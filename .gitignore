@@ -1,0 +1,20 @@
+# dependencies / build artifacts
+node_modules/
+dist/
+target/
+gen/schemas/
+
+# env & secrets
+.env
+.env.*
+*.p8
+*.pem
+!docs/**/*.pem.example
+
+# session metadata
+.omo/
+.opencode/
+
+# OS
+Thumbs.db
+.DS_Store
