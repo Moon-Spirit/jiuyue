@@ -1,0 +1,15 @@
+[package]
+name = "jiuyue-protocol"
+description = "JiuYue wire protocol v1: versioned WebSocket frame envelope and payload types"
+publish = false
+
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+uuid.workspace = true

@@ -1,0 +1,21 @@
+[package]
+name = "jiuyue-server"
+description = "JiuYue backend: axum HTTP + WebSocket server"
+publish = false
+
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "jiuyue-server"
+path = "src/main.rs"
+
+[dependencies]
+jiuyue-domain.workspace = true
+jiuyue-protocol.workspace = true
+axum = "0.8"
+tokio.workspace = true
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

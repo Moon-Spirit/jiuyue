@@ -1,0 +1,13 @@
+[package]
+name = "jiuyue-domain"
+description = "JiuYue pure domain logic: seq allocation trait, message state machine, recall policy"
+publish = false
+
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+uuid.workspace = true
