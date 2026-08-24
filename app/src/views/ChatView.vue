@@ -62,6 +62,19 @@ function initialOf(username: string): string {
   return first.length === 0 ? "?" : first.toUpperCase();
 }
 
+/** Peer messages label with the peer's name; falls back to the raw id. */
+function senderLabel(message: { senderId: string }): string {
+  const conv = ws.activeConversation;
+  if (
+    conv !== null &&
+    message.senderId === conv.peerUserId &&
+    conv.peerUsername.length > 0
+  ) {
+    return conv.peerUsername;
+  }
+  return message.senderId;
+}
+
 function displayName(conversation: Conversation): string {
   return conversation.peerUsername.length > 0
     ? conversation.peerUsername
@@ -628,7 +641,7 @@ function onComposerBlur(): void {
                   class="mb-0.5 text-[11px] text-neutral-400 dark:text-neutral-500"
                   data-testid="message-sender"
                 >
-                  {{ message.senderId }}
+                  {{ senderLabel(message) }}
                 </div>
                 <!-- M3 undecryptable: localized placeholder replaces content -->
                 <div

@@ -835,4 +835,77 @@ describe("ws store — M2 forwarding", () => {
     );
     expect(result).toBeNull();
   });
+  it("enriches skeleton conversations created by live msg.new with peer identity", async () => {
+    const store = useWsStore();
+    const sock = await connectAndOpen();
+
+    // Live arrival for an unknown conversation creates a skeleton.
+    sock.serverFrame({
+      v: 1,
+      t: "msg.new",
+      d: msgNew({ message_id: "m-live-1", conversation_id: 42, seq: 1 }),
+    });
+    expect(store.conversations.some((c) => c.conversationId === 42)).toBe(true);
+    // Let the skeleton-triggered (old-mock) enrichment settle first.
+    for (let i = 0; i < 12; i++) await Promise.resolve();
+    expect(
+      store.conversations.find((c) => c.conversationId === 42)?.peerUsername,
+    ).toBe("");
+
+    // Backfill fetch resolves with the peer identity.
+    fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes("/api/auth/ws-ticket")) return jsonResponse(200, { ticket: "t1" });
+      if (url.includes("/api/conversations"))
+        return jsonResponse(200, [
+          {
+            conversation_id: 42,
+            kind: "direct",
+            peer: { user_id: "peer-42", username: "alice" },
+            last_seq: 1,
+            last_delivered_seq: 0,
+          },
+        ]);
+      return jsonResponse(200, { ticket: "t1" });
+    });
+    await store.enrichPeerIdentity();
+
+    const conv = store.conversations.find((c) => c.conversationId === 42);
+    expect(conv?.peerUsername).toBe("alice");
+    expect(conv?.peerUserId).toBe("peer-42");
+  });
+
+  it("applyServerConversationList enriches empty peers without resetting local state", () => {
+    const store = useWsStore();
+    seedConversation(store, 7, { maxSeq: 9, unread: 3 });
+    const conv = store.conversations.find((c) => c.conversationId === 7);
+    if (conv === undefined) throw new Error("seed failed");
+    conv.peerUserId = "";
+    conv.peerUsername = "";
+
+    store.applyServerConversationList([
+      {
+        conversation_id: 7,
+        kind: "direct",
+        peer: { user_id: "peer-7", username: "bob" },
+        last_seq: 99,
+        last_delivered_seq: 99,
+      },
+      {
+        conversation_id: 8,
+        kind: "direct",
+        peer: { user_id: "peer-8", username: "carol" },
+        last_seq: 4,
+        last_delivered_seq: 4,
+      },
+    ]);
+
+    const enriched = store.conversations.find((c) => c.conversationId === 7);
+    expect(enriched?.peerUsername).toBe("bob");
+    expect(enriched?.maxSeq).toBe(9); // local sync state untouched
+    expect(enriched?.unread).toBe(3);
+    const added = store.conversations.find((c) => c.conversationId === 8);
+    expect(added?.peerUsername).toBe("carol");
+    expect(added?.maxSeq).toBe(0); // fresh entry starts from zero
+  });
 });

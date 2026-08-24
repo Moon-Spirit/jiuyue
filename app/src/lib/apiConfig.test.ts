@@ -2,10 +2,11 @@ import { afterEach, describe, expect, it } from "vitest";
 import { apiBase, wsBase } from "./apiConfig";
 
 function setTauri(value: boolean): void {
+  const w = window as unknown as Record<string, unknown>;
   if (value) {
-    (window as Record<string, unknown>)["__TAURI_INTERNALS__"] = {};
+    w["__TAURI_INTERNALS__"] = {};
   } else {
-    delete (window as Record<string, unknown>)["__TAURI_INTERNALS__"];
+    delete w["__TAURI_INTERNALS__"];
   }
 }
 

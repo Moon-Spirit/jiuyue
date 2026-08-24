@@ -7,6 +7,7 @@ import {
   createConversation as apiCreateConversation,
   listConversations,
 } from "../lib/api/messages";
+import type { ConversationListItem } from "../lib/api/messages";
 import type { ConversationKind } from "../lib/api/messages";
 import * as olm from "../lib/crypto/olm-lite";
 import type {
@@ -113,6 +114,8 @@ export interface ReplyContext {
 
 const CONVOS_KEY = "jiuyue.convos";
 const MSGS_KEY_PREFIX = "jiuyue.msgs.";
+/** Coalesces peer-identity backfills while a listing request is in flight. */
+let enrichmentInflight = false;
 
 export const BACKOFF_BASE_MS = 500;
 export const BACKOFF_CAP_MS = 15_000;
@@ -469,6 +472,71 @@ export const useWsStore = defineStore("ws", {
       }, STALE_CHECK_INTERVAL_MS);
     },
 
+    /**
+     * Upsert semantics for the server-side conversation listing:
+     * - unknown conversation → added with zeroed local sync state;
+     * - known conversation with MISSING peer identity (skeleton created by a
+     *   live msg.new before any listing arrived) → enriched in place;
+     * - otherwise untouched (local cursors/unread are authoritative).
+     */
+    applyServerConversationList(remote: ConversationListItem[]): void {
+      for (const item of remote) {
+        const existing = this.conversations.find(
+          (c) => c.conversationId === item.conversation_id,
+        );
+        if (existing !== undefined) {
+          if (
+            existing.peerUsername === "" &&
+            item.peer !== null &&
+            item.peer.username !== ""
+          ) {
+            existing.peerUserId = item.peer.user_id;
+            existing.peerUsername = item.peer.username;
+            existing.kind = item.kind === "secret" ? "secret" : existing.kind;
+          }
+          continue;
+        }
+        this.conversations.push({
+          conversationId: item.conversation_id,
+          peerUserId: item.peer?.user_id ?? "",
+          peerUsername: item.peer?.username ?? "",
+          lastMessagePreview: null,
+          lastActivityAt: "",
+          // Device-local unseen count: sync arrivals increment it; the
+          // server-side approximation would double-count after bootstrap.
+          unread: 0,
+          // Server cursors describe what the USER has received elsewhere;
+          // THIS device's cache starts empty, so sync pulls full history
+          // (user story 7) instead of trusting last_seq as local truth.
+          lastSeenSeq: 0,
+          maxSeq: 0,
+          peerTypingUntil: null,
+          kind: item.kind === "secret" ? "secret" : "direct",
+        });
+      }
+    },
+
+    /**
+     * One-shot peer-identity backfill for skeletons created by live arrivals;
+     * coalesced so a message burst triggers at most one listing request.
+     */
+    async enrichPeerIdentity(): Promise<void> {
+      if (enrichmentInflight) return;
+      enrichmentInflight = true;
+      try {
+        const auth = useAuthStore();
+        const token = await auth.ensureAccessToken();
+        if (token !== null) {
+          this.applyServerConversationList(await listConversations(token));
+          this.persistConversations();
+        }
+      } catch {
+        // Identity enrichment is cosmetic; silent retry on next arrival.
+      } finally {
+        enrichmentInflight = false;
+      }
+    },
+
     onSocketOpen(): void {
       const ws = socket;
       if (ws === null) return;
@@ -482,32 +550,7 @@ export const useWsStore = defineStore("ws", {
           const token = await auth.ensureAccessToken();
           if (token === null) return;
           const remote = await listConversations(token);
-          for (const item of remote) {
-            if (
-              this.conversations.some(
-                (c) => c.conversationId === item.conversation_id,
-              )
-            ) {
-              continue;
-            }
-            this.conversations.push({
-              conversationId: item.conversation_id,
-              peerUserId: item.peer?.user_id ?? "",
-              peerUsername: item.peer?.username ?? "",
-              lastMessagePreview: null,
-              lastActivityAt: "",
-              // Device-local unseen count: sync arrivals increment it; the
-              // server-side approximation would double-count after bootstrap.
-              unread: 0,
-              // Server cursors describe what the USER has received elsewhere;
-              // THIS device's cache starts empty, so sync pulls full history
-              // (user story 7) instead of trusting last_seq as local truth.
-              lastSeenSeq: 0,
-              maxSeq: 0,
-              peerTypingUntil: null,
-              kind: item.kind === "secret" ? "secret" : "direct",
-            });
-          }
+          this.applyServerConversationList(remote);
           this.persistConversations();
         } catch (error) {
           // Bootstrap is best-effort: local-only sync still works for
@@ -651,6 +694,9 @@ export const useWsStore = defineStore("ws", {
           kind: "direct",
         };
         this.conversations.push(conversation);
+        // The skeleton lacks peer identity (msg.new carries only ids);
+        // backfill names from the server listing once per arrival burst.
+        void this.enrichPeerIdentity();
       }
 
       const mine = m.sender_id === this.mySenderId();
