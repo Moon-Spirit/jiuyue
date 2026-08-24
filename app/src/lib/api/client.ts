@@ -8,6 +8,8 @@
  */
 
 /** Machine codes emitted by the backend auth/chat HTTP surface. */
+import { apiBase } from "../apiConfig";
+
 export type ApiErrorCode =
   | "invalid_credentials"
   | "username_taken"
@@ -63,7 +65,7 @@ export async function apiRequest<T>(
 
   let response: Response;
   try {
-    response = await fetch(path, {
+    response = await fetch(apiBase() + path, {
       method,
       headers,
       credentials: "omit",

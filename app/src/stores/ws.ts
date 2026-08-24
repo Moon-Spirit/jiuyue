@@ -1,6 +1,7 @@
 import { defineStore } from "pinia";
 import { toRaw } from "vue";
 import { requestWsTicket } from "../lib/api/auth";
+import { wsBase } from "../lib/apiConfig";
 import { ApiError } from "../lib/api/client";
 import {
   createConversation as apiCreateConversation,
@@ -385,7 +386,7 @@ export const useWsStore = defineStore("ws", {
 
       intentionalClose = false;
       const ws = new WebSocket(
-        `/ws?ticket=${encodeURIComponent(ticket)}&platform=web`,
+        `${wsBase()}/ws?ticket=${encodeURIComponent(ticket)}&platform=web`,
       );
       socket = ws;
 
