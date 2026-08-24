@@ -70,6 +70,36 @@ impl ConnRegistry {
             .filter(|tx| tx.try_send(Arc::clone(frame)).is_ok())
             .count()
     }
+
+    /// Like [`Self::deliver_to`] but skips one device — used by fanout so a
+    /// sender's *other* live devices still self-echo while the sending
+    /// `(user_id, device_id)` itself does not receive its own message back
+    /// (it already gets the authoritative `msg.ack`).
+    ///
+    /// Returns how many devices actually accepted the frame.
+    pub fn deliver_to_excluding(
+        &self,
+        user_id: Uuid,
+        excluded_device: Uuid,
+        frame: &OutboundFrame,
+    ) -> usize {
+        let Some(devices) = self.conns.get(&user_id) else {
+            return 0;
+        };
+        devices
+            .iter()
+            .filter(|(device, _)| **device != excluded_device)
+            .filter(|(_, tx)| tx.try_send(Arc::clone(frame)).is_ok())
+            .count()
+    }
+
+    /// Number of live device channels currently registered for `user_id`.
+    ///
+    /// Introspection aid for heartbeat-eviction tests and diagnostics; not
+    /// used on the delivery hot path.
+    pub fn user_device_count(&self, user_id: Uuid) -> usize {
+        self.conns.get(&user_id).map_or(0, |devices| devices.len())
+    }
 }
 
 #[cfg(test)]
@@ -113,5 +143,60 @@ mod tests {
             "drop-lag: full channel must not accept"
         );
         assert_eq!(rx.recv().await.expect("frame").as_str(), "1");
+    }
+
+    #[tokio::test]
+    async fn deliver_to_excluding_skips_only_the_named_device() {
+        let registry = ConnRegistry::new();
+        let user = Uuid::now_v7();
+        let sending_device = Uuid::now_v7();
+        let other_device = Uuid::now_v7();
+        let (tx_send, mut rx_send) = mpsc::channel::<OutboundFrame>(4);
+        let (tx_other, mut rx_other) = mpsc::channel::<OutboundFrame>(4);
+        registry.register(user, sending_device, tx_send);
+        registry.register(user, other_device, tx_other);
+
+        let frame = Arc::new("echo".into());
+        assert_eq!(
+            registry.deliver_to_excluding(user, sending_device, &frame),
+            1,
+            "the sender's OTHER device must still self-echo"
+        );
+        assert_eq!(rx_other.recv().await.expect("frame").as_str(), "echo");
+
+        // The excluded device got nothing: its queue is still empty, and once
+        // it is the only target left, excluding it delivers to nobody.
+        assert!(rx_send.try_recv().is_err());
+        registry.unregister(user, other_device);
+        assert_eq!(
+            registry.deliver_to_excluding(user, sending_device, &frame),
+            0,
+            "excluding the last remaining device must deliver nowhere"
+        );
+
+        // Unknown user and unknown excluded device behave sanely.
+        assert_eq!(registry.deliver_to_excluding(Uuid::now_v7(), sending_device, &frame), 0);
+        assert_eq!(
+            registry.deliver_to_excluding(user, Uuid::now_v7(), &frame),
+            1,
+            "an unknown exclusion must not suppress delivery"
+        );
+        assert_eq!(rx_send.recv().await.expect("frame").as_str(), "echo");
+    }
+
+    #[tokio::test]
+    async fn user_device_count_tracks_registration_lifecycle() {
+        let registry = ConnRegistry::new();
+        let user = Uuid::now_v7();
+        assert_eq!(registry.user_device_count(user), 0);
+
+        let (tx_a, _rx_a) = mpsc::channel::<OutboundFrame>(1);
+        let (tx_b, _rx_b) = mpsc::channel::<OutboundFrame>(1);
+        registry.register(user, Uuid::now_v7(), tx_a);
+        registry.register(user, Uuid::now_v7(), tx_b);
+        assert_eq!(registry.user_device_count(user), 2);
+
+        registry.unregister(user, Uuid::now_v7());
+        assert_eq!(registry.user_device_count(user), 2, "unknown device unregister is a no-op");
     }
 }

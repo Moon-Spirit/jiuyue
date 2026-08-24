@@ -4,6 +4,23 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>JiuYue</title>
+    <script>
+      // Pre-paint theme: apply the stored preference before CSS paints to
+      // avoid a flash of the wrong color scheme.
+      (function () {
+        try {
+          var pref = localStorage.getItem("jiuyue.theme");
+          var dark =
+            pref === "dark" ||
+            ((pref === null || pref === "system") &&
+              window.matchMedia &&
+              window.matchMedia("(prefers-color-scheme: dark)").matches);
+          if (dark) document.documentElement.classList.add("dark");
+        } catch (e) {
+          /* best-effort only */
+        }
+      })();
+    </script>
   </head>
   <body>
     <div id="app"></div>

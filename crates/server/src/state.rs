@@ -2,7 +2,7 @@
 
 use crate::code_store::CodeStore;
 use crate::crypto::BodyCipher;
-use crate::ws::ConnRegistry;
+use crate::ws::{ConnRegistry, HeartbeatConfig};
 use sqlx::PgPool;
 use std::sync::Arc;
 
@@ -18,6 +18,10 @@ pub struct AppState {
     /// AES-256-GCM at-rest cipher. Key derivation: SHA-256 of the UTF-8
     /// bytes of `JIUYUE_MASTER_KEY` (see `crypto` module docs).
     pub cipher: BodyCipher,
+    /// Server-initiated WS heartbeat intervals, parsed once from
+    /// `JIUYUE_WS_PING_SECS` / `JIUYUE_WS_TIMEOUT_SECS` (defaults 30/60).
+    /// Public so tests can shrink them without env mutation.
+    pub heartbeat: HeartbeatConfig,
 }
 
 impl AppState {
@@ -42,6 +46,7 @@ impl AppState {
             jwt_secret: Arc::new(jwt_secret.into()),
             registry: Arc::new(ConnRegistry::new()),
             cipher: BodyCipher::new(&master_key),
+            heartbeat: HeartbeatConfig::from_env(),
         }
     }
 }

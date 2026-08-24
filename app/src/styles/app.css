@@ -1,0 +1,4 @@
+@import "tailwindcss";
+
+/* Tailwind v4 class-strategy dark mode: `.dark` on <html> (see index.html pre-paint script). */
+@custom-variant dark (&:where(.dark, .dark *));
