@@ -1,0 +1,93 @@
+//! Uniform error model: every failure is JSON `{"error": "<machine_code>", "message": "<human>"}`.
+
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+use axum::Json;
+use serde::Serialize;
+
+#[derive(Debug, Serialize)]
+struct ErrorBody {
+    error: &'static str,
+    message: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConflictKind {
+    UsernameTaken,
+    IdentityAlreadyBound,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum AppError {
+    /// 401 — wrong code/password/token/unknown identifier. One generic body so
+    /// callers cannot distinguish "unknown account" from "bad secret".
+    #[error("invalid credentials")]
+    InvalidCredentials,
+
+    /// 409 — unique constraint violated.
+    #[error("conflict: {0:?}")]
+    Conflict(ConflictKind),
+
+    /// 422 — semantically invalid input (username format, weak password, bad target).
+    #[error("validation failed: {0}")]
+    Validation(String),
+
+    /// 400 — malformed request (bad JSON, missing fields).
+    #[error("bad request: {0}")]
+    BadRequest(String),
+
+    /// 500 — unexpected; details logged, never leaked to the client.
+    #[error(transparent)]
+    Internal(#[from] anyhow::Error),
+}
+
+impl AppError {
+    /// Constructor for `map_err`: accepts any error convertible into `anyhow::Error`.
+    pub fn internal<E: Into<anyhow::Error>>(err: E) -> Self {
+        Self::Internal(err.into())
+    }
+}
+
+impl IntoResponse for AppError {
+    fn into_response(self) -> Response {
+        let (status, code, message) = match &self {
+            AppError::InvalidCredentials => (
+                StatusCode::UNAUTHORIZED,
+                "invalid_credentials",
+                "invalid credentials".to_string(),
+            ),
+            AppError::Conflict(ConflictKind::UsernameTaken) => (
+                StatusCode::CONFLICT,
+                "username_taken",
+                "username is already taken".to_string(),
+            ),
+            AppError::Conflict(ConflictKind::IdentityAlreadyBound) => (
+                StatusCode::CONFLICT,
+                "identity_already_bound",
+                "this email/phone is already bound to an account".to_string(),
+            ),
+            AppError::Validation(msg) => (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "validation_error",
+                msg.clone(),
+            ),
+            AppError::BadRequest(msg) => (StatusCode::BAD_REQUEST, "bad_request", msg.clone()),
+            AppError::Internal(err) => {
+                tracing::error!(error = %format!("{err:#}"), "internal server error");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal",
+                    "internal server error".to_string(),
+                )
+            }
+        };
+        (
+            status,
+            Json(ErrorBody {
+                error: code,
+                message,
+            }),
+        )
+            .into_response()
+    }
+}

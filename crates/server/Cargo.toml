@@ -15,7 +15,27 @@ path = "src/main.rs"
 [dependencies]
 jiuyue-domain.workspace = true
 jiuyue-protocol.workspace = true
+anyhow.workspace = true
+argon2.workspace = true
 axum = "0.8"
+base64 = "0.22"
+dashmap.workspace = true
+dotenvy = "0.15"
+jsonwebtoken.workspace = true
+rand.workspace = true
+redis.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "0.10"
+sqlx.workspace = true
+thiserror.workspace = true
+time.workspace = true
 tokio.workspace = true
+tower-http.workspace = true
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid.workspace = true
+
+[dev-dependencies]
+http-body-util = "0.1"
+tower = { version = "0.5", features = ["util"] }

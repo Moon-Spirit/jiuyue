@@ -1,0 +1,10 @@
+{
+  "v": 1,
+  "t": "sync.req",
+  "d": {
+    "cursors": [
+      { "conversation_id": 42, "last_delivered_seq": 127 },
+      { "conversation_id": 7, "last_delivered_seq": 0 }
+    ]
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "v": 1,
+  "t": "presence.milestone",
+  "d": {
+    "user_id": "018e1122-3344-7006-9a2b-1c2d3e4f5a6b",
+    "milestone": "first_message_sent"
+  }
+}

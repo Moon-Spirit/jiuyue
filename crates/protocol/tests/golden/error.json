@@ -1,0 +1,9 @@
+{
+  "v": 1,
+  "t": "error",
+  "d": {
+    "code": "rate_limited",
+    "message": "too many messages, slow down",
+    "retryable": true
+  }
+}

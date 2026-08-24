@@ -1,0 +1,7 @@
+{
+  "v": 1,
+  "t": "auth.ticket.res",
+  "d": {
+    "ticket": "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIwMThlMTEyMi0zMzQ0LTcwMDYtOWEyYi0xYzJkM2U0ZjVhNmIifQ.s1gn4tur3"
+  }
+}

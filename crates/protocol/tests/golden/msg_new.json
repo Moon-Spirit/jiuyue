@@ -1,0 +1,12 @@
+{
+  "v": 1,
+  "t": "msg.new",
+  "d": {
+    "message_id": "0190aabb-ccdd-7e01-8a1b-2c3d4e5f6071",
+    "conversation_id": 42,
+    "seq": 128,
+    "sender_id": "018e1122-3344-7006-9a2b-1c2d3e4f5a6b",
+    "body": "你好，九月！",
+    "sent_at": "2026-08-24T08:30:00.123Z"
+  }
+}

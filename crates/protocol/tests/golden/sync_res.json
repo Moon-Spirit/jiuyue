@@ -1,0 +1,25 @@
+{
+  "v": 1,
+  "t": "sync.res",
+  "d": {
+    "messages": [
+      {
+        "message_id": "0190aabb-ccdd-7e01-8a1b-2c3d4e5f6071",
+        "conversation_id": 42,
+        "seq": 128,
+        "sender_id": "018e1122-3344-7006-9a2b-1c2d3e4f5a6b",
+        "body": "你好，九月！",
+        "sent_at": "2026-08-24T08:30:00.123Z"
+      },
+      {
+        "message_id": "0190aabb-ccdd-7e02-8a1b-2c3d4e5f6072",
+        "conversation_id": 42,
+        "seq": 129,
+        "sender_id": "018e1122-3344-7006-9a2b-1c2d3e4f5a6b",
+        "body": "明天一起吃饭吗？",
+        "sent_at": "2026-08-24T08:30:05.456Z"
+      }
+    ],
+    "complete": true
+  }
+}
