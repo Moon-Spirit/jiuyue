@@ -33,7 +33,12 @@ async fn main() -> anyhow::Result<()> {
         .allow_origin(AllowOrigin::predicate(|origin, _| {
             match origin.to_str() {
                 Ok(origin) => {
-                    origin.starts_with("http://localhost") || origin.starts_with("http://127.0.0.1")
+                    origin.starts_with("http://localhost")
+                        || origin.starts_with("http://127.0.0.1")
+                        // Packaged Tauri webview origins (Windows: http://tauri.localhost,
+                        // macOS/Linux: tauri://localhost).
+                        || origin == "http://tauri.localhost"
+                        || origin == "tauri://localhost"
                 }
                 Err(_) => false,
             }
