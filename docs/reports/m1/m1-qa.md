@@ -51,3 +51,19 @@ QA 结束时停止：jiuyue-server.exe 后端进程、vite dev server、playwrig
 - 新增测试：协议 golden ×9（read/typing/recall/扩展 msg.new）、m2_flow.rs 集成 8 用例、前端 store/UI 测试至 100/100。全门禁绿：Rust 79 passed + clippy 干净；typecheck 0。
 - 真实网络取证 `scripts/qa/m2-e2e.mjs` → **PASS**（转录 docs/reports/m1/evidence-m2-transcript.jsonl）：typing.relayed_to_peer / readreceipt.peer_notified / recall.broadcast_both_sides / recall.sync_serves_tombstone_no_body / recall.non_sender_not_broadcast。
 - 语义决定：非发送者撤回的错误帧只回给尝试者（策略答复不断连）；网络层断言为"不产生墓碑广播"。
+## 七、M3 补录（密聊 E2EE）
+
+- 后端（M3a）：crates/crypto vodozemac 包装（6 单测，Apache-2.0，生产升级路径）；e2ee_identities 表 + 密聊 pair 唯一索引；POST /api/e2ee/keys/upload、GET /api/e2ee/keys/{username}（OTK 原子单取）；e2ee.msg 中继+密文落库（服务端不可读）；m3_flow.rs 5 集成用例。协议 golden e2ee_msg.json。
+- 前端（M3b）：lib/crypto/olm-lite.ts 纯 TS 双棘轮（WebCrypto P-256+HKDF+AES-GCM，乱序窗口），olm-lite 往返/乱序/篡改拒绝测试；密聊会话创建开关、锁标识、设备绑定横幅、SAS 安全码展示；解密失败占位不崩溃。
+- 边界声明：TS 引擎为 MVP 级自实现（约 300 行、有测试向量），原生桥接 vodozemac 为既定升级路径——两套实现均不引入 AGPL 依赖。
+
+## 八、M4 补录（推送抽象层）
+
+- PushChannel 枚举派发：MockChannel（环形缓冲快照）/ ApnsChannel / FcmChannel（载荷构造完整、传输闭包注入，凭证环境变量缺失时不可构造——live 传输随部署阶段接入 apns-h2，见 docs/research/2026-08-23-push-infra-rust.md）。
+- JIUYUE_REGION=cn|global 区域选择 + Mock 永远兜底，离线成员按 devices.push_token 派发，失败仅记录。
+- m4_flow.rs 3 用例：离线投递入 Mock 快照（预览文本+会话 id 正确）、在线不推、撤回不推；GET /api/dev/push-log（dev 构建）取证端点。
+
+## 九、最终门禁（成品）
+
+- cargo test --workspace：**107 passed**（含 crypto 6 / protocol 10 / server 单测 25 / auth 10 / chat 11 / sync 11 / m2 8 / m3 5 / m4 3）+ clippy -D warnings 干净。
+- 前端：vue-tsc exit 0；vitest **112 passed**（8 文件）。

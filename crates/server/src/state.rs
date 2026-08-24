@@ -2,6 +2,7 @@
 
 use crate::code_store::CodeStore;
 use crate::crypto::BodyCipher;
+use crate::push::PushService;
 use crate::ws::{ConnRegistry, HeartbeatConfig};
 use sqlx::PgPool;
 use std::sync::Arc;
@@ -22,6 +23,10 @@ pub struct AppState {
     /// `JIUYUE_WS_PING_SECS` / `JIUYUE_WS_TIMEOUT_SECS` (defaults 30/60).
     /// Public so tests can shrink them without env mutation.
     pub heartbeat: HeartbeatConfig,
+    /// Region-aware offline-push facade (`push` module). The Mock channel
+    /// inside is always the last-resort sink; the dev-only `/api/dev/push-log`
+    /// endpoint reads its snapshot.
+    pub push: Arc<PushService>,
 }
 
 impl AppState {
@@ -47,6 +52,7 @@ impl AppState {
             registry: Arc::new(ConnRegistry::new()),
             cipher: BodyCipher::new(&master_key),
             heartbeat: HeartbeatConfig::from_env(),
+            push: Arc::new(PushService::from_env()),
         }
     }
 }

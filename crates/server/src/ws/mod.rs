@@ -30,6 +30,7 @@ pub use registry::{ConnRegistry, FrameTx, OutboundFrame, OUTBOUND_CHANNEL_CAPACI
 
 use crate::auth::ws_ticket;
 use crate::error::AppError;
+use crate::push::{PushEnvelope, PushKind, PushPlatform};
 use crate::state::AppState;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Query, State};
@@ -894,6 +895,15 @@ async fn fanout_msg_new(
         }),
     };
     let wire = serialize_frame(&msg_new);
+    // Offline members are resolved BEFORE the fanout loop consumes `members`:
+    // a member with zero registry entries received nothing live and is the
+    // offline-push candidate set (M4).
+    let offline_members: Vec<Uuid> = members
+        .iter()
+        .copied()
+        .filter(|user_id| *user_id != sender_id)
+        .filter(|user_id| state.registry.user_device_count(*user_id) == 0)
+        .collect();
     for user_id in members {
         let delivered = if user_id == sender_id {
             state
@@ -906,6 +916,18 @@ async fn fanout_msg_new(
         if delivered > 0 {
             spawn_advance_delivered_cursor(state, outcome.conversation_id, user_id, outcome.seq);
         }
+    }
+
+    // M4 offline-push hook: one fire-and-forget envelope per offline device.
+    // Plaintext preview is allowed here because this path only serves normal
+    // chats — secret chats (`fanout_e2ee`) never reach this module.
+    if !offline_members.is_empty() {
+        spawn_dispatch_offline_push(
+            state,
+            outcome.conversation_id,
+            plaintext_body,
+            offline_members,
+        );
     }
 
     // Fire-and-forget pub/sub notify: single-instance delivery rides the
@@ -925,6 +947,66 @@ async fn fanout_msg_new(
         {
             Ok(receivers) => tracing::debug!(channel = %channel, receivers, "redis publish"),
             Err(err) => tracing::debug!(channel = %channel, error = %err, "redis publish failed"),
+        }
+    });
+}
+
+/// Fire-and-forget offline-push dispatch (M4): resolves every device row of
+/// the offline members that carries a non-null `push_token`, then delivers
+/// one [`PushEnvelope`] per device through the region-aware
+/// [`crate::push::PushService`]. Spawned + fully error-logged: a push outage
+/// must never panic or slow the send path. `web` devices and rows without a
+/// token are skipped by design.
+fn spawn_dispatch_offline_push(
+    state: &AppState,
+    conversation_id: i64,
+    plaintext_body: &str,
+    offline_users: Vec<Uuid>,
+) {
+    let pool = state.pool.clone();
+    let push = Arc::clone(&state.push);
+    let preview = truncate_chars(plaintext_body, crate::push::PREVIEW_MAX_CHARS);
+    tokio::spawn(async move {
+        let rows: Vec<(Uuid, Uuid, String, String)> = match sqlx::query_as(
+            "SELECT id, user_id, platform, push_token FROM devices \
+             WHERE user_id = ANY($1) AND push_token IS NOT NULL",
+        )
+        .bind(&offline_users)
+        .fetch_all(&pool)
+        .await
+        {
+            Ok(rows) => rows,
+            Err(err) => {
+                tracing::warn!(
+                    conversation_id,
+                    error = %err,
+                    "offline-push device lookup failed"
+                );
+                return;
+            }
+        };
+        for (device_id, user_id, platform, push_token) in rows {
+            // `web` and unrecognized platforms never receive pushes.
+            let Some(platform) = PushPlatform::parse(&platform) else {
+                continue;
+            };
+            let envelope = PushEnvelope::new(
+                user_id,
+                device_id,
+                conversation_id,
+                &preview,
+                PushKind::Message,
+            );
+            if let Err(err) = push.deliver(platform, &push_token, envelope).await {
+                tracing::warn!(
+                    %user_id,
+                    %device_id,
+                    %platform,
+                    conversation_id,
+                    error = %err,
+                    "offline push delivery failed"
+                );
+            }
         }
     });
 }

@@ -1,5 +1,6 @@
 //! Environment-driven configuration (loaded from `.env` via dotenvy).
 
+use crate::push::region_from_raw;
 use anyhow::Context;
 
 #[derive(Debug, Clone)]
@@ -8,6 +9,9 @@ pub struct Config {
     pub redis_url: String,
     pub jwt_secret: String,
     pub bind_addr: String,
+    /// Deployment region (`JIUYUE_REGION`): `"cn"` | `"global"`, default
+    /// `"global"`. Drives offline-push channel selection (see `push`).
+    pub region: String,
 }
 
 impl Config {
@@ -18,6 +22,7 @@ impl Config {
             jwt_secret: std::env::var("JIUYUE_JWT_SECRET")
                 .context("JIUYUE_JWT_SECRET is required")?,
             bind_addr: std::env::var("JIUYUE_BIND").unwrap_or_else(|_| "0.0.0.0:8080".into()),
+            region: region_from_raw(std::env::var("JIUYUE_REGION").ok()),
         })
     }
 }

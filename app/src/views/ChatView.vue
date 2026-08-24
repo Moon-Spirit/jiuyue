@@ -6,6 +6,7 @@ import AppShell from "../components/layout/AppShell.vue";
 import LanguageToggle from "../components/LanguageToggle.vue";
 import ThemeToggle from "../components/ThemeToggle.vue";
 import { apiErrorMessage } from "../lib/api/messages";
+import * as olm from "../lib/crypto/olm-lite";
 import { useAuthStore } from "../stores/auth";
 import { RECALL_WINDOW_MS, useWsStore } from "../stores/ws";
 import type { ChatMessage, Conversation } from "../stores/ws";
@@ -18,9 +19,13 @@ const ws = useWsStore();
 const PREVIEW_MAX_CHARS = 40;
 
 const newPeerUsername = ref("");
+/** M3: kind chosen in the segmented 普通/密聊 control. */
+const newConversationKind = ref<"direct" | "secret">("direct");
 const creatingConversation = ref(false);
 const conversationError = ref("");
 const draft = ref("");
+/** Local half of the safety code for the active secret thread (or null). */
+const sasCode = ref<string | null>(null);
 const composerEl = ref<HTMLTextAreaElement | null>(null);
 const messagesEndRef = ref<HTMLElement | null>(null);
 
@@ -98,14 +103,36 @@ async function submitNewConversation(): Promise<void> {
   creatingConversation.value = true;
   conversationError.value = "";
   try {
-    await ws.createOrOpenConversation(peer);
+    await ws.createOrOpenConversation(peer, newConversationKind.value);
     newPeerUsername.value = "";
+    newConversationKind.value = "direct";
   } catch (error) {
     conversationError.value = apiErrorMessage(error, (key) => t(key));
   } finally {
     creatingConversation.value = false;
   }
 }
+
+// ---------------------------------------------------------------------
+// M3 secret chats: safety code for the active thread
+// ---------------------------------------------------------------------
+
+watch(
+  () => [ws.activeConversationId, ws.activeConversation?.kind] as const,
+  async () => {
+    sasCode.value = null;
+    const conversation = ws.activeConversation;
+    if (conversation?.kind !== "secret") return;
+    const peerIdentity = olm.getPeerIdentity(conversation.conversationId);
+    if (peerIdentity === null) return;
+    try {
+      sasCode.value = await olm.safetyCode(peerIdentity);
+    } catch {
+      sasCode.value = null;
+    }
+  },
+  { immediate: true },
+);
 
 function openConversation(conversationId: number): void {
   // Resets unread and advances lastSeenSeq inside the store.
@@ -307,6 +334,38 @@ function onComposerBlur(): void {
             :placeholder="t('chat.newConversationPlaceholder')"
             class="min-w-0 flex-1 rounded-lg border border-neutral-300 bg-transparent px-2 py-1.5 text-sm outline-none focus:border-indigo-500 dark:border-neutral-700"
           />
+          <!-- M3: conversation kind segmented control (普通 / 密聊) -->
+          <div
+            class="flex shrink-0 overflow-hidden rounded-lg border border-neutral-300 text-xs dark:border-neutral-700"
+            data-testid="kind-toggle"
+          >
+            <button
+              type="button"
+              data-testid="kind-direct"
+              class="px-2 py-1.5 font-medium transition-colors"
+              :class="
+                newConversationKind === 'direct'
+                  ? 'bg-indigo-600 text-white'
+                  : 'text-neutral-500 hover:bg-neutral-100 dark:text-neutral-400 dark:hover:bg-neutral-800'
+              "
+              @click="newConversationKind = 'direct'"
+            >
+              {{ t("chat.kindDirect") }}
+            </button>
+            <button
+              type="button"
+              data-testid="kind-secret"
+              class="border-l border-neutral-300 px-2 py-1.5 font-medium transition-colors dark:border-neutral-700"
+              :class="
+                newConversationKind === 'secret'
+                  ? 'bg-emerald-600 text-white'
+                  : 'text-neutral-500 hover:bg-neutral-100 dark:text-neutral-400 dark:hover:bg-neutral-800'
+              "
+              @click="newConversationKind = 'secret'"
+            >
+              {{ t("chat.kindSecret") }}
+            </button>
+          </div>
           <button
             type="submit"
             data-testid="new-conversation-submit"
@@ -357,10 +416,27 @@ function onComposerBlur(): void {
             <span class="min-w-0 flex-1">
               <span class="flex items-baseline justify-between gap-2">
                 <span
-                  class="min-w-0 truncate text-sm font-medium"
-                  data-testid="session-name"
-                  >{{ displayName(conversation) }}</span
+                  class="flex min-w-0 items-center gap-1 text-sm font-medium"
                 >
+                  <svg
+                    v-if="conversation.kind === 'secret'"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="2"
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                    class="h-3 w-3 shrink-0 text-emerald-600 dark:text-emerald-400"
+                    data-testid="session-lock"
+                    aria-hidden="true"
+                  >
+                    <rect x="5" y="11" width="14" height="9" rx="2" />
+                    <path d="M8 11V7a4 4 0 0 1 8 0v4" />
+                  </svg>
+                  <span class="min-w-0 truncate" data-testid="session-name">{{
+                    displayName(conversation)
+                  }}</span>
+                </span>
                 <span
                   class="shrink-0 text-[11px] text-neutral-400 dark:text-neutral-500"
                   data-testid="session-time"
@@ -426,6 +502,28 @@ function onComposerBlur(): void {
           {{ t("chat.wsError") }}
         </button>
 
+        <!-- M3 secret chat banner: device-bound, never synced elsewhere -->
+        <div
+          v-if="ws.activeConversation?.kind === 'secret'"
+          class="flex shrink-0 items-center justify-center gap-1.5 bg-emerald-100 py-1.5 text-xs font-medium text-emerald-800 dark:bg-emerald-900/40 dark:text-emerald-200"
+          data-testid="secret-banner"
+        >
+          <svg
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            class="h-3 w-3 shrink-0"
+            aria-hidden="true"
+          >
+            <rect x="5" y="11" width="14" height="9" rx="2" />
+            <path d="M8 11V7a4 4 0 0 1 8 0v4" />
+          </svg>
+          {{ t("chat.secretBanner") }}
+        </div>
+
         <!-- Thread header -->
         <header
           class="flex shrink-0 items-center gap-2 border-b border-neutral-200 px-4 py-2 dark:border-neutral-800"
@@ -438,7 +536,42 @@ function onComposerBlur(): void {
           <span class="text-sm font-semibold" data-testid="thread-title">
             {{ displayName(ws.activeConversation) }}
           </span>
+          <svg
+            v-if="ws.activeConversation.kind === 'secret'"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            class="h-3.5 w-3.5 shrink-0 text-emerald-600 dark:text-emerald-400"
+            data-testid="thread-lock"
+            aria-hidden="true"
+          >
+            <rect x="5" y="11" width="14" height="9" rx="2" />
+            <path d="M8 11V7a4 4 0 0 1 8 0v4" />
+          </svg>
         </header>
+
+        <!-- M3 safety code row: compare with the peer out-of-band -->
+        <div
+          v-if="ws.activeConversation?.kind === 'secret'"
+          class="flex shrink-0 flex-wrap items-center gap-x-2 gap-y-0.5 border-b border-neutral-200 px-4 py-1.5 text-[11px] dark:border-neutral-800"
+          data-testid="sas-row"
+        >
+          <span class="font-medium text-neutral-500 dark:text-neutral-400">
+            {{ t("chat.sasLabel") }}
+          </span>
+          <code
+            class="font-mono text-xs font-semibold tracking-widest text-emerald-700 dark:text-emerald-300"
+            data-testid="sas-code"
+          >
+            {{ sasCode ?? t("chat.sasPending") }}
+          </code>
+          <span class="text-neutral-400 dark:text-neutral-500">
+            {{ t("chat.sasHint") }}
+          </span>
+        </div>
 
         <!-- Message list -->
         <div
@@ -476,9 +609,17 @@ function onComposerBlur(): void {
                 >
                   {{ message.senderId }}
                 </div>
+                <!-- M3 undecryptable: localized placeholder replaces content -->
+                <div
+                  v-if="message.undecryptable"
+                  class="inline-block rounded-2xl bg-slate-100 px-3 py-1.5 text-sm italic leading-relaxed text-neutral-400 break-words dark:bg-slate-800 dark:text-neutral-500"
+                  data-testid="undecryptable-placeholder"
+                >
+                  {{ t("chat.undecryptablePlaceholder") }}
+                </div>
                 <!-- Recall tombstone: localized placeholder replaces content -->
                 <div
-                  v-if="message.recalled"
+                  v-else-if="message.recalled"
                   class="inline-block rounded-2xl bg-slate-100 px-3 py-1.5 text-sm italic leading-relaxed text-neutral-400 break-words dark:bg-slate-800 dark:text-neutral-500"
                   data-testid="recalled-placeholder"
                 >
@@ -510,10 +651,10 @@ function onComposerBlur(): void {
                   {{ message.body }}
                 </div>
                 <!-- Hover/tap action row: reply / forward / recall.
-                     Tombstones offer no actions — there is nothing left
-                     to reply to, forward, or recall again. -->
+                     Tombstones and undecryptable placeholders offer no
+                     actions — there is nothing left to act on. -->
                 <div
-                  v-if="!message.recalled"
+                  v-if="!message.recalled && !message.undecryptable"
                   class="mt-0.5 flex items-center gap-2 text-[11px] opacity-0 transition-opacity group-hover:opacity-100 focus-within:opacity-100"
                   :class="message.mine ? 'justify-end' : 'justify-start'"
                   data-testid="message-actions"

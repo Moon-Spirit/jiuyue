@@ -95,6 +95,14 @@ const en: MessageSchema = {
     replyCancel: "Cancel reply",
     forwardPickerTitle: "Forward to…",
     forwardPickerCancel: "Cancel",
+    kindDirect: "Normal",
+    kindSecret: "Secret",
+    secretBanner:
+      "Secret messages are bound to this device and never sync to other devices",
+    sasLabel: "Safety code",
+    sasHint: "Compare this code with your peer to verify the channel",
+    sasPending: "Available once the session is set up",
+    undecryptablePlaceholder: "Undecryptable message",
   },
   errors: {
     invalid_credentials: "Incorrect account or password",
@@ -104,6 +112,8 @@ const en: MessageSchema = {
     validation_error:
       "Submitted information is invalid, please check and retry",
     peer_not_found: "The other party does not exist",
+    no_one_time_keys:
+      "The peer has run out of one-time keys; ask them to come online and retry",
     bad_request: "Invalid request, please retry",
     network_error: "Network error, check your connection and retry",
     unknown: "Something went wrong, please retry later",

@@ -8,22 +8,35 @@ export interface ConversationPeer {
   username: string;
 }
 
-/** POST /api/conversations → 201 { conversation_id, peer, created } */
+/** Conversation kind: plain direct chat or end-to-end encrypted secret chat. */
+export type ConversationKind = "direct" | "secret";
+
+/** POST /api/conversations → 201 { conversation_id, peer, created, kind } */
 export interface CreateConversationResult {
   conversation_id: number;
   peer: ConversationPeer;
   /** False when the conversation already existed (idempotent open). */
   created: boolean;
+  /** Echoed by the server ("secret" when the secret kind was requested). */
+  kind: string;
 }
 
-/** POST /api/conversations { peer_username } (Bearer access). */
+/**
+ * POST /api/conversations { peer_username, kind? } (Bearer access).
+ * `kind` is only sent when "secret" — omitting it keeps M1/M2 request
+ * bodies byte-identical for plain conversations.
+ */
 export function createConversation(
   accessToken: string,
   peerUsername: string,
+  kind: ConversationKind = "direct",
 ): Promise<CreateConversationResult> {
   return apiRequest<CreateConversationResult>("/api/conversations", {
     method: "POST",
-    body: { peer_username: peerUsername },
+    body:
+      kind === "secret"
+        ? { peer_username: peerUsername, kind }
+        : { peer_username: peerUsername },
     accessToken,
   });
 }
@@ -64,6 +77,8 @@ export function apiErrorMessage(error: unknown, translate: Translate): string {
       return translate("errors.validation_error");
     case "peer_not_found":
       return translate("errors.peer_not_found");
+    case "no_one_time_keys":
+      return translate("errors.no_one_time_keys");
     case "bad_request":
       return translate("errors.bad_request");
     case "network_error":

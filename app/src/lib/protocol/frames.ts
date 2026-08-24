@@ -21,6 +21,7 @@
  * | typing           | C ⇄ S     | `{ conversation_id, state: "start"\|"stop", user_id? }`        |
  * | msg.recall       | C → S     | `{ conversation_id, message_id }`                              |
  * | msg.recalled     | S → C     | `{ conversation_id, message_id }`                              |
+ * | e2ee.msg         | C ⇄ S     | `{ conversation_id, ciphertext, message_type }`                |
  * | error            | S → C     | `{ code, message, retryable }`                                 |
  *
  * M2 optional `msg.*` metadata fields are null-absent: absent on the wire
@@ -134,6 +135,20 @@ export interface MsgRecalled {
   message_id: string;
 }
 
+/**
+ * M3 secret chats: opaque end-to-end ciphertext relayed verbatim in both
+ * directions (and replayed by sync). The server stores the bytes but can
+ * never read them; `message_type` is 0 for a session-init message and 1 for
+ * a normal ratchet message (see lib/crypto/olm-lite.ts).
+ */
+export interface E2eeMsg {
+  conversation_id: number;
+  /** base64 payload produced by lib/crypto/olm-lite. */
+  ciphertext: string;
+  /** 0 = session-init, 1 = normal ratchet message. */
+  message_type: number;
+}
+
 export type ErrorCode =
   | "bad_request"
   | "unauthorized"
@@ -162,6 +177,7 @@ export const FRAME_TYPES = [
   "typing",
   "msg.recall",
   "msg.recalled",
+  "e2ee.msg",
   "error",
 ] as const;
 
@@ -186,6 +202,7 @@ export type Frame =
   | Envelope<"typing", Typing>
   | Envelope<"msg.recall", MsgRecall>
   | Envelope<"msg.recalled", MsgRecalled>
+  | Envelope<"e2ee.msg", E2eeMsg>
   | Envelope<"error", ErrorPayload>;
 
 /** Thrown when a raw value cannot be interpreted as a v1 frame at all. */
@@ -331,13 +348,20 @@ export function isMsgRecall(d: unknown): d is MsgRecall {
     isRecord(d) && hasInt(d, "conversation_id") && hasString(d, "message_id")
   );
 }
-
 export function isMsgRecalled(d: unknown): d is MsgRecalled {
   return (
     isRecord(d) && hasInt(d, "conversation_id") && hasString(d, "message_id")
   );
 }
 
+export function isE2eeMsg(d: unknown): d is E2eeMsg {
+  return (
+    isRecord(d) &&
+    hasInt(d, "conversation_id") &&
+    hasString(d, "ciphertext") &&
+    hasInt(d, "message_type")
+  );
+}
 const PAYLOAD_GUARDS: { [T in FrameType]: (d: unknown) => boolean } = {
   "auth.ticket.req": isAuthTicketReq,
   "auth.ticket.res": isAuthTicketRes,
@@ -351,6 +375,7 @@ const PAYLOAD_GUARDS: { [T in FrameType]: (d: unknown) => boolean } = {
   typing: isTyping,
   "msg.recall": isMsgRecall,
   "msg.recalled": isMsgRecalled,
+  "e2ee.msg": isE2eeMsg,
   error: isErrorPayload,
 };
 

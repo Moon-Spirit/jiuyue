@@ -6,7 +6,10 @@ import {
   createConversation as apiCreateConversation,
   listConversations,
 } from "../lib/api/messages";
+import type { ConversationKind } from "../lib/api/messages";
+import * as olm from "../lib/crypto/olm-lite";
 import type {
+  E2eeMsg,
   ErrorCode,
   ErrorPayload,
   Frame,
@@ -69,6 +72,11 @@ export interface ChatMessage {
   replyToSenderId: string | null;
   replyToBodyPreview: string | null;
   forwardedFromUsername: string | null;
+  /**
+   * M3 secret chats: true when the ciphertext could not be decrypted
+   * (missing session / tampered payload); renders a localized placeholder.
+   */
+  undecryptable?: boolean;
 }
 
 export interface Conversation {
@@ -87,6 +95,11 @@ export interface Conversation {
    * (transient, never meaningful across reloads).
    */
   peerTypingUntil: number | null;
+  /**
+   * M3: "secret" conversations carry end-to-end encrypted traffic over
+   * e2ee.msg frames; absent/undefined means "direct".
+   */
+  kind?: ConversationKind;
 }
 
 /** Composer-level reply context shown above the input until cancelled. */
@@ -172,6 +185,7 @@ function loadPersistedConversations(): Conversation[] {
       maxSeq: Number(c["maxSeq"] ?? 0),
       peerTypingUntil:
         typeof c["peerTypingUntil"] === "number" ? c["peerTypingUntil"] : null,
+      kind: c["kind"] === "secret" ? "secret" : "direct",
     }));
   } catch {
     // Corrupted cache degrades to an empty list; sync will repopulate.
@@ -223,6 +237,7 @@ function loadPersistedMessages(): Record<number, ChatMessage[]> {
           typeof m["forwardedFromUsername"] === "string"
             ? m["forwardedFromUsername"]
             : null,
+        undecryptable: m["undecryptable"] === true,
       }));
     }
   } catch {
@@ -249,6 +264,25 @@ let typingActive = false;
 const readUpdateTimers = new Map<number, ReturnType<typeof setTimeout>>();
 /** Highest seq already reported via read.update per conversation. */
 const lastSentReadSeq = new Map<number, number>();
+/**
+ * M3: this tab already uploaded its key bundle (the endpoint is an
+ * idempotent upsert, so re-publishing would be harmless — the flag just
+ * avoids redundant round-trips).
+ */
+let identityPublished = false;
+
+/**
+ * Deterministic local id for e2ee bubbles (djb2 over the ciphertext): the
+ * server assigns no message_id/seq to opaque ciphertext, and sync replays
+ * carry identical bytes, so hashing gives stable cross-replay dedupe.
+ */
+function pseudoE2eeId(ciphertext: string): string {
+  let hash = 5381;
+  for (let i = 0; i < ciphertext.length; i += 1) {
+    hash = ((hash * 33) ^ ciphertext.charCodeAt(i)) >>> 0;
+  }
+  return `e2ee-${hash.toString(16).padStart(8, "0")}-${ciphertext.length}`;
+}
 
 function clearTypingExpiry(conversationId: number): void {
   const timer = typingExpiryTimers.get(conversationId);
@@ -469,6 +503,7 @@ export const useWsStore = defineStore("ws", {
               lastSeenSeq: 0,
               maxSeq: 0,
               peerTypingUntil: null,
+              kind: item.kind === "secret" ? "secret" : "direct",
             });
           }
           this.persistConversations();
@@ -536,6 +571,9 @@ export const useWsStore = defineStore("ws", {
         case "msg.recalled":
           this.handleMsgRecalled(frame.d);
           break;
+        case "e2ee.msg":
+          this.handleE2eeMsg(frame.d);
+          break;
         case "error":
           this.handleErrorFrame(frame.d);
           break;
@@ -600,6 +638,7 @@ export const useWsStore = defineStore("ws", {
           lastSeenSeq: 0,
           maxSeq: 0,
           peerTypingUntil: null,
+          kind: "direct",
         };
         this.conversations.push(conversation);
       }
@@ -758,6 +797,152 @@ export const useWsStore = defineStore("ws", {
       this.persistMessages(payload.conversation_id);
     },
 
+    // ------------------------------------------------------------------
+    // M3 secret chats (end-to-end encrypted)
+    // ------------------------------------------------------------------
+
+    /**
+     * Ensures the device can participate in `conversationId`'s secret chat:
+     * publishes this device's key bundle once per tab, then fetches the
+     * peer's bundle and installs the initiator session. Throws on failure
+     * (callers decide whether to surface it).
+     */
+    async setupSecretConversation(
+      conversationId: number,
+      peerUsername: string,
+    ): Promise<void> {
+      const auth = useAuthStore();
+      const token = await auth.ensureAccessToken();
+      if (token === null) return;
+      if (!identityPublished) {
+        await olm.publishBundle(token);
+        identityPublished = true;
+      }
+      await olm.fetchPeerBundleAndEstablish(
+        peerUsername,
+        conversationId,
+        token,
+      );
+    },
+
+    /** Inbound opaque ciphertext: decrypt → bubble, or failure placeholder. */
+    handleE2eeMsg(payload: E2eeMsg): void {
+      const conversation = this.conversations.find(
+        (c) => c.conversationId === payload.conversation_id,
+      );
+      if (conversation === undefined || conversation.kind !== "secret") return;
+      void this.decryptAndIngest(conversation, payload);
+    },
+
+    async decryptAndIngest(
+      conversation: Conversation,
+      payload: E2eeMsg,
+    ): Promise<void> {
+      let plaintext: string | null = null;
+      let mine = false;
+      try {
+        const envelope = await olm.decryptEnvelope(
+          conversation.conversationId,
+          payload.ciphertext,
+        );
+        plaintext = envelope.plaintext;
+        mine = envelope.senderIdentity === (await olm.ensureIdentity());
+      } catch (error) {
+        console.warn("[ws] e2ee decrypt failed", error);
+      }
+      if (plaintext !== null && !mine) {
+        // Own multi-device echoes decrypt fine but must not bump unread.
+        this.clearPeerTyping(conversation.conversationId);
+      }
+      this.appendE2eeBubble(
+        conversation,
+        pseudoE2eeId(payload.ciphertext),
+        mine,
+        plaintext,
+      );
+    },
+
+    /**
+     * Appends a decrypted e2ee bubble (or an undecryptable placeholder when
+     * `plaintext` is null). e2ee traffic has no server seq — bubbles keep
+     * seq:null and never touch sync cursors, only local display state.
+     */
+    appendE2eeBubble(
+      conversation: Conversation,
+      messageId: string,
+      mine: boolean,
+      plaintext: string | null,
+    ): void {
+      const messages =
+        this.messagesByConversation[conversation.conversationId] ?? [];
+      // Sync replays carry identical ciphertext bytes → identical id.
+      if (messages.some((m) => m.messageId === messageId)) return;
+      const sentAt = new Date().toISOString();
+      messages.push({
+        clientMsgId: "",
+        messageId,
+        conversationId: conversation.conversationId,
+        seq: null,
+        senderId: mine ? this.mySenderId() : conversation.peerUserId,
+        body: plaintext ?? "",
+        sentAt,
+        mine,
+        status: "delivered",
+        recalled: false,
+        replyToMessageId: null,
+        replyToSenderId: null,
+        replyToBodyPreview: null,
+        forwardedFromUsername: null,
+        undecryptable: plaintext === null,
+      });
+      this.sortMessages(messages);
+      this.messagesByConversation[conversation.conversationId] = messages;
+
+      if (!mine && plaintext !== null) {
+        conversation.lastMessagePreview = plaintext;
+        conversation.lastActivityAt = sentAt;
+        if (this.activeConversationId !== conversation.conversationId) {
+          conversation.unread += 1;
+        }
+      }
+      this.persistConversations();
+      this.persistMessages(conversation.conversationId);
+    },
+
+    /**
+     * Encrypts and transmits one secret message as an e2ee.msg frame.
+     * Offline sends are queued already-encrypted (counters stay consistent);
+     * transport rejection or engine errors fail the optimistic bubble.
+     */
+    async transmitSecretMessage(
+      message: ChatMessage,
+      plaintext: string,
+    ): Promise<void> {
+      try {
+        const { ciphertext, messageType } = await olm.encrypt(
+          message.conversationId,
+          plaintext,
+        );
+        const frame: Frame = {
+          v: 1,
+          t: "e2ee.msg",
+          d: {
+            conversation_id: message.conversationId,
+            ciphertext,
+            message_type: messageType,
+          },
+        };
+        const outcome = this.transmitFrame(frame);
+        if (outcome === "queued") this.queuedFrames.push(frame);
+        else if (outcome === "rejected") message.status = "failed";
+      } catch (error) {
+        console.warn("[ws] e2ee encrypt failed", error);
+        message.status = "failed";
+      } finally {
+        this.persistMessages(message.conversationId);
+      }
+    },
+
     handleErrorFrame(payload: ErrorPayload): void {
       // parseFrame degrades unknown frame types (e.g. server pings) to
       // error{code:"unknown_type"} 鈥?those are heartbeat noise, not failures.
@@ -804,6 +989,7 @@ export const useWsStore = defineStore("ws", {
           lastSeenSeq: 0,
           maxSeq: 0,
           peerTypingUntil: null,
+          kind: "direct",
         };
         this.conversations.push(conversation);
       }
@@ -837,25 +1023,33 @@ export const useWsStore = defineStore("ws", {
       const replyTo = this.replyContext?.messageId;
       this.clearReplyContext();
 
-      const frame: Frame = {
-        v: 1,
-        t: "msg.send",
-        d: {
-          conversation_id: conversationId,
-          client_msg_id: message.clientMsgId,
-          body: trimmed,
-          ...(replyTo !== undefined && replyTo !== null
-            ? { reply_to: replyTo }
-            : {}),
-        },
-      };
-      const outcome = this.transmitFrame(frame);
-      if (outcome === "queued") {
-        // Socket not open: hold in memory; flushed automatically on open.
-        this.queuedFrames.push(frame);
-      } else if (outcome === "rejected") {
-        // Send rejection surfaces as an explicit failure on the message.
-        message.status = "failed";
+      if (conversation.kind === "secret") {
+        // M3 secret chat: the wire carries opaque ciphertext only; the
+        // plaintext stays in the local bubble for display. send() stays
+        // synchronous — encryption + transmission happen in the background
+        // and flip the bubble to failed on error.
+        void this.transmitSecretMessage(message, trimmed);
+      } else {
+        const frame: Frame = {
+          v: 1,
+          t: "msg.send",
+          d: {
+            conversation_id: conversationId,
+            client_msg_id: message.clientMsgId,
+            body: trimmed,
+            ...(replyTo !== undefined && replyTo !== null
+              ? { reply_to: replyTo }
+              : {}),
+          },
+        };
+        const outcome = this.transmitFrame(frame);
+        if (outcome === "queued") {
+          // Socket not open: hold in memory; flushed automatically on open.
+          this.queuedFrames.push(frame);
+        } else if (outcome === "rejected") {
+          // Send rejection surfaces as an explicit failure on the message.
+          message.status = "failed";
+        }
       }
 
       this.persistConversations();
@@ -875,17 +1069,26 @@ export const useWsStore = defineStore("ws", {
         if (entry === undefined) continue;
 
         entry.status = "sending";
-        const frame: Frame = {
-          v: 1,
-          t: "msg.send",
-          d: {
-            conversation_id: entry.conversationId,
-            client_msg_id: entry.clientMsgId,
-            body: entry.body,
-          },
-        };
-        if (this.transmitFrame(frame) === "queued")
-          this.queuedFrames.push(frame);
+        const owner = this.conversations.find(
+          (c) => c.conversationId === entry.conversationId,
+        );
+        if (owner?.kind === "secret") {
+          // Re-encrypt with fresh ratchet keys (the original ciphertext is
+          // unrecoverable); the peer may render both copies — MVP tradeoff.
+          void this.transmitSecretMessage(entry, entry.body);
+        } else {
+          const frame: Frame = {
+            v: 1,
+            t: "msg.send",
+            d: {
+              conversation_id: entry.conversationId,
+              client_msg_id: entry.clientMsgId,
+              body: entry.body,
+            },
+          };
+          if (this.transmitFrame(frame) === "queued")
+            this.queuedFrames.push(frame);
+        }
         this.persistMessages(entry.conversationId);
         return;
       }
@@ -1039,13 +1242,14 @@ export const useWsStore = defineStore("ws", {
 
     async createOrOpenConversation(
       peerUsername: string,
+      kind: ConversationKind = "direct",
     ): Promise<Conversation> {
       const auth = useAuthStore();
       const token = await auth.ensureAccessToken();
       if (token === null) {
         throw new ApiError(0, "network_error", "not signed in");
       }
-      const result = await apiCreateConversation(token, peerUsername);
+      const result = await apiCreateConversation(token, peerUsername, kind);
 
       let conversation = this.conversations.find(
         (c) => c.conversationId === result.conversation_id,
@@ -1061,13 +1265,26 @@ export const useWsStore = defineStore("ws", {
           lastSeenSeq: 0,
           maxSeq: 0,
           peerTypingUntil: null,
+          kind: result.kind === "secret" ? "secret" : "direct",
         };
         this.conversations.push(conversation);
       } else {
         conversation.peerUserId = result.peer.user_id;
         conversation.peerUsername = result.peer.username;
+        if (kind === "secret") conversation.kind = "secret";
       }
       this.persistConversations();
+      // Establish the crypto session BEFORE the thread opens so the very
+      // first message can be encrypted (errors propagate to the caller UI).
+      if (
+        conversation.kind === "secret" &&
+        !olm.hasSession(conversation.conversationId)
+      ) {
+        await this.setupSecretConversation(
+          conversation.conversationId,
+          conversation.peerUsername,
+        );
+      }
       this.openConversation(result.conversation_id);
       return conversation;
     },
@@ -1084,6 +1301,17 @@ export const useWsStore = defineStore("ws", {
       if (conversation === undefined) return;
       conversation.unread = 0;
       conversation.lastSeenSeq = conversation.maxSeq;
+      // M3: lazily-discovered secret conversations (sync/bootstrap) set up
+      // their crypto session in the background; failures are non-fatal here
+      // because inbound e2ee.msg degrades to the undecryptable placeholder.
+      if (conversation.kind === "secret" && !olm.hasSession(conversationId)) {
+        void this.setupSecretConversation(
+          conversationId,
+          conversation.peerUsername,
+        ).catch((error) => {
+          console.warn("[ws] secret session setup failed", error);
+        });
+      }
       if (conversation.peerTypingUntil !== null) {
         if (conversation.peerTypingUntil <= Date.now()) {
           conversation.peerTypingUntil = null;
