@@ -45,3 +45,9 @@
 ## 五、teardown 凭证
 
 QA 结束时停止：jiuyue-server.exe 后端进程、vite dev server、playwright chromium 临时上下文。持久服务保留：PostgreSQL 16（系统服务）、redis-server（C:\tools\redis，PID 文件随附）。测试数据（qa__/vis__/dbg_* 用户与会话）留存于 jiuyue_dev 库供复核，可用 `TRUNCATE users CASCADE` 清空。
+
+## 六、M2 补录（2026-08-24）
+
+- 新增测试：协议 golden ×9（read/typing/recall/扩展 msg.new）、m2_flow.rs 集成 8 用例、前端 store/UI 测试至 100/100。全门禁绿：Rust 79 passed + clippy 干净；typecheck 0。
+- 真实网络取证 `scripts/qa/m2-e2e.mjs` → **PASS**（转录 docs/reports/m1/evidence-m2-transcript.jsonl）：typing.relayed_to_peer / readreceipt.peer_notified / recall.broadcast_both_sides / recall.sync_serves_tombstone_no_body / recall.non_sender_not_broadcast。
+- 语义决定：非发送者撤回的错误帧只回给尝试者（策略答复不断连）；网络层断言为"不产生墓碑广播"。
