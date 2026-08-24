@@ -1,6 +1,31 @@
-import { ApiError } from "./client";
+import { apiRequest, ApiError } from "./client";
 
 type Translate = (key: string) => string;
+
+export interface ConversationPeer {
+  user_id: number;
+  username: string;
+}
+
+/** POST /api/conversations → 201 { conversation_id, peer, created } */
+export interface CreateConversationResult {
+  conversation_id: number;
+  peer: ConversationPeer;
+  /** False when the conversation already existed (idempotent open). */
+  created: boolean;
+}
+
+/** POST /api/conversations { peer_username } (Bearer access). */
+export function createConversation(
+  accessToken: string,
+  peerUsername: string,
+): Promise<CreateConversationResult> {
+  return apiRequest<CreateConversationResult>("/api/conversations", {
+    method: "POST",
+    body: { peer_username: peerUsername },
+    accessToken,
+  });
+}
 
 /**
  * Maps an API failure to a localized human message using the backend's
