@@ -2,7 +2,10 @@ import { defineStore } from "pinia";
 import { toRaw } from "vue";
 import { requestWsTicket } from "../lib/api/auth";
 import { ApiError } from "../lib/api/client";
-import { createConversation as apiCreateConversation } from "../lib/api/messages";
+import {
+  createConversation as apiCreateConversation,
+  listConversations,
+} from "../lib/api/messages";
 import type {
   ErrorCode,
   ErrorPayload,
@@ -24,17 +27,16 @@ import { useAuthStore } from "./auth";
  * conversation/message cache persisted to localStorage.
  *
  * Wire contract (frozen, see lib/protocol/frames.ts):
- * - connect: POST /api/auth/ws-ticket → GET /ws?ticket=…&platform=web
+ * - connect: POST /api/auth/ws-ticket 鈫?GET /ws?ticket=鈥?platform=web
  * - on open: sync.req{cursors:[{conversation_id,last_delivered_seq}]} for ALL
  *   known conversations; cursor = highest seq the client has seen locally.
- * - msg.ack resolves the matching optimistic entry (duplicate:true merges —
- *   never a second bubble); msg.new appends + bumps preview/unread/cursor;
+ * - msg.ack resolves the matching optimistic entry (duplicate:true merges 鈥? *   never a second bubble); msg.new appends + bumps preview/unread/cursor;
  *   sync.res merges idempotently by message_id and (conversation_id, seq).
  * - error frames carry no client_msg_id, so on failure every in-flight
  *   "sending" entry flips to "failed"; retry() reuses the SAME client_msg_id,
  *   which server-side dedupe makes safe.
  *
- * Reconnect: exponential backoff 500ms·2^n capped at 15s with ±20% jitter.
+ * Reconnect: exponential backoff 500ms路2^n capped at 15s with 卤20% jitter.
  * Staleness: a socket silent for STALE_AFTER_MS is closed locally and re-
  * connected through the normal path (server pings count as activity).
  */
@@ -60,14 +62,14 @@ export interface ChatMessage {
 
 export interface Conversation {
   conversationId: number;
-  peerUserId: number;
+  peerUserId: string;
   peerUsername: string;
   lastMessagePreview: string | null;
   lastActivityAt: string;
   unread: number;
   /** Highest seq marked as read (opening the conversation advances this). */
   lastSeenSeq: number;
-  /** Highest seq seen locally — sent as the sync cursor on reconnect. */
+  /** Highest seq seen locally 鈥?sent as the sync cursor on reconnect. */
   maxSeq: number;
 }
 
@@ -81,7 +83,7 @@ export const STALE_AFTER_MS = 90_000;
 export const STALE_CHECK_INTERVAL_MS = 15_000;
 
 /**
- * Backoff schedule for reconnect attempt `n` (0-based): 500ms·2^n capped at
+ * Backoff schedule for reconnect attempt `n` (0-based): 500ms路2^n capped at
  * 15s, multiplied by a jitter factor in [0.8, 1.2), then clamped to the cap.
  * `rand` is injectable for deterministic tests.
  */
@@ -117,7 +119,7 @@ function loadPersistedConversations(): Conversation[] {
     if (!Array.isArray(parsed)) return [];
     return parsed.filter(isRecord).map((c) => ({
       conversationId: Number(c["conversationId"]),
-      peerUserId: Number(c["peerUserId"]),
+      peerUserId: String(c["peerUserId"] ?? ""),
       peerUsername: String(c["peerUsername"] ?? ""),
       lastMessagePreview:
         typeof c["lastMessagePreview"] === "string"
@@ -165,7 +167,7 @@ function loadPersistedMessages(): Record<number, ChatMessage[]> {
   return out;
 }
 
-/** Module-level connection handles — one live socket per tab. */
+/** Module-level connection handles 鈥?one live socket per tab. */
 let socket: WebSocket | null = null;
 let intentionalClose = false;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -247,7 +249,7 @@ export const useWsStore = defineStore("ws", {
       try {
         ticket = (await requestWsTicket(token)).ticket;
       } catch {
-        // Ticket endpoint unreachable — back off and try again.
+        // Ticket endpoint unreachable 鈥?back off and try again.
         this.scheduleReconnect();
         return;
       }
@@ -329,24 +331,67 @@ export const useWsStore = defineStore("ws", {
     onSocketOpen(): void {
       const ws = socket;
       if (ws === null) return;
-      // Cursor sync first: gap-fill before anything else flows.
-      const syncReq: Frame = {
-        v: 1,
-        t: "sync.req",
-        d: {
-          cursors: this.conversations.map((c) => ({
-            conversation_id: c.conversationId,
-            last_delivered_seq: c.maxSeq,
-          })),
-        },
+      // Bootstrap conversation discovery, then cursor-sync. Fresh sessions
+      // (new browser/device) know no conversation ids locally; without the
+      // server listing their sync.req would cover nothing (user story 7:
+      // identical history on every device).
+      const bootstrap = async () => {
+        try {
+          const auth = useAuthStore();
+          const token = await auth.ensureAccessToken();
+          if (token === null) return;
+          const remote = await listConversations(token);
+          for (const item of remote) {
+            if (
+              this.conversations.some(
+                (c) => c.conversationId === item.conversation_id,
+              )
+            ) {
+              continue;
+            }
+            this.conversations.push({
+              conversationId: item.conversation_id,
+              peerUserId: item.peer?.user_id ?? "",
+              peerUsername: item.peer?.username ?? "",
+              lastMessagePreview: null,
+              lastActivityAt: "",
+              // Device-local unseen count: sync arrivals increment it; the
+              // server-side approximation would double-count after bootstrap.
+              unread: 0,
+              // Server cursors describe what the USER has received elsewhere;
+              // THIS device's cache starts empty, so sync pulls full history
+              // (user story 7) instead of trusting last_seq as local truth.
+              lastSeenSeq: 0,
+              maxSeq: 0,
+            });
+          }
+          this.persistConversations();
+        } catch (error) {
+          // Bootstrap is best-effort: local-only sync still works for
+          // sessions that already know their conversations.
+          console.warn("[ws] conversation bootstrap failed", error);
+        }
+        if (socket !== ws || ws.readyState !== 1) return; // 1 = OPEN (no WebSocket global under mocked envs)
+        // Cursor sync first: gap-fill before anything else flows.
+        const syncReq: Frame = {
+          v: 1,
+          t: "sync.req",
+          d: {
+            cursors: this.conversations.map((c) => ({
+              conversation_id: c.conversationId,
+              last_delivered_seq: c.maxSeq,
+            })),
+          },
+        };
+        ws.send(JSON.stringify(serializeFrame(syncReq)));
+        // Then flush everything queued while offline.
+        const stillQueued: Frame[] = [];
+        for (const frame of this.queuedFrames) {
+          if (this.transmitFrame(frame) !== "sent") stillQueued.push(frame);
+        }
+        this.queuedFrames = stillQueued;
       };
-      ws.send(JSON.stringify(serializeFrame(syncReq)));
-      // Then flush everything queued while offline.
-      const stillQueued: Frame[] = [];
-      for (const frame of this.queuedFrames) {
-        if (this.transmitFrame(frame) !== "sent") stillQueued.push(frame);
-      }
-      this.queuedFrames = stillQueued;
+      void bootstrap();
     },
 
     // ------------------------------------------------------------------
@@ -419,7 +464,7 @@ export const useWsStore = defineStore("ws", {
         return;
       }
       // Unknown client_msg_id (e.g. pending entry lost): nothing to attach
-      // the ack to — the message body would be unrecoverable, so ignore.
+      // the ack to 鈥?the message body would be unrecoverable, so ignore.
     },
 
     ingestMessage(m: MsgNew): void {
@@ -430,7 +475,7 @@ export const useWsStore = defineStore("ws", {
         // Sync can surface conversations this client has never opened.
         conversation = {
           conversationId: m.conversation_id,
-          peerUserId: 0,
+          peerUserId: "",
           peerUsername: "",
           lastMessagePreview: null,
           lastActivityAt: "",
@@ -444,7 +489,7 @@ export const useWsStore = defineStore("ws", {
       const mine = m.sender_id === this.mySenderId();
       const messages = this.messagesByConversation[m.conversation_id] ?? [];
 
-      // Idempotent re-delivery: same message_id or same (conv, seq) → skip.
+      // Idempotent re-delivery: same message_id or same (conv, seq) 鈫?skip.
       const duplicate = messages.some(
         (msg) =>
           msg.messageId === m.message_id ||
@@ -521,7 +566,7 @@ export const useWsStore = defineStore("ws", {
 
     handleErrorFrame(payload: ErrorPayload): void {
       // parseFrame degrades unknown frame types (e.g. server pings) to
-      // error{code:"unknown_type"} — those are heartbeat noise, not failures.
+      // error{code:"unknown_type"} 鈥?those are heartbeat noise, not failures.
       if (payload.code === "unknown_type") return;
 
       this.lastError = { ...payload };
@@ -557,7 +602,7 @@ export const useWsStore = defineStore("ws", {
       if (conversation === undefined) {
         conversation = {
           conversationId,
-          peerUserId: 0,
+          peerUserId: "",
           peerUsername: "",
           lastMessagePreview: null,
           lastActivityAt: "",
@@ -648,7 +693,7 @@ export const useWsStore = defineStore("ws", {
       if (ws === null || ws.readyState !== 1) return "queued";
       try {
         // toRaw: frames sourced from reactive state (queuedFrames) are Vue
-        // proxies, which structuredClone rejects — serialize the raw target.
+        // proxies, which structuredClone rejects 鈥?serialize the raw target.
         ws.send(JSON.stringify(serializeFrame(toRaw(frame))));
         return "sent";
       } catch {
@@ -717,7 +762,7 @@ export const useWsStore = defineStore("ws", {
     mySenderId(): string {
       const auth = useAuthStore();
       const userId = auth.user?.userId;
-      return typeof userId === "number" && userId > 0 ? String(userId) : "";
+      return typeof userId === "string" && userId.length > 0 ? userId : "";
     },
 
     sortMessages(messages: ChatMessage[]): void {

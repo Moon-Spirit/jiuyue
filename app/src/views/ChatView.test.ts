@@ -24,7 +24,7 @@ function conversation(
 ): Conversation {
   return {
     conversationId,
-    peerUserId: 100 + conversationId,
+    peerUserId: String(100 + conversationId),
     peerUsername: `peer${conversationId}`,
     lastMessagePreview: null,
     lastActivityAt: "",
@@ -87,7 +87,7 @@ describe("ChatView — sessions pane", () => {
   it("lists conversations by recent activity with preview, relative time and unread badge", async () => {
     const pinia = createPinia();
     setActivePinia(pinia);
-    useAuthStore().user = { userId: 7, username: "me" };
+    useAuthStore().user = { userId: "7", username: "me" };
     const ws = useWsStore();
     ws.conversations.push(
       conversation(1, {
@@ -148,7 +148,7 @@ describe("ChatView — message thread", () => {
   }> {
     const pinia = createPinia();
     setActivePinia(pinia);
-    useAuthStore().user = { userId: 7, username: "me" };
+    useAuthStore().user = { userId: "7", username: "me" };
     const ws = useWsStore();
     ws.conversations.push(conversation(1, { peerUsername: "alice" }));
     ws.messagesByConversation[1] = [
@@ -254,7 +254,7 @@ describe("ChatView — unread and composer", () => {
   }> {
     const pinia = createPinia();
     setActivePinia(pinia);
-    useAuthStore().user = { userId: 7, username: "me" };
+    useAuthStore().user = { userId: "7", username: "me" };
     const ws = useWsStore();
     ws.conversations.push(
       conversation(2, {

@@ -6,12 +6,16 @@ import {
   requestCode as apiRequestCode,
 } from "../lib/api/auth";
 import type { AuthChannel, RegisterInput } from "../lib/api/auth";
+import {
+  secureLoadRefresh,
+  secureRemoveRefresh,
+  secureStoreRefresh,
+} from "../lib/secure";
 
-const REFRESH_TOKEN_KEY = "jiuyue.refresh";
 const USER_KEY = "jiuyue.user";
 
 export interface AuthUser {
-  userId: number;
+  userId: string;
   username: string;
 }
 
@@ -34,7 +38,7 @@ function readPersistedUser(): AuthUser | null {
     const parsed: unknown = JSON.parse(raw);
     if (!isRecord(parsed)) return null;
     const { userId, username } = parsed;
-    if (typeof userId === "number" && typeof username === "string") {
+    if (typeof userId === "string" && userId.length > 0 && typeof username === "string") {
       return { userId, username };
     }
     return null;
@@ -44,15 +48,6 @@ function readPersistedUser(): AuthUser | null {
   }
 }
 
-/**
- * The login endpoint returns tokens only (no profile), so derive a display
- * name from the identifier. Replaced once a profile endpoint exists.
- */
-function displayNameFromIdentifier(identifier: string): string {
-  const [name] = identifier.split("@");
-  if (name === undefined || name.length === 0) return identifier;
-  return name;
-}
 
 export const useAuthStore = defineStore("auth", {
   state: () => ({
@@ -72,7 +67,7 @@ export const useAuthStore = defineStore("auth", {
       this.status = "loading";
       try {
         const result = await apiRegister(input);
-        this.adoptTokens(result.access_token, result.refresh_token, {
+        await this.adoptTokens(result.access_token, result.refresh_token, {
           userId: result.user_id,
           username: result.username,
         });
@@ -85,10 +80,10 @@ export const useAuthStore = defineStore("auth", {
     async login(identifier: string, password: string): Promise<void> {
       this.status = "loading";
       try {
-        const tokens = await apiLogin(identifier, password);
-        this.adoptTokens(tokens.access_token, tokens.refresh_token, {
-          userId: 0,
-          username: displayNameFromIdentifier(identifier),
+        const result = await apiLogin(identifier, password);
+        await this.adoptTokens(result.access_token, result.refresh_token, {
+          userId: result.user_id,
+          username: result.username,
         });
       } catch (error) {
         this.status = "anon";
@@ -117,41 +112,41 @@ export const useAuthStore = defineStore("auth", {
       return access !== null;
     },
 
-    logout(): void {
+    async logout(): Promise<void> {
       this.accessToken = null;
       this.user = null;
       this.status = "anon";
       // No server-side revoke endpoint exists; clearing is client-side only.
-      localStorage.removeItem(REFRESH_TOKEN_KEY);
+      await secureRemoveRefresh();
       localStorage.removeItem(USER_KEY);
     },
 
     async performRefresh(): Promise<string | null> {
-      const stored = localStorage.getItem(REFRESH_TOKEN_KEY);
+      const stored = await secureLoadRefresh();
       if (stored === null) return null;
       try {
         const tokens = await refreshSession(stored);
         this.accessToken = tokens.access_token;
-        localStorage.setItem(REFRESH_TOKEN_KEY, tokens.refresh_token);
+        await secureStoreRefresh(tokens.refresh_token);
         if (this.user === null) this.user = readPersistedUser();
         this.status = "authed";
         return tokens.access_token;
       } catch {
         // Dead/expired refresh token: drop local session silently.
-        this.logout();
+        await this.logout();
         return null;
       }
     },
 
-    adoptTokens(
+    async adoptTokens(
       accessToken: string,
       refreshToken: string,
       user: AuthUser,
-    ): void {
+    ): Promise<void> {
       this.accessToken = accessToken;
       this.user = user;
       this.status = "authed";
-      localStorage.setItem(REFRESH_TOKEN_KEY, refreshToken);
+      await secureStoreRefresh(refreshToken);
       localStorage.setItem(USER_KEY, JSON.stringify(user));
     },
   },

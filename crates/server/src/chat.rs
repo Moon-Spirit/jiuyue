@@ -151,3 +151,66 @@ mod tests {
         assert_eq!(key, format!("{a}:{a}"), "self-pair is well-formed (server rejects it earlier)");
     }
 }
+
+/// GET /api/conversations — conversation memberships of the authenticated
+/// user, newest first. For `direct` conversations `peer` carries the single
+/// other member; other kinds leave it `null` until group support lands.
+#[derive(Debug, Serialize)]
+pub struct ConversationListItem {
+    pub conversation_id: i64,
+    pub kind: String,
+    pub peer: Option<PeerInfo>,
+    pub last_seq: i64,
+    /// Server-side delivery cursor for THIS member; clients bootstrap their
+    /// offline sync from here on fresh sessions.
+    pub last_delivered_seq: i64,
+}
+
+pub async fn list_conversations(
+    State(state): State<AppState>,
+    user: AuthUser,
+) -> Result<Json<Vec<ConversationListItem>>, AppError> {
+    type ConvRow = (i64, String, i64, i64, Option<Uuid>, Option<String>);
+    let rows: Vec<ConvRow> = sqlx::query_as(
+        r#"
+        SELECT c.id,
+               c.kind,
+               c.last_seq,
+               m.last_delivered_seq,
+               peer.user_id,
+               peer.username
+        FROM conversation_members m
+        JOIN conversations c ON c.id = m.conversation_id
+        LEFT JOIN LATERAL (
+            SELECT cm2.user_id AS user_id, u.username AS username
+            FROM conversation_members cm2
+            JOIN users u ON u.id = cm2.user_id
+            WHERE cm2.conversation_id = c.id AND cm2.user_id <> m.user_id
+            LIMIT 1
+        ) peer ON TRUE
+        WHERE m.user_id = $1
+        ORDER BY c.id DESC
+        "#,
+    )
+    .bind(user.0)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(AppError::internal)?;
+
+    let items = rows
+        .into_iter()
+        .map(|(conversation_id, kind, last_seq, last_delivered_seq, peer_id, peer_username)| {
+            ConversationListItem {
+                conversation_id,
+                kind,
+                peer: peer_id.map(|user_id| PeerInfo {
+                    user_id,
+                    username: peer_username.unwrap_or_default(),
+                }),
+                last_seq,
+                last_delivered_seq,
+            }
+        })
+        .collect();
+    Ok(Json(items))
+}

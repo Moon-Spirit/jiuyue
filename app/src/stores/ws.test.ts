@@ -78,7 +78,7 @@ function seedConversation(
 ): Conversation {
   const conversation: Conversation = {
     conversationId,
-    peerUserId: 100 + conversationId,
+    peerUserId: String(100 + conversationId),
     peerUsername: `peer${conversationId}`,
     lastMessagePreview: null,
     lastActivityAt: "",
@@ -122,14 +122,22 @@ function seededMessage(overrides: Partial<ChatMessage>): ChatMessage {
 async function connectAndOpen(): Promise<MockWebSocket> {
   const auth = useAuthStore();
   auth.accessToken = "tok";
-  auth.user = { userId: 7, username: "me" };
+  auth.user = { userId: "7", username: "me" };
   // Fresh Response per call: a Response body can only be consumed once and
   // reconnects fetch the ticket endpoint again.
-  fetchMock.mockImplementation(async () => jsonResponse(200, { ticket: "t1" }));
+  fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
+    const url = String(input);
+    if (url.includes("/api/auth/ws-ticket")) return jsonResponse(200, { ticket: "t1" });
+    if (url.includes("/api/conversations")) return jsonResponse(200, []);
+    return jsonResponse(200, { ticket: "t1" });
+  });
   const store = useWsStore();
   await store.connect();
   const sock = lastSocket();
   sock.serverOpen();
+  // onopen now bootstraps conversation discovery (async fetch) before the
+  // cursor sync; drain microtask queue deterministically (fake-timer safe).
+  for (let i = 0; i < 12; i++) await Promise.resolve();
   return sock;
 }
 
@@ -149,7 +157,7 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
-describe("ws store — optimistic send and ack resolution", () => {
+describe("ws store 鈥?optimistic send and ack resolution", () => {
   it("appends an optimistic sending entry and resolves it to delivered on msg.ack", async () => {
     const store = useWsStore();
     seedConversation(store, 1);
@@ -222,7 +230,7 @@ describe("ws store — optimistic send and ack resolution", () => {
   });
 });
 
-describe("ws store — inbound messages and unread state", () => {
+describe("ws store 鈥?inbound messages and unread state", () => {
   it("increments unread for inactive conversations and keeps the open one clean", async () => {
     const store = useWsStore();
     seedConversation(store, 1);
@@ -315,7 +323,7 @@ describe("ws store — inbound messages and unread state", () => {
   });
 });
 
-describe("ws store — offline queueing and reconnect", () => {
+describe("ws store 鈥?offline queueing and reconnect", () => {
   it("queues outbound frames while disconnected and flushes them on reopen", () => {
     const store = useWsStore();
     seedConversation(store, 1);
@@ -356,7 +364,7 @@ describe("ws store — offline queueing and reconnect", () => {
     sock.close();
     expect(store.status).toBe("reconnecting");
 
-    // First retry fires at exactly 500ms (base · 2^0 · jitter 1.0).
+    // First retry fires at exactly 500ms (base 路 2^0 路 jitter 1.0).
     await vi.advanceTimersByTimeAsync(499);
     expect(MockWebSocket.instances).toHaveLength(1);
     await vi.advanceTimersByTimeAsync(1);
@@ -366,6 +374,7 @@ describe("ws store — offline queueing and reconnect", () => {
     sock = lastSocket();
     sock.serverOpen();
     expect(store.status).toBe("open");
+    for (let i = 0; i < 12; i++) await Promise.resolve();
 
     // Reconnect resyncs from the highest locally-seen seq.
     const syncReq = sentFrames(sock)[0];
@@ -380,13 +389,13 @@ describe("ws store — offline queueing and reconnect", () => {
     expect(MockWebSocket.instances).toHaveLength(3);
   });
 
-  it("computes the backoff schedule as 500ms·2^n capped at 15s with ±20% jitter", () => {
+  it("computes the backoff schedule as 500ms路2^n capped at 15s with 卤20% jitter", () => {
     expect(computeBackoffDelay(0, () => 0.5)).toBe(500);
     expect(computeBackoffDelay(1, () => 0.5)).toBe(1_000);
     expect(computeBackoffDelay(4, () => 0.5)).toBe(8_000);
     expect(computeBackoffDelay(5, () => 0.5)).toBe(BACKOFF_CAP_MS);
     expect(computeBackoffDelay(9, () => 0.5)).toBe(BACKOFF_CAP_MS);
-    // Jitter bounds: rand=0 → ×0.8, rand→1 approaches ×1.2 (still capped).
+    // Jitter bounds: rand=0 鈫?脳0.8, rand鈫? approaches 脳1.2 (still capped).
     expect(computeBackoffDelay(0, () => 0)).toBe(400);
     expect(computeBackoffDelay(0, () => 0.999)).toBe(600);
     expect(computeBackoffDelay(20, () => 0)).toBe(12_000);
@@ -394,7 +403,7 @@ describe("ws store — offline queueing and reconnect", () => {
   });
 });
 
-describe("ws store — error frames and retry", () => {
+describe("ws store 鈥?error frames and retry", () => {
   it("marks in-flight sends failed on an error frame and retry reuses the same client_msg_id", async () => {
     const store = useWsStore();
     seedConversation(store, 1);
@@ -416,7 +425,7 @@ describe("ws store — error frames and retry", () => {
     expect(retryFrame?.t).toBe("msg.send");
     expect(retryFrame?.d["client_msg_id"]).toBe(message?.clientMsgId);
 
-    // Server had already persisted the first attempt → duplicate ack merges.
+    // Server had already persisted the first attempt 鈫?duplicate ack merges.
     sock.serverFrame({
       v: 1,
       t: "msg.ack",
@@ -452,7 +461,7 @@ describe("ws store — error frames and retry", () => {
   });
 });
 
-describe("ws store — persistence", () => {
+describe("ws store 鈥?persistence", () => {
   it("restores conversations and messages from localStorage into a fresh store", async () => {
     const store = useWsStore();
     seedConversation(store, 1);

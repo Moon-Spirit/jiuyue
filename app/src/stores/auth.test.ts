@@ -25,6 +25,9 @@ describe("auth store", () => {
         access_token: "a1",
         refresh_token: "r1",
         expires_in: 900,
+        // Login now carries the profile (server-side change, ticket 08 fix).
+        user_id: "01a03367-0000-7000-8000-00000000aaaa",
+        username: "alice",
       }),
     );
 
@@ -33,6 +36,7 @@ describe("auth store", () => {
 
     expect(store.accessToken).toBe("a1");
     expect(store.status).toBe("authed");
+    expect(store.user?.userId).toBe("01a03367-0000-7000-8000-00000000aaaa");
     expect(store.user?.username).toBe("alice");
     expect(localStorage.getItem("jiuyue.refresh")).toBe("r1");
   });

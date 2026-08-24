@@ -1,0 +1,15 @@
+﻿JiuYue Tauri desktop shell - smoke test
+Date : 2026-08-24 17:52:05
+Exe  : C:\Users\Administrator\Desktop\gcwjj\ltrj\app\src-tauri\target\release\jiuyue-app.exe
+
+RESULT: PASS - process alive after 12s
+
+
+Id              : 44580
+ProcessName     : jiuyue-app
+MainWindowTitle : JiuYue
+StartTime       : 2026/8/24 17:52:05
+
+
+
+

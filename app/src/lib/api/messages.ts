@@ -3,7 +3,8 @@ import { apiRequest, ApiError } from "./client";
 type Translate = (key: string) => string;
 
 export interface ConversationPeer {
-  user_id: number;
+  /** Server-side user UUID (a string, never a number). */
+  user_id: string;
   username: string;
 }
 
@@ -25,6 +26,25 @@ export function createConversation(
     body: { peer_username: peerUsername },
     accessToken,
   });
+}
+
+/** GET /api/conversations (Bearer access) — bootstraps fresh sessions. */
+export function listConversations(
+  accessToken: string,
+): Promise<ConversationListItem[]> {
+  return apiRequest<ConversationListItem[]>("/api/conversations", {
+    method: "GET",
+    accessToken,
+  });
+}
+
+/** GET /api/conversations — 200 ConversationListItem[] (memberships, newest first). */
+export interface ConversationListItem {
+  conversation_id: number;
+  kind: string;
+  peer: ConversationPeer | null;
+  last_seq: number;
+  last_delivered_seq: number;
 }
 
 /**

@@ -1,0 +1,36 @@
+[package]
+name = "jiuyue-app"
+version = "0.1.0"
+description = "JiuYue desktop shell"
+edition = "2021"
+license = "UNLICENSED"
+
+# Standalone crate: intentionally NOT a member of the repo-root Cargo workspace
+# (root members list only covers crates/*). The empty [workspace] table stops
+# cargo from walking up and rejecting the package as a non-member.
+[workspace]
+
+[lib]
+name = "jiuyue_app"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_Security_Cryptography",
+  "Win32_System_Memory",
+] }
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1

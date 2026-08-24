@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Capabilities for the main window only: Tauri core defaults plus the application-defined secure token storage commands.",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}

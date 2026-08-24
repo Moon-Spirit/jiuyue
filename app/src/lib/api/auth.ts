@@ -12,8 +12,13 @@ export interface TokenPair {
   expires_in: number;
 }
 
+export interface LoginResult extends TokenPair {
+  user_id: string;
+  username: string;
+}
+
 export interface RegisterResult extends TokenPair {
-  user_id: number;
+  user_id: string;
   username: string;
 }
 
@@ -52,8 +57,8 @@ export function register(input: RegisterInput): Promise<RegisterResult> {
 export function login(
   identifier: string,
   password: string,
-): Promise<TokenPair> {
-  return apiRequest<TokenPair>("/api/auth/login", {
+): Promise<LoginResult> {
+  return apiRequest<LoginResult>("/api/auth/login", {
     method: "POST",
     body: { identifier, password },
   });

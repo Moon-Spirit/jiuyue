@@ -690,3 +690,39 @@ async fn unknown_frame_type_is_answered_without_closing() {
         other => panic!("connection must survive unknown frames, got {other:?}"),
     }
 }
+
+#[tokio::test]
+async fn conversation_list_returns_memberships_with_peer_info() {
+    let t = test_app().await;
+    let (_a_id, a_access) = register_user(&t, "list-a@example.com", "lista").await;
+    let (_b_id, b_access) = register_user(&t, "list-b@example.com", "listb").await;
+    let conv = create_conversation(&t, &a_access, "listb").await;
+
+    // Creator sees the conversation with peer info pointing at listb.
+    let (status, body) = send_http(&t.app, "GET", "/api/conversations", Some(&a_access), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let items = body.as_array().expect("array body");
+    assert_eq!(items.len(), 1, "{body}");
+    assert_eq!(items[0]["conversation_id"], conv["conversation_id"]);
+    assert_eq!(items[0]["kind"], "direct");
+    assert_eq!(items[0]["peer"]["username"], "listb");
+    assert_eq!(items[0]["last_seq"], 0);
+    assert_eq!(items[0]["last_delivered_seq"], 0);
+
+    // The peer sees the same conversation with the creator as peer.
+    let (status, body) = send_http(&t.app, "GET", "/api/conversations", Some(&b_access), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let items = body.as_array().expect("array body");
+    assert_eq!(items.len(), 1, "{body}");
+    assert_eq!(items[0]["peer"]["username"], "lista");
+
+    // A user without conversations gets an empty array, not an error.
+    let (_c_id, c_access) = register_user(&t, "list-c@example.com", "listc").await;
+    let (status, body) = send_http(&t.app, "GET", "/api/conversations", Some(&c_access), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body.as_array().map(Vec::len), Some(0), "{body}");
+
+    // Unauthenticated requests are rejected.
+    let (status, _) = send_http(&t.app, "GET", "/api/conversations", None, None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}

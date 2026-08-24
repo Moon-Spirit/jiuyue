@@ -218,7 +218,7 @@ function retryMessage(clientMsgId: string): void {
         <button
           type="button"
           data-testid="logout-button"
-          class="inline-flex h-9 items-center justify-center rounded-lg px-2 text-xs font-medium text-neutral-600 hover:bg-neutral-100 hover:text-neutral-900 lg:w-full dark:text-neutral-300 dark:hover:bg-neutral-800 dark:hover:text-white"
+          class="inline-flex h-9 items-center justify-center whitespace-nowrap rounded-lg px-2 text-xs font-medium text-neutral-600 hover:bg-neutral-100 hover:text-neutral-900 lg:w-full dark:text-neutral-300 dark:hover:bg-neutral-800 dark:hover:text-white"
           @click="logout()"
         >
           {{ t("nav.logout") }}

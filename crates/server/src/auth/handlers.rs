@@ -77,6 +77,17 @@ pub struct TokenPairResponse {
     pub expires_in: i64,
 }
 
+/// Login answers with the caller's profile alongside tokens so clients can
+/// display identity without decoding JWTs (register already does the same).
+#[derive(Debug, Serialize)]
+pub struct LoginResponse {
+    pub access_token: String,
+    pub refresh_token: String,
+    pub expires_in: i64,
+    pub user_id: Uuid,
+    pub username: String,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct RefreshRequest {
     pub refresh_token: String,
@@ -291,12 +302,12 @@ pub async fn register(
 pub async fn login(
     State(state): State<AppState>,
     payload: Result<Json<LoginRequest>, JsonRejection>,
-) -> Result<Json<TokenPairResponse>, AppError> {
+) -> Result<Json<LoginResponse>, AppError> {
     let Json(req) = payload.map_err(bad_json)?;
     let identifier = req.identifier.trim();
 
-    let row: Option<(Uuid, String)> = sqlx::query_as(
-        "SELECT u.id, u.password_hash FROM users u \
+    let row: Option<(Uuid, String, String)> = sqlx::query_as(
+        "SELECT u.id, u.username, u.password_hash FROM users u \
          WHERE u.username = lower($1) \
             OR EXISTS (SELECT 1 FROM auth_identities ai \
                        WHERE ai.user_id = u.id AND lower(ai.value) = lower($1)) \
@@ -307,17 +318,19 @@ pub async fn login(
     .await
     .map_err(AppError::internal)?;
 
-    let (user_id, password_hash) = row.ok_or(AppError::InvalidCredentials)?;
+    let (user_id, username, password_hash) = row.ok_or(AppError::InvalidCredentials)?;
     // Unknown identifier and wrong password collapse into the same 401 body.
     if !password::verify_password(&req.password, &password_hash) {
         return Err(AppError::InvalidCredentials);
     }
 
     let session = issue_session(&state, user_id).await.map_err(AppError::internal)?;
-    Ok(Json(TokenPairResponse {
+    Ok(Json(LoginResponse {
         access_token: session.access_token,
         refresh_token: session.refresh_token,
         expires_in: session.expires_in,
+        user_id,
+        username,
     }))
 }
 

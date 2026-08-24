@@ -706,3 +706,42 @@ async fn login_failures_do_not_leak_account_existence() {
     assert_eq!(body_known, generic_401_body());
     assert_eq!(body_ghost, generic_401_body());
 }
+
+#[tokio::test]
+async fn login_response_includes_profile_for_client_display() {
+    let t = test_app().await;
+    let (status, reg) = send(
+        &t.app,
+        "POST",
+        "/api/auth/request-code",
+        None,
+        Some(json!({ "channel": "email", "target": "profile@example.com" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{reg}");
+    let (status, reg) = send(
+        &t.app,
+        "POST",
+        "/api/auth/register",
+        None,
+        Some(json!({
+            "channel": "email", "target": "profile@example.com", "code": "000000",
+            "username": "profileuser", "password": "password123"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{reg}");
+    let user_id = reg["user_id"].as_str().expect("user_id").to_owned();
+
+    let (status, body) = send(
+        &t.app,
+        "POST",
+        "/api/auth/login",
+        None,
+        Some(json!({ "identifier": "profileuser", "password": "password123" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["user_id"], Value::String(user_id), "{body}");
+    assert_eq!(body["username"], "profileuser");
+}
