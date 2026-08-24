@@ -1,0 +1,16 @@
+{
+  "v": 1,
+  "t": "msg.new",
+  "d": {
+    "message_id": "0190aabb-ccdd-7e03-8a1b-2c3d4e5f6073",
+    "conversation_id": 42,
+    "seq": 130,
+    "sender_id": "018e1122-3344-7006-9a2b-1c2d3e4f5a6b",
+    "body": "这是回复",
+    "sent_at": "2026-08-24T08:31:00.000Z",
+    "reply_to_message_id": "0190aabb-ccdd-7e01-8a1b-2c3d4e5f6071",
+    "reply_to_sender_id": "018f9999-3344-7006-9a2b-1c2d3e4f5a6b",
+    "reply_to_body_preview": "在吗？",
+    "forwarded_from_username": "carol"
+  }
+}

@@ -36,8 +36,8 @@ use axum::extract::{Query, State};
 use axum::response::{IntoResponse, Response};
 use futures_util::{SinkExt, StreamExt};
 use jiuyue_protocol::{
-    ErrorCode, ErrorPayload, Frame, MsgAck, MsgNew, MsgSend, Payload, SyncReq, SyncRes,
-    PROTOCOL_VERSION,
+    ErrorCode, ErrorPayload, Frame, MsgAck, MsgNew, MsgRecall, MsgRecalled, MsgSend, Payload,
+    ReadReceipt, ReadUpdate, SyncReq, SyncRes, Typing, TypingState, PROTOCOL_VERSION,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -380,6 +380,12 @@ async fn handle_frame(
                 }
                 Flow::Continue
             }
+            Err(SendRejection::BadRequest(reason)) => {
+                let _ = out_tx
+                    .send(serialize_frame(&error_frame(ErrorCode::BadRequest, reason)))
+                    .await;
+                Flow::Continue
+            }
             Err(SendRejection::Unauthorized(reason)) => {
                 let _ = out_tx
                     .send(serialize_frame(&error_frame(ErrorCode::Unauthorized, reason)))
@@ -444,8 +450,121 @@ async fn handle_frame(
                 .await;
             Flow::Continue
         }
+        // M2 read receipts: persist the reader's cursor, echo a receipt to
+        // the OTHER members only (the reader already knows it read).
+        Payload::ReadUpdate(req) => match process_read_update(state, sender_id, &req).await {
+            Ok(Some(last_read_seq)) => {
+                fanout_read_receipt(state, sender_id, req.conversation_id, last_read_seq).await;
+                Flow::Continue
+            }
+            // Raced with membership removal: nothing to echo.
+            Ok(None) => Flow::Continue,
+            Err(MemberRejection::NotMember) => {
+                let _ = out_tx
+                    .send(serialize_frame(&error_frame(
+                        ErrorCode::Unauthorized,
+                        "sender is not a member of this conversation",
+                    )))
+                    .await;
+                Flow::Close
+            }
+            Err(MemberRejection::Internal(err)) => {
+                tracing::error!(%sender_id, error = %format!("{err:#}"), "read.update failed");
+                let _ = out_tx
+                    .send(serialize_frame(&error_frame(
+                        ErrorCode::Internal,
+                        "internal error",
+                    )))
+                    .await;
+                Flow::Continue
+            }
+        },
+        // M2 typing: pure relay, never persisted. The server stamps the
+        // authenticated sender into `user_id` — a client-supplied value is
+        // never trusted.
+        Payload::Typing(typing) => match relay_typing(state, sender_id, &typing).await {
+            Ok(()) => Flow::Continue,
+            Err(MemberRejection::NotMember) => {
+                let _ = out_tx
+                    .send(serialize_frame(&error_frame(
+                        ErrorCode::Unauthorized,
+                        "sender is not a member of this conversation",
+                    )))
+                    .await;
+                Flow::Close
+            }
+            Err(MemberRejection::Internal(err)) => {
+                tracing::error!(%sender_id, error = %format!("{err:#}"), "typing relay failed");
+                let _ = out_tx
+                    .send(serialize_frame(&error_frame(
+                        ErrorCode::Internal,
+                        "internal error",
+                    )))
+                    .await;
+                Flow::Continue
+            }
+        },
+        // M2 recall: sender-only + time-windowed via domain RecallPolicy,
+        // tombstone-guarded via MessageStateMachine; broadcast to everyone.
+        Payload::MsgRecall(req) => match process_msg_recall(state, sender_id, &req).await {
+            Ok(()) => {
+                broadcast_msg_recalled(state, req.conversation_id, req.message_id).await;
+                Flow::Continue
+            }
+            Err(RecallRejection::NotMember) => {
+                let _ = out_tx
+                    .send(serialize_frame(&error_frame(
+                        ErrorCode::Unauthorized,
+                        "sender is not a member of this conversation",
+                    )))
+                    .await;
+                Flow::Close
+            }
+            // Action-level denial: refuse without closing — unlike a foreign
+            // conversation probe, recalling someone else's message inside
+            // your own conversation is a policy answer, not identity doubt.
+            Err(RecallRejection::NotSender) => {
+                let _ = out_tx
+                    .send(serialize_frame(&error_frame(
+                        ErrorCode::Unauthorized,
+                        "only the sender may recall a message",
+                    )))
+                    .await;
+                Flow::Continue
+            }
+            Err(RecallRejection::NotFound) => {
+                let _ = out_tx
+                    .send(serialize_frame(&error_frame(
+                        ErrorCode::NotFound,
+                        "message not found in this conversation",
+                    )))
+                    .await;
+                Flow::Continue
+            }
+            Err(RecallRejection::Conflict(reason)) => {
+                let _ = out_tx
+                    .send(serialize_frame(&error_frame(ErrorCode::Conflict, reason)))
+                    .await;
+                Flow::Continue
+            }
+            Err(RecallRejection::Internal(err)) => {
+                tracing::error!(%sender_id, error = %format!("{err:#}"), "msg.recall failed");
+                let _ = out_tx
+                    .send(serialize_frame(&error_frame(
+                        ErrorCode::Internal,
+                        "internal error",
+                    )))
+                    .await;
+                Flow::Continue
+            }
+        },
         // Server-to-client types arriving client→server are protocol misuse.
-        Payload::MsgAck(_) | Payload::MsgNew(_) | Payload::AuthTicketRes(_) | Payload::SyncRes(_) => {
+        Payload::MsgAck(_)
+        | Payload::MsgNew(_)
+        | Payload::AuthTicketRes(_)
+        | Payload::SyncRes(_)
+        | Payload::ReadReceipt(_)
+        | Payload::MsgRecalled(_) => {
             let _ = out_tx
                 .send(serialize_frame(&error_frame(
                     ErrorCode::BadRequest,
@@ -464,9 +583,25 @@ struct SendOutcome {
     seq: i64,
     sent_at_rfc3339: String,
     duplicate: bool,
+    /// Resolved reply-quote metadata for the fresh insert (duplicates never
+    /// refanout, so they carry none).
+    reply: Option<ReplyMeta>,
 }
 
+/// Server-resolved quote metadata carried on `msg.new` so receivers can
+/// render the quote without an extra fetch.
+struct ReplyMeta {
+    message_id: Uuid,
+    sender_id: Uuid,
+    /// First [`REPLY_PREVIEW_MAX_CHARS`] chars of the quoted body (plaintext).
+    body_preview: Option<String>,
+}
+
+/// Reply quotes show at most this many plaintext characters.
+const REPLY_PREVIEW_MAX_CHARS: usize = 80;
+
 enum SendRejection {
+    BadRequest(&'static str),
     Unauthorized(&'static str),
     Internal(anyhow::Error),
 }
@@ -523,10 +658,35 @@ async fn process_msg_send(
         ));
     }
 
-    // Encrypt at rest before opening the transaction (no DB time spent in crypto).
-    let body_enc = state.cipher.encrypt(&send.body)?;
-
+    // Reply target validation: must exist AND belong to the same
+    // conversation. Resolved once here (inside the tx) and reused for the
+    // quote metadata after a fresh insert.
     let mut tx = state.pool.begin().await?;
+    let reply_target: Option<(Uuid, Uuid, Vec<u8>, Option<OffsetDateTime>)> =
+        match send.reply_to {
+            Some(reply_to) => {
+                let row: Option<(Uuid, Uuid, Vec<u8>, Option<OffsetDateTime>)> =
+                    sqlx::query_as(
+                        "SELECT id, sender_id, body_enc, recalled_at FROM messages \
+                         WHERE id = $1 AND conversation_id = $2",
+                    )
+                    .bind(reply_to)
+                    .bind(send.conversation_id)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+                if row.is_none() {
+                    let _ = tx.rollback().await;
+                    return Err(SendRejection::BadRequest(
+                        "reply_to must reference an existing message in the same conversation",
+                    ));
+                }
+                row
+            }
+            None => None,
+        };
+
+    // Encrypt at rest before the heavy transaction work (no DB time spent in crypto).
+    let body_enc = state.cipher.encrypt(&send.body)?;
     let allocated_seq: Option<i64> =
         sqlx::query_scalar("UPDATE conversations SET last_seq = last_seq + 1 WHERE id = $1 RETURNING last_seq")
             .bind(send.conversation_id)
@@ -540,9 +700,16 @@ async fn process_msg_send(
     };
 
     let candidate_id = Uuid::now_v7();
+    // DECISION (forwarding): forward is a pure CLIENT-side compose of a new
+    // msg.send whose body is prefixed "[转发] " — there is deliberately no
+    // wire field on msg.send to set forwarded_from_username, so the column
+    // is always NULL on this insert. The schema column and the null-absent
+    // `forwarded_from_username` field on msg.new are reserved for a future
+    // server-side attribution path.
+    let forwarded_from_username: Option<String> = None;
     let fresh: Option<(Uuid, i64, OffsetDateTime)> = sqlx::query_as(
-        "INSERT INTO messages (id, conversation_id, seq, sender_id, client_msg_id, key_id, body_enc) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7) \
+        "INSERT INTO messages (id, conversation_id, seq, sender_id, client_msg_id, key_id, body_enc, reply_to, forwarded_from_username) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
          ON CONFLICT (conversation_id, client_msg_id) DO NOTHING \
          RETURNING id, seq, sent_at",
     )
@@ -553,10 +720,38 @@ async fn process_msg_send(
     .bind(send.client_msg_id)
     .bind(state.cipher.key_id())
     .bind(&body_enc)
+    .bind(send.reply_to)
+    .bind(&forwarded_from_username)
     .fetch_optional(&mut *tx)
     .await?;
 
     if let Some((message_id, seq, sent_at)) = fresh {
+        // Resolve the quote metadata while the reply row is still in scope:
+        // decrypt the target body and cut an 80-char plaintext preview. A
+        // RECALLED target never contributes its content ("never sent
+        // again") — only its id/sender ride along.
+        let reply = reply_target.map(
+            |(reply_id, reply_sender_id, reply_body_enc, recalled_at)| {
+                let body_preview = if recalled_at.is_some() {
+                    None
+                } else {
+                    match state.cipher.decrypt(&reply_body_enc) {
+                        Ok(plaintext) => {
+                            Some(truncate_chars(&plaintext, REPLY_PREVIEW_MAX_CHARS))
+                        }
+                        Err(err) => {
+                            tracing::warn!(%reply_id, error = %err, "reply preview decrypt failed");
+                            None
+                        }
+                    }
+                };
+                ReplyMeta {
+                    message_id: reply_id,
+                    sender_id: reply_sender_id,
+                    body_preview,
+                }
+            },
+        );
         tx.commit().await?;
         return Ok(SendOutcome {
             message_id,
@@ -564,6 +759,7 @@ async fn process_msg_send(
             seq,
             sent_at_rfc3339: sent_at.format(&Rfc3339)?,
             duplicate: false,
+            reply,
         });
     }
 
@@ -583,6 +779,7 @@ async fn process_msg_send(
         seq,
         sent_at_rfc3339: sent_at.format(&Rfc3339)?,
         duplicate: true,
+        reply: None,
     })
 }
 
@@ -628,6 +825,15 @@ async fn fanout_msg_new(
             sender_id,
             body: plaintext_body.to_owned(),
             sent_at: outcome.sent_at_rfc3339.clone(),
+            reply_to_message_id: outcome.reply.as_ref().map(|r| r.message_id),
+            reply_to_sender_id: outcome.reply.as_ref().map(|r| r.sender_id),
+            reply_to_body_preview: outcome
+                .reply
+                .as_ref()
+                .and_then(|r| r.body_preview.clone()),
+            // Always None today (see the DECISION comment in process_msg_send).
+            forwarded_from_username: None,
+            recalled: false,
         }),
     };
     let wire = serialize_frame(&msg_new);
@@ -716,8 +922,317 @@ fn spawn_touch_device_last_seen(state: &AppState, device_id: Uuid) {
     });
 }
 
+/// Cuts a plaintext string to at most `max` chars (char-boundary safe).
+fn truncate_chars(s: &str, max: usize) -> String {
+    s.chars().take(max).collect()
+}
+
+/// Rejection type for member-gated ephemeral frames (`read.update`, `typing`).
+enum MemberRejection {
+    NotMember,
+    Internal(anyhow::Error),
+}
+
+impl From<sqlx::Error> for MemberRejection {
+    fn from(err: sqlx::Error) -> Self {
+        Self::Internal(err.into())
+    }
+}
+
+/// Read-cursor pipeline for one `read.update`: persist
+/// `last_read_seq = GREATEST(persisted, requested)` and report the effective
+/// value so the receipt echo never regresses. Returns `None` when membership
+/// vanished between the gate and the write (raced removal — nothing to echo).
+async fn process_read_update(
+    state: &AppState,
+    reader_id: Uuid,
+    req: &ReadUpdate,
+) -> Result<Option<i64>, MemberRejection> {
+    let member: Option<i64> = sqlx::query_scalar(
+        "SELECT 1::int8 FROM conversation_members WHERE conversation_id = $1 AND user_id = $2",
+    )
+    .bind(req.conversation_id)
+    .bind(reader_id)
+    .fetch_optional(&state.pool)
+    .await?;
+    if member.is_none() {
+        return Err(MemberRejection::NotMember);
+    }
+
+    let effective: Option<i64> = sqlx::query_scalar(
+        "UPDATE conversation_members \
+         SET last_read_seq = GREATEST(last_read_seq, $3) \
+         WHERE conversation_id = $1 AND user_id = $2 \
+         RETURNING last_read_seq",
+    )
+    .bind(req.conversation_id)
+    .bind(reader_id)
+    .bind(req.last_read_seq)
+    .fetch_optional(&state.pool)
+    .await?;
+    Ok(effective)
+}
+
+/// Pushes `read.receipt` to every OTHER member's live devices (never back to
+/// the reader). No Redis hook here by design: read cursors are durable state
+/// recovered through sync, unlike typing which is ephemeral.
+async fn fanout_read_receipt(
+    state: &AppState,
+    reader_id: Uuid,
+    conversation_id: i64,
+    last_read_seq: i64,
+) {
+    let members: Vec<Uuid> = match sqlx::query_scalar(
+        "SELECT user_id FROM conversation_members WHERE conversation_id = $1",
+    )
+    .bind(conversation_id)
+    .fetch_all(&state.pool)
+    .await
+    {
+        Ok(rows) => rows,
+        Err(err) => {
+            tracing::error!(conversation_id, error = %err, "receipt member lookup failed");
+            return;
+        }
+    };
+    let frame = serialize_frame(&Frame {
+        v: PROTOCOL_VERSION,
+        payload: Payload::ReadReceipt(ReadReceipt {
+            conversation_id,
+            user_id: reader_id,
+            last_read_seq,
+        }),
+    });
+    for user_id in members.into_iter().filter(|id| *id != reader_id) {
+        let delivered = state.registry.deliver_to(user_id, &frame);
+        tracing::debug!(%user_id, delivered, conversation_id, "read.receipt fanout");
+    }
+}
+
+/// Typing relay: member-gated, registry-only delivery to OTHER members
+/// (never echoed to the typer), plus a fire-and-forget Redis publish on
+/// `conv:{id}` so a future multi-instance deployment can bridge relays.
+/// Nothing is persisted anywhere — typing is strictly ephemeral.
+async fn relay_typing(state: &AppState, sender_id: Uuid, typing: &Typing) -> Result<(), MemberRejection> {
+    let member: Option<i64> = sqlx::query_scalar(
+        "SELECT 1::int8 FROM conversation_members WHERE conversation_id = $1 AND user_id = $2",
+    )
+    .bind(typing.conversation_id)
+    .bind(sender_id)
+    .fetch_optional(&state.pool)
+    .await?;
+    if member.is_none() {
+        return Err(MemberRejection::NotMember);
+    }
+
+    let frame = serialize_frame(&Frame {
+        v: PROTOCOL_VERSION,
+        payload: Payload::Typing(Typing {
+            conversation_id: typing.conversation_id,
+            state: typing.state,
+            user_id: Some(sender_id),
+        }),
+    });
+
+    let members: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT user_id FROM conversation_members WHERE conversation_id = $1",
+    )
+    .bind(typing.conversation_id)
+    .fetch_all(&state.pool)
+    .await?;
+    for user_id in members.into_iter().filter(|id| *id != sender_id) {
+        let delivered = state.registry.deliver_to(user_id, &frame);
+        tracing::debug!(%user_id, delivered, conversation_id = typing.conversation_id, "typing relay");
+    }
+
+    // Fire-and-forget pub/sub hook (same channel convention as msg.new).
+    // Payload is a small self-describing envelope; spawned + error-logged so
+    // a Redis outage can never slow or break the relay.
+    let mut conn = state.redis.clone();
+    let channel = format!("conv:{}", typing.conversation_id);
+    let payload = serde_json::json!({
+        "kind": "typing",
+        "user_id": sender_id,
+        "state": match typing.state {
+            TypingState::Start => "start",
+            TypingState::Stop => "stop",
+        },
+    })
+    .to_string();
+    tokio::spawn(async move {
+        match redis::cmd("PUBLISH")
+            .arg(&channel)
+            .arg(&payload)
+            .query_async::<i64>(&mut conn)
+            .await
+        {
+            Ok(receivers) => tracing::debug!(channel = %channel, receivers, "redis publish"),
+            Err(err) => tracing::debug!(channel = %channel, error = %err, "redis publish failed"),
+        }
+    });
+    Ok(())
+}
+
+/// Rejection taxonomy for one `msg.recall`.
+enum RecallRejection {
+    /// Requester is not in the conversation at all (connection closes).
+    NotMember,
+    /// Member, but not the author of the message (refused, socket stays).
+    NotSender,
+    /// No such message in this conversation.
+    NotFound,
+    /// Window expired or already recalled (tombstone is terminal).
+    Conflict(&'static str),
+    Internal(anyhow::Error),
+}
+
+impl From<sqlx::Error> for RecallRejection {
+    fn from(err: sqlx::Error) -> Self {
+        Self::Internal(err.into())
+    }
+}
+
+/// Recall pipeline for one `msg.recall`, composing BOTH domain guards:
+///
+/// 1. [`jiuyue_domain::RecallPolicy`] — identity first ("only the sender"),
+///    then the injected-clock window check (`now_utc()` vs `sent_at`,
+///    default 120s inclusive).
+/// 2. [`jiuyue_domain::MessageStateMachine`] — a tombstone is terminal, so
+///    an already-recalled message rejects the second recall as an illegal
+///    transition (mapped to `conflict`). Non-recalled messages are all
+///    representable as `Sent` here because `Recall` is legal from
+///    Sent/Delivered/Read alike.
+///
+/// The final UPDATE re-checks `(id, sender, recalled_at IS NULL)` so a race
+/// between two concurrent recalls still lands exactly one tombstone; losing
+/// that race surfaces as `conflict`.
+async fn process_msg_recall(
+    state: &AppState,
+    requester_id: Uuid,
+    req: &MsgRecall,
+) -> Result<(), RecallRejection> {
+    use jiuyue_domain::{MessageStateMachine, MessageStatus, RecallPolicy, TransitionEvent};
+
+    let member: Option<i64> = sqlx::query_scalar(
+        "SELECT 1::int8 FROM conversation_members WHERE conversation_id = $1 AND user_id = $2",
+    )
+    .bind(req.conversation_id)
+    .bind(requester_id)
+    .fetch_optional(&state.pool)
+    .await?;
+    if member.is_none() {
+        return Err(RecallRejection::NotMember);
+    }
+
+    let row: Option<(Uuid, OffsetDateTime, Option<OffsetDateTime>)> = sqlx::query_as(
+        "SELECT sender_id, sent_at, recalled_at FROM messages \
+         WHERE id = $1 AND conversation_id = $2",
+    )
+    .bind(req.message_id)
+    .bind(req.conversation_id)
+    .fetch_optional(&state.pool)
+    .await?;
+    let Some((sender_id, sent_at, recalled_at)) = row else {
+        return Err(RecallRejection::NotFound);
+    };
+
+    // Guard 1: policy (identity + window), clock injected at this instant.
+    RecallPolicy::default()
+        .can_recall(requester_id, sender_id, sent_at, OffsetDateTime::now_utc())
+        .map_err(|err| match err {
+            jiuyue_domain::RecallError::NotSender => RecallRejection::NotSender,
+            jiuyue_domain::RecallError::WindowExpired => {
+                RecallRejection::Conflict("recall window expired")
+            }
+        })?;
+
+    // Guard 2: state machine (tombstone is terminal → double recall dies here).
+    let mut machine = MessageStateMachine::from(if recalled_at.is_some() {
+        MessageStatus::Recalled
+    } else {
+        MessageStatus::Sent
+    });
+    machine
+        .transition(TransitionEvent::Recall)
+        .map_err(|_| RecallRejection::Conflict("message already recalled"))?;
+
+    let updated = sqlx::query(
+        "UPDATE messages SET recalled_at = now() \
+         WHERE id = $1 AND sender_id = $2 AND recalled_at IS NULL",
+    )
+    .bind(req.message_id)
+    .bind(sender_id)
+    .execute(&state.pool)
+    .await?
+    .rows_affected();
+    if updated == 0 {
+        return Err(RecallRejection::Conflict("message already recalled"));
+    }
+    tracing::info!(
+        conversation_id = req.conversation_id,
+        message_id = %req.message_id,
+        requester_id = %requester_id,
+        "message recalled"
+    );
+    Ok(())
+}
+
+/// Broadcasts `msg.recalled` to ALL members including the requester (the
+/// broadcast doubles as the sender's confirmation; there is no separate ack
+/// frame for recalls).
+async fn broadcast_msg_recalled(state: &AppState, conversation_id: i64, message_id: Uuid) {
+    let members: Vec<Uuid> = match sqlx::query_scalar(
+        "SELECT user_id FROM conversation_members WHERE conversation_id = $1",
+    )
+    .bind(conversation_id)
+    .fetch_all(&state.pool)
+    .await
+    {
+        Ok(rows) => rows,
+        Err(err) => {
+            tracing::error!(conversation_id, error = %err, "recalled member lookup failed");
+            return;
+        }
+    };
+    let frame = serialize_frame(&Frame {
+        v: PROTOCOL_VERSION,
+        payload: Payload::MsgRecalled(MsgRecalled {
+            conversation_id,
+            message_id,
+        }),
+    });
+    for user_id in members {
+        let delivered = state.registry.deliver_to(user_id, &frame);
+        tracing::debug!(%user_id, delivered, conversation_id, "msg.recalled broadcast");
+    }
+}
+
 /// Per-cursor replay cap for one `sync.req`.
 const SYNC_BATCH_LIMIT: i64 = 200;
+
+/// One tombstone-aware sync row: the message columns plus the LEFT-JOINed
+/// reply-target columns (`r.sender_id`, `r.body_enc`, `r.recalled_at`).
+type SyncMessageRow = (
+    Uuid,
+    i64,
+    i64,
+    Uuid,
+    OffsetDateTime,
+    Vec<u8>,
+    Option<OffsetDateTime>,
+    Option<Uuid>,
+    Option<String>,
+    Option<Uuid>,
+    Option<Vec<u8>>,
+    Option<OffsetDateTime>,
+);
+
+const SYNC_MESSAGE_QUERY: &str = "SELECT m.id, m.conversation_id, m.seq, m.sender_id, m.sent_at, \
+     m.body_enc, m.recalled_at, m.reply_to, m.forwarded_from_username, \
+     r.sender_id, r.body_enc, r.recalled_at \
+     FROM messages m \
+     LEFT JOIN messages r ON r.id = m.reply_to \
+     WHERE m.conversation_id = $1 AND m.seq > $2 ORDER BY m.seq ASC LIMIT $3";
 
 /// Catch-up pipeline for one `sync.req`: replay every message past each
 /// cursor into ONE `sync.res`.
@@ -756,10 +1271,12 @@ async fn process_sync_req(
             continue; // silent skip: anti-probing (see doc comment)
         }
 
-        let rows: Vec<(Uuid, i64, i64, Uuid, OffsetDateTime, Vec<u8>)> = sqlx::query_as(
-            "SELECT id, conversation_id, seq, sender_id, sent_at, body_enc FROM messages \
-             WHERE conversation_id = $1 AND seq > $2 ORDER BY seq ASC LIMIT $3",
-        )
+        // Tombstone-aware fetch: recalled rows keep body_enc at rest for
+        // audit but it is NEVER decrypted or sent again — the wire entry
+        // carries an empty body plus `recalled: true`. The lateral join
+        // resolves reply-quote metadata in the same round trip; a RECALLED
+        // quote target contributes no preview (content "never sent again").
+        let rows: Vec<SyncMessageRow> = sqlx::query_as(SYNC_MESSAGE_QUERY)
         .bind(cursor.conversation_id)
         .bind(cursor.last_delivered_seq)
         .bind(SYNC_BATCH_LIMIT)
@@ -767,11 +1284,44 @@ async fn process_sync_req(
         .await?;
 
         complete &= rows.len() < usize::try_from(SYNC_BATCH_LIMIT).unwrap_or(usize::MAX);
-        for (message_id, conversation_id, seq, sender_id, sent_at, body_enc) in rows {
-            // Decrypt at-rest bodies before they leave the server; a row we
+        for (
+            message_id,
+            conversation_id,
+            seq,
+            sender_id,
+            sent_at,
+            body_enc,
+            recalled_at,
+            reply_to,
+            forwarded_from_username,
+            reply_sender_id,
+            reply_body_enc,
+            reply_recalled_at,
+        ) in rows
+        {
+            let recalled = recalled_at.is_some();
+            // Decrypt at-rest bodies before they leave the server — except
+            // tombstones, whose content stays sealed forever. A row we
             // cannot decrypt is an internal fault surfaced as a generic
             // error to the client (never plaintext, never a panic).
-            let body = state.cipher.decrypt(&body_enc)?;
+            let body = if recalled {
+                String::new()
+            } else {
+                state.cipher.decrypt(&body_enc)?
+            };
+            let mut reply_to_sender_id = None;
+            let mut reply_to_body_preview = None;
+            if let (Some(_reply_id), Some(r_sender), Some(r_body), r_recalled) =
+                (reply_to, reply_sender_id, reply_body_enc, reply_recalled_at)
+            {
+                reply_to_sender_id = Some(r_sender);
+                if r_recalled.is_none()
+                    && let Ok(plaintext) = state.cipher.decrypt(&r_body)
+                {
+                    reply_to_body_preview =
+                        Some(truncate_chars(&plaintext, REPLY_PREVIEW_MAX_CHARS));
+                }
+            }
             messages.push(MsgNew {
                 message_id,
                 conversation_id,
@@ -779,6 +1329,13 @@ async fn process_sync_req(
                 sender_id,
                 body,
                 sent_at: sent_at.format(&Rfc3339)?,
+                // Quote metadata survives recall: it describes the QUOTED
+                // message, not the tombstone's own (sealed) content.
+                reply_to_message_id: reply_to,
+                reply_to_sender_id,
+                reply_to_body_preview,
+                forwarded_from_username,
+                recalled,
             });
         }
     }

@@ -301,6 +301,7 @@ async fn send_and_ack(ws: &mut WsClient, conversation_id: i64, body: &str) -> (U
             conversation_id,
             client_msg_id,
             body: body.to_owned(),
+            reply_to: None,
         }),
     };
     ws_send_text(ws, &serde_json::to_string(&frame).expect("serialize")).await;
@@ -683,6 +684,7 @@ async fn saturated_recipient_channel_does_not_block_or_break_the_sender() {
                 conversation_id,
                 client_msg_id: Uuid::now_v7(),
                 body: format!("burst-{n}"),
+                reply_to: None,
             }),
         };
         tokio::time::timeout(

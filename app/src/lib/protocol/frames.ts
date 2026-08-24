@@ -11,12 +11,23 @@
  * |------------------|-----------|----------------------------------------------------------------|
  * | auth.ticket.req  | C → S     | `{}`                                                           |
  * | auth.ticket.res  | S → C     | `{ ticket }`                                                   |
- * | msg.send         | C → S     | `{ conversation_id, client_msg_id, body }`                     |
+ * | msg.send         | C → S     | `{ conversation_id, client_msg_id, body, reply_to? }`          |
  * | msg.ack          | S → C     | `{ client_msg_id, message_id, seq, duplicate }`                |
- * | msg.new          | S → C     | `{ message_id, conversation_id, seq, sender_id, body, sent_at }` |
+ * | msg.new          | S → C     | `{ message_id, conversation_id, seq, sender_id, body, sent_at, reply_to_message_id?, reply_to_sender_id?, reply_to_body_preview?, forwarded_from_username?, recalled? }` |
  * | sync.req         | C → S     | `{ cursors: [{ conversation_id, last_delivered_seq }] }`       |
  * | sync.res         | S → C     | `{ messages: [msg.new], complete }`                            |
+ * | read.update      | C → S     | `{ conversation_id, last_read_seq }`                           |
+ * | read.receipt     | S → C     | `{ conversation_id, user_id, last_read_seq }`                  |
+ * | typing           | C ⇄ S     | `{ conversation_id, state: "start"\|"stop", user_id? }`        |
+ * | msg.recall       | C → S     | `{ conversation_id, message_id }`                              |
+ * | msg.recalled     | S → C     | `{ conversation_id, message_id }`                              |
  * | error            | S → C     | `{ code, message, retryable }`                                 |
+ *
+ * M2 optional `msg.*` metadata fields are null-absent: absent on the wire
+ * when unset (never serialized as `null`), keeping M1 frames byte-identical.
+ * On `typing`, `user_id` is present only on the server→client relay (the
+ * server stamps the authenticated sender; a client-supplied value is never
+ * trusted).
  *
  * Parity notes with the Rust decoder:
  * - An unknown `t` does NOT throw; it degrades to an `error` frame with code
@@ -41,6 +52,8 @@ export interface MsgSend {
   /** Client-generated idempotency key (UUIDv7 string). */
   client_msg_id: string;
   body: string;
+  /** Optional reply target; must be a message of the same conversation. */
+  reply_to?: string;
 }
 
 export interface MsgAck {
@@ -60,6 +73,14 @@ export interface MsgNew {
   body: string;
   /** RFC 3339 timestamp string, passed through verbatim. */
   sent_at: string;
+  /** Reply metadata (null-absent on plain messages). */
+  reply_to_message_id?: string;
+  reply_to_sender_id?: string;
+  /** First 80 chars of the replied-to body, decrypted server-side. */
+  reply_to_body_preview?: string;
+  forwarded_from_username?: string;
+  /** True for recall tombstones; `body` is then empty by contract. */
+  recalled?: boolean;
 }
 
 export interface SyncCursor {
@@ -74,6 +95,43 @@ export interface SyncReq {
 export interface SyncRes {
   messages: MsgNew[];
   complete: boolean;
+}
+
+/** Client → server: reader advanced its read cursor (conversation open). */
+export interface ReadUpdate {
+  conversation_id: number;
+  last_read_seq: number;
+}
+
+/** Server → peer: `user_id`'s persisted read cursor advanced. */
+export interface ReadReceipt {
+  conversation_id: number;
+  user_id: string;
+  last_read_seq: number;
+}
+
+export type TypingState = "start" | "stop";
+
+/**
+ * Typing signal. Client→server frames omit `user_id`; the server relay to
+ * peers always carries it (stamped from the authenticated connection).
+ */
+export interface Typing {
+  conversation_id: number;
+  state: TypingState;
+  user_id?: string;
+}
+
+/** Client → server: recall request (sender-only, 120s window). */
+export interface MsgRecall {
+  conversation_id: number;
+  message_id: string;
+}
+
+/** Server → all members: message became a tombstone. */
+export interface MsgRecalled {
+  conversation_id: number;
+  message_id: string;
 }
 
 export type ErrorCode =
@@ -99,6 +157,11 @@ export const FRAME_TYPES = [
   "msg.new",
   "sync.req",
   "sync.res",
+  "read.update",
+  "read.receipt",
+  "typing",
+  "msg.recall",
+  "msg.recalled",
   "error",
 ] as const;
 
@@ -118,6 +181,11 @@ export type Frame =
   | Envelope<"msg.new", MsgNew>
   | Envelope<"sync.req", SyncReq>
   | Envelope<"sync.res", SyncRes>
+  | Envelope<"read.update", ReadUpdate>
+  | Envelope<"read.receipt", ReadReceipt>
+  | Envelope<"typing", Typing>
+  | Envelope<"msg.recall", MsgRecall>
+  | Envelope<"msg.recalled", MsgRecalled>
   | Envelope<"error", ErrorPayload>;
 
 /** Thrown when a raw value cannot be interpreted as a v1 frame at all. */
@@ -145,6 +213,12 @@ function hasBool(d: Record<string, unknown>, key: string): boolean {
   return typeof d[key] === "boolean";
 }
 
+/** Optional string: absent (or undefined) is fine; present must be a string. */
+function hasOptionalString(d: Record<string, unknown>, key: string): boolean {
+  const v = d[key];
+  return v === undefined || typeof v === "string";
+}
+
 export function isAuthTicketReq(d: unknown): d is AuthTicketReq {
   return isRecord(d) && Object.keys(d).length === 0;
 }
@@ -158,7 +232,8 @@ export function isMsgSend(d: unknown): d is MsgSend {
     isRecord(d) &&
     hasInt(d, "conversation_id") &&
     hasString(d, "client_msg_id") &&
-    hasString(d, "body")
+    hasString(d, "body") &&
+    hasOptionalString(d, "reply_to")
   );
 }
 
@@ -180,7 +255,12 @@ export function isMsgNew(d: unknown): d is MsgNew {
     hasInt(d, "seq") &&
     hasString(d, "sender_id") &&
     hasString(d, "body") &&
-    hasString(d, "sent_at")
+    hasString(d, "sent_at") &&
+    hasOptionalString(d, "reply_to_message_id") &&
+    hasOptionalString(d, "reply_to_sender_id") &&
+    hasOptionalString(d, "reply_to_body_preview") &&
+    hasOptionalString(d, "forwarded_from_username") &&
+    (d["recalled"] === undefined || typeof d["recalled"] === "boolean")
   );
 }
 
@@ -218,6 +298,46 @@ export function isErrorPayload(d: unknown): d is ErrorPayload {
   );
 }
 
+export function isReadUpdate(d: unknown): d is ReadUpdate {
+  return (
+    isRecord(d) && hasInt(d, "conversation_id") && hasInt(d, "last_read_seq")
+  );
+}
+
+export function isReadReceipt(d: unknown): d is ReadReceipt {
+  return (
+    isRecord(d) &&
+    hasInt(d, "conversation_id") &&
+    hasString(d, "user_id") &&
+    hasInt(d, "last_read_seq")
+  );
+}
+
+export function isTypingState(v: unknown): v is TypingState {
+  return v === "start" || v === "stop";
+}
+
+export function isTyping(d: unknown): d is Typing {
+  return (
+    isRecord(d) &&
+    hasInt(d, "conversation_id") &&
+    isTypingState(d["state"]) &&
+    hasOptionalString(d, "user_id")
+  );
+}
+
+export function isMsgRecall(d: unknown): d is MsgRecall {
+  return (
+    isRecord(d) && hasInt(d, "conversation_id") && hasString(d, "message_id")
+  );
+}
+
+export function isMsgRecalled(d: unknown): d is MsgRecalled {
+  return (
+    isRecord(d) && hasInt(d, "conversation_id") && hasString(d, "message_id")
+  );
+}
+
 const PAYLOAD_GUARDS: { [T in FrameType]: (d: unknown) => boolean } = {
   "auth.ticket.req": isAuthTicketReq,
   "auth.ticket.res": isAuthTicketRes,
@@ -226,6 +346,11 @@ const PAYLOAD_GUARDS: { [T in FrameType]: (d: unknown) => boolean } = {
   "msg.new": isMsgNew,
   "sync.req": isSyncReq,
   "sync.res": isSyncRes,
+  "read.update": isReadUpdate,
+  "read.receipt": isReadReceipt,
+  typing: isTyping,
+  "msg.recall": isMsgRecall,
+  "msg.recalled": isMsgRecalled,
   error: isErrorPayload,
 };
 

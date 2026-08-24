@@ -1,4 +1,4 @@
-﻿//! Ticket 05 integration tests: direct-conversation creation + the full
+//! Ticket 05 integration tests: direct-conversation creation + the full
 //! WebSocket send path against the live local stack (`jiuyue_test` PG +
 //! Redis).
 //!
@@ -305,6 +305,7 @@ async fn happy_path_direct_message_delivers_ack_and_live_msg_new() {
             conversation_id,
             client_msg_id,
             body: "\u{5728}\u{5417}\u{ff1f}".to_owned(),
+            reply_to: None,
         }),
     };
     ws_send_text(
@@ -342,6 +343,7 @@ async fn happy_path_direct_message_delivers_ack_and_live_msg_new() {
             sender_id,
             body,
             sent_at,
+            ..
         }) => {
             assert_eq!(message_id, acked_message_id);
             assert_eq!(conv, conversation_id);
@@ -360,6 +362,7 @@ async fn happy_path_direct_message_delivers_ack_and_live_msg_new() {
             conversation_id,
             client_msg_id: Uuid::now_v7(),
             body: "second".to_owned(),
+            reply_to: None,
         }),
     };
     ws_send_text(
@@ -399,6 +402,7 @@ async fn duplicate_client_msg_id_is_idempotent_down_to_one_db_row() {
                 conversation_id,
                 client_msg_id,
                 body: "exactly once".to_owned(),
+                reply_to: None,
             }),
         };
         ws_send_text(
@@ -466,6 +470,7 @@ async fn body_is_ciphertext_at_rest_and_decrypts_back_to_plaintext() {
             conversation_id,
             client_msg_id: Uuid::now_v7(),
             body: plaintext.to_owned(),
+            reply_to: None,
         }),
     };
     ws_send_text(
@@ -519,6 +524,7 @@ async fn non_member_cannot_send_and_connection_is_closed() {
             conversation_id,
             client_msg_id: Uuid::now_v7(),
             body: "let me in".to_owned(),
+            reply_to: None,
         }),
     };
     ws_send_text(
@@ -678,6 +684,7 @@ async fn unknown_frame_type_is_answered_without_closing() {
             conversation_id,
             client_msg_id: Uuid::now_v7(),
             body: "still here".to_owned(),
+            reply_to: None,
         }),
     };
     ws_send_text(

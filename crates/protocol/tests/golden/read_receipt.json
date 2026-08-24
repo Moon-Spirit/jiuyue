@@ -1,0 +1,9 @@
+{
+  "v": 1,
+  "t": "read.receipt",
+  "d": {
+    "conversation_id": 42,
+    "user_id": "018e1122-3344-7006-9a2b-1c2d3e4f5a6b",
+    "last_read_seq": 128
+  }
+}

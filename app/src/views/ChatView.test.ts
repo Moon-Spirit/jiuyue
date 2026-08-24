@@ -31,6 +31,7 @@ function conversation(
     unread: 0,
     lastSeenSeq: 0,
     maxSeq: 0,
+    peerTypingUntil: null,
     ...overrides,
   };
 }
@@ -46,6 +47,11 @@ function message(overrides: Partial<ChatMessage>): ChatMessage {
     sentAt: isoAt(0),
     mine: false,
     status: "delivered",
+    recalled: false,
+    replyToMessageId: null,
+    replyToSenderId: null,
+    replyToBodyPreview: null,
+    forwardedFromUsername: null,
     ...overrides,
   };
 }
@@ -361,5 +367,192 @@ describe("ChatView — unread and composer", () => {
     const items = mainPane(wrapper).findAll('[data-testid="message-item"]');
     expect(items).toHaveLength(3);
     expect(items.at(-1)?.text()).toContain("发送中");
+  });
+
+  describe("ChatView — M2 message experience", () => {
+    async function mountWithM2Thread(): Promise<{
+      wrapper: VueWrapper;
+      ws: ReturnType<typeof useWsStore>;
+    }> {
+      const pinia = createPinia();
+      setActivePinia(pinia);
+      useAuthStore().user = { userId: "7", username: "me" };
+      const ws = useWsStore();
+      ws.conversations.push(
+        conversation(1, { peerUsername: "alice" }),
+        conversation(2, { peerUsername: "bob" }),
+      );
+      ws.messagesByConversation[1] = [
+        message({
+          messageId: "m-theirs",
+          seq: 1,
+          senderId: "alice",
+          body: "来自对方的消息",
+          sentAt: isoAt(-60_000),
+        }),
+        message({
+          messageId: "m-mine-recent",
+          seq: 2,
+          senderId: "7",
+          body: "我刚发的",
+          sentAt: isoAt(-10_000),
+          mine: true,
+          status: "delivered",
+        }),
+        message({
+          messageId: "m-gone",
+          seq: 3,
+          senderId: "alice",
+          body: "",
+          sentAt: isoAt(-5_000),
+          recalled: true,
+        }),
+      ];
+      ws.openConversation(1);
+
+      const wrapper = await mountView(pinia);
+      return { wrapper, ws };
+    }
+
+    it("renders recall tombstones as a localized italic placeholder", async () => {
+      const { wrapper } = await mountWithM2Thread();
+      const main = mainPane(wrapper);
+
+      const placeholder = main.find('[data-testid="recalled-placeholder"]');
+      expect(placeholder.exists()).toBe(true);
+      expect(placeholder.text()).toBe("消息已撤回");
+      // The tombstone renders NO normal bubble and NO action row.
+      const items = main.findAll('[data-testid="message-item"]');
+      const goneItem = items.find((i) =>
+        i.find('[data-testid="recalled-placeholder"]').exists(),
+      );
+      expect(goneItem?.find('[data-testid="message-bubble"]').exists()).toBe(
+        false,
+      );
+      expect(goneItem?.find('[data-testid="action-forward"]').exists()).toBe(
+        false,
+      );
+    });
+
+    it("offers reply/forward on every bubble and recall only on own recent ones", async () => {
+      const { wrapper } = await mountWithM2Thread();
+      const main = mainPane(wrapper);
+
+      const items = main.findAll('[data-testid="message-item"]');
+      const theirs = items.find(
+        (i) =>
+          i.find('[data-testid="message-bubble"]').text() === "来自对方的消息",
+      );
+      expect(theirs?.find('[data-testid="action-reply"]').exists()).toBe(true);
+      expect(theirs?.find('[data-testid="action-forward"]').exists()).toBe(
+        true,
+      );
+      expect(theirs?.find('[data-testid="action-recall"]').exists()).toBe(
+        false,
+      );
+
+      const mineRecent = items.find(
+        (i) => i.find('[data-testid="message-bubble"]').text() === "我刚发的",
+      );
+      expect(mineRecent?.find('[data-testid="action-recall"]').exists()).toBe(
+        true,
+      );
+    });
+
+    it("opens the reply context above the composer and cancels it", async () => {
+      const { wrapper, ws } = await mountWithM2Thread();
+      const main = mainPane(wrapper);
+
+      expect(main.find('[data-testid="reply-context"]').exists()).toBe(false);
+
+      const items = main.findAll('[data-testid="message-item"]');
+      const theirs = items.find(
+        (i) =>
+          i.find('[data-testid="message-bubble"]').text() === "来自对方的消息",
+      );
+      await theirs?.find('[data-testid="action-reply"]').trigger("click");
+
+      const context = main.find('[data-testid="reply-context"]');
+      expect(context.exists()).toBe(true);
+      expect(context.find('[data-testid="reply-context-preview"]').text()).toBe(
+        "来自对方的消息",
+      );
+      expect(ws.replyContext?.messageId).toBe("m-theirs");
+
+      await context.find('[data-testid="reply-cancel"]').trigger("click");
+      expect(main.find('[data-testid="reply-context"]').exists()).toBe(false);
+      expect(ws.replyContext).toBeNull();
+    });
+
+    it("forwards a message through the in-app picker into another conversation", async () => {
+      const { wrapper, ws } = await mountWithM2Thread();
+      const main = mainPane(wrapper);
+
+      const items = main.findAll('[data-testid="message-item"]');
+      const theirs = items.find(
+        (i) =>
+          i.find('[data-testid="message-bubble"]').text() === "来自对方的消息",
+      );
+      await theirs?.find('[data-testid="action-forward"]').trigger("click");
+
+      const picker = wrapper.find('[data-testid="forward-picker"]');
+      expect(picker.exists()).toBe(true);
+
+      // Only the OTHER conversation is offered (no self-target).
+      const targets = picker.findAll('[data-testid="forward-target"]');
+      expect(targets).toHaveLength(1);
+      expect(targets[0]?.attributes("data-conversation-id")).toBe("2");
+
+      await targets[0]?.trigger("click");
+      expect(wrapper.find('[data-testid="forward-picker"]').exists()).toBe(
+        false,
+      );
+
+      const forwarded = ws.messagesByConversation[2]?.at(-1);
+      expect(forwarded?.body).toBe("[转发] 来自对方的消息");
+      expect(forwarded?.mine).toBe(true);
+    });
+
+    it("shows the peer typing indicator while the typing deadline is active", async () => {
+      const { wrapper, ws } = await mountWithM2Thread();
+
+      expect(
+        mainPane(wrapper).find('[data-testid="typing-indicator"]').exists(),
+      ).toBe(false);
+
+      ws.conversations[0]!.peerTypingUntil = Date.now() + 60_000;
+      await wrapper.vm.$nextTick();
+      const indicator = mainPane(wrapper).find(
+        '[data-testid="typing-indicator"]',
+      );
+      expect(indicator.exists()).toBe(true);
+      expect(indicator.text()).toContain("对方正在输入");
+    });
+
+    it("renders the reply quote inside bubbles from server metadata", async () => {
+      const pinia = createPinia();
+      setActivePinia(pinia);
+      useAuthStore().user = { userId: "7", username: "me" };
+      const ws = useWsStore();
+      ws.conversations.push(conversation(1, { peerUsername: "alice" }));
+      ws.messagesByConversation[1] = [
+        message({
+          messageId: "m-reply",
+          seq: 9,
+          senderId: "alice",
+          body: "这是回复",
+          replyToMessageId: "m-orig",
+          replyToSenderId: "7",
+          replyToBodyPreview: "原始内容预览",
+          sentAt: isoAt(-30_000),
+        }),
+      ];
+      ws.openConversation(1);
+
+      const wrapper = await mountView(pinia);
+      const quote = mainPane(wrapper).find('[data-testid="reply-quote"]');
+      expect(quote.exists()).toBe(true);
+      expect(quote.text()).toBe("原始内容预览");
+    });
   });
 });

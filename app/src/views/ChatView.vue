@@ -7,7 +7,7 @@ import LanguageToggle from "../components/LanguageToggle.vue";
 import ThemeToggle from "../components/ThemeToggle.vue";
 import { apiErrorMessage } from "../lib/api/messages";
 import { useAuthStore } from "../stores/auth";
-import { useWsStore } from "../stores/ws";
+import { RECALL_WINDOW_MS, useWsStore } from "../stores/ws";
 import type { ChatMessage, Conversation } from "../stores/ws";
 
 const { t, locale } = useI18n();
@@ -186,6 +186,7 @@ function sendMessage(): void {
   if (conversationId === null || !ws.isConnected) return;
   const body = draft.value.trim();
   if (body.length === 0) return;
+  ws.notifyTypingStop(conversationId);
   ws.send(conversationId, body);
   draft.value = "";
   autoGrow();
@@ -193,6 +194,65 @@ function sendMessage(): void {
 
 function retryMessage(clientMsgId: string): void {
   ws.retry(clientMsgId);
+}
+
+// ---------------------------------------------------------------------
+// M2: reply / forward / recall / typing
+// ---------------------------------------------------------------------
+
+/** Forward picker source message; null = picker closed. */
+const forwardSource = ref<ChatMessage | null>(null);
+
+/** Picker lists every OTHER conversation (no self-target). */
+const forwardTargets = computed(() =>
+  ws.sortedConversations.filter(
+    (c) => c.conversationId !== forwardSource.value?.conversationId,
+  ),
+);
+
+/** Sender-only, 120s window (mirrors the server-side RecallPolicy). */
+function canRecall(message: ChatMessage): boolean {
+  if (!message.mine || message.recalled || message.messageId === null) {
+    return false;
+  }
+  const sentAt = Date.parse(message.sentAt);
+  return Number.isFinite(sentAt) && Date.now() - sentAt < RECALL_WINDOW_MS;
+}
+
+function replyToMessage(message: ChatMessage): void {
+  ws.setReplyContext(message);
+}
+
+function cancelReply(): void {
+  ws.clearReplyContext();
+}
+
+function openForwardPicker(message: ChatMessage): void {
+  if (!message.recalled) forwardSource.value = message;
+}
+
+function confirmForward(conversationId: number): void {
+  const source = forwardSource.value;
+  forwardSource.value = null;
+  if (source === null) return;
+  ws.forwardMessage(conversationId, source);
+}
+
+function recallMessage(message: ChatMessage): void {
+  if (canRecall(message)) ws.recallMessage(message.conversationId, message);
+}
+
+function onComposerInput(): void {
+  autoGrow();
+  const conversationId = ws.activeConversationId;
+  if (conversationId !== null && ws.isConnected) {
+    ws.notifyTypingStart(conversationId);
+  }
+}
+
+function onComposerBlur(): void {
+  const conversationId = ws.activeConversationId;
+  if (conversationId !== null) ws.notifyTypingStop(conversationId);
 }
 </script>
 
@@ -404,7 +464,7 @@ function retryMessage(clientMsgId: string): void {
             <div
               v-for="message in group.messages"
               :key="message.messageId ?? message.clientMsgId"
-              class="mb-2 flex"
+              class="group mb-2 flex"
               :class="message.mine ? 'justify-end' : 'justify-start'"
               data-testid="message-item"
             >
@@ -416,7 +476,16 @@ function retryMessage(clientMsgId: string): void {
                 >
                   {{ message.senderId }}
                 </div>
+                <!-- Recall tombstone: localized placeholder replaces content -->
                 <div
+                  v-if="message.recalled"
+                  class="inline-block rounded-2xl bg-slate-100 px-3 py-1.5 text-sm italic leading-relaxed text-neutral-400 break-words dark:bg-slate-800 dark:text-neutral-500"
+                  data-testid="recalled-placeholder"
+                >
+                  {{ t("chat.recalledPlaceholder") }}
+                </div>
+                <div
+                  v-else
                   class="inline-block rounded-2xl px-3 py-1.5 text-sm leading-relaxed break-words"
                   :class="
                     message.mine
@@ -425,7 +494,55 @@ function retryMessage(clientMsgId: string): void {
                   "
                   data-testid="message-bubble"
                 >
+                  <!-- Reply quote rendered inline from server-resolved metadata -->
+                  <span
+                    v-if="message.replyToBodyPreview"
+                    class="mb-1 block rounded border-l-2 px-2 py-0.5 text-xs opacity-80"
+                    :class="
+                      message.mine
+                        ? 'border-white/70 bg-white/10'
+                        : 'border-indigo-400 bg-black/5 dark:bg-white/5'
+                    "
+                    data-testid="reply-quote"
+                  >
+                    {{ message.replyToBodyPreview }}
+                  </span>
                   {{ message.body }}
+                </div>
+                <!-- Hover/tap action row: reply / forward / recall.
+                     Tombstones offer no actions — there is nothing left
+                     to reply to, forward, or recall again. -->
+                <div
+                  v-if="!message.recalled"
+                  class="mt-0.5 flex items-center gap-2 text-[11px] opacity-0 transition-opacity group-hover:opacity-100 focus-within:opacity-100"
+                  :class="message.mine ? 'justify-end' : 'justify-start'"
+                  data-testid="message-actions"
+                >
+                  <button
+                    type="button"
+                    class="text-neutral-500 hover:text-indigo-600 hover:underline dark:text-neutral-400"
+                    data-testid="action-reply"
+                    @click="replyToMessage(message)"
+                  >
+                    {{ t("chat.actionReply") }}
+                  </button>
+                  <button
+                    type="button"
+                    class="text-neutral-500 hover:text-indigo-600 hover:underline dark:text-neutral-400"
+                    data-testid="action-forward"
+                    @click="openForwardPicker(message)"
+                  >
+                    {{ t("chat.actionForward") }}
+                  </button>
+                  <button
+                    v-if="canRecall(message)"
+                    type="button"
+                    class="text-neutral-500 hover:text-red-500 hover:underline dark:text-neutral-400"
+                    data-testid="action-recall"
+                    @click="recallMessage(message)"
+                  >
+                    {{ t("chat.actionRecall") }}
+                  </button>
                 </div>
                 <div
                   class="mt-0.5 flex items-center gap-1.5 text-[11px]"
@@ -451,6 +568,13 @@ function retryMessage(clientMsgId: string): void {
                   >
                     ✓✓ {{ t("chat.statusDelivered") }}
                   </span>
+                  <span
+                    v-else-if="message.mine && message.status === 'read'"
+                    class="font-medium text-blue-500 dark:text-blue-400"
+                    data-testid="message-status"
+                  >
+                    ✓✓ {{ t("chat.statusRead") }}
+                  </span>
                   <button
                     v-else-if="message.mine && message.status === 'failed'"
                     type="button"
@@ -467,31 +591,113 @@ function retryMessage(clientMsgId: string): void {
           <div ref="messagesEndRef"></div>
         </div>
 
+        <!-- Peer typing indicator -->
+        <div
+          v-if="ws.activeConversation?.peerTypingUntil !== null"
+          class="shrink-0 px-4 pb-1 text-xs text-neutral-500 dark:text-neutral-400"
+          data-testid="typing-indicator"
+        >
+          {{ t("chat.typingIndicator") }}
+        </div>
+
         <!-- Composer -->
         <footer
-          class="flex shrink-0 items-end gap-2 border-t border-neutral-200 p-3 dark:border-neutral-800"
+          class="flex shrink-0 flex-col border-t border-neutral-200 dark:border-neutral-800"
         >
-          <textarea
-            ref="composerEl"
-            v-model="draft"
-            rows="1"
-            data-testid="composer-input"
-            :placeholder="t('chat.inputPlaceholder')"
-            :disabled="!ws.isConnected"
-            class="max-h-40 min-h-9 flex-1 resize-none rounded-xl border border-neutral-300 bg-transparent px-3 py-2 text-sm outline-none focus:border-indigo-500 disabled:cursor-not-allowed disabled:opacity-60 dark:border-neutral-700"
-            @keydown.enter.exact.prevent="sendMessage()"
-            @input="autoGrow()"
-          ></textarea>
+          <!-- Reply context strip above the input -->
+          <div
+            v-if="ws.replyContext !== null"
+            class="flex items-center gap-2 border-b border-neutral-200 bg-neutral-50 px-3 py-1.5 text-xs dark:border-neutral-800 dark:bg-neutral-900"
+            data-testid="reply-context"
+          >
+            <span class="text-indigo-500">↩</span>
+            <span
+              class="min-w-0 flex-1 truncate text-neutral-600 dark:text-neutral-300"
+              data-testid="reply-context-preview"
+            >
+              {{ ws.replyContext.bodyPreview }}
+            </span>
+            <button
+              type="button"
+              class="shrink-0 rounded px-1.5 py-0.5 font-medium text-neutral-500 hover:bg-neutral-200 hover:text-neutral-800 dark:hover:bg-neutral-700 dark:hover:text-neutral-100"
+              data-testid="reply-cancel"
+              :aria-label="t('chat.replyCancel')"
+              @click="cancelReply()"
+            >
+              ×
+            </button>
+          </div>
+          <div class="flex items-end gap-2 p-3">
+            <textarea
+              ref="composerEl"
+              v-model="draft"
+              rows="1"
+              data-testid="composer-input"
+              :placeholder="t('chat.inputPlaceholder')"
+              :disabled="!ws.isConnected"
+              class="max-h-40 min-h-9 flex-1 resize-none rounded-xl border border-neutral-300 bg-transparent px-3 py-2 text-sm outline-none focus:border-indigo-500 disabled:cursor-not-allowed disabled:opacity-60 dark:border-neutral-700"
+              @keydown.enter.exact.prevent="sendMessage()"
+              @input="onComposerInput()"
+              @blur="onComposerBlur()"
+            ></textarea>
+            <button
+              type="button"
+              data-testid="composer-send"
+              :disabled="!ws.isConnected || draft.trim().length === 0"
+              class="shrink-0 rounded-xl bg-indigo-600 px-4 py-2 text-sm font-medium text-white hover:bg-indigo-500 disabled:cursor-not-allowed disabled:opacity-50"
+              @click="sendMessage()"
+            >
+              {{ t("chat.composerSend") }}
+            </button>
+          </div>
+        </footer>
+      </div>
+
+      <!-- Forward picker modal -->
+      <div
+        v-if="forwardSource !== null"
+        class="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4"
+        data-testid="forward-picker"
+      >
+        <div
+          class="w-full max-w-xs rounded-xl bg-white p-4 shadow-lg dark:bg-neutral-900"
+        >
+          <h3
+            class="pb-2 text-sm font-semibold"
+            data-testid="forward-picker-title"
+          >
+            {{ t("chat.forwardPickerTitle") }}
+          </h3>
+          <ul class="max-h-64 space-y-1 overflow-y-auto">
+            <li
+              v-for="conversation in forwardTargets"
+              :key="conversation.conversationId"
+            >
+              <button
+                type="button"
+                class="flex w-full items-center gap-2 rounded-lg p-2 text-left text-sm hover:bg-neutral-100 dark:hover:bg-neutral-800"
+                data-testid="forward-target"
+                :data-conversation-id="conversation.conversationId"
+                @click="confirmForward(conversation.conversationId)"
+              >
+                <span
+                  class="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-indigo-100 text-xs font-semibold text-indigo-700 dark:bg-indigo-900 dark:text-indigo-200"
+                >
+                  {{ initialOf(conversation.peerUsername) }}
+                </span>
+                {{ displayName(conversation) }}
+              </button>
+            </li>
+          </ul>
           <button
             type="button"
-            data-testid="composer-send"
-            :disabled="!ws.isConnected || draft.trim().length === 0"
-            class="shrink-0 rounded-xl bg-indigo-600 px-4 py-2 text-sm font-medium text-white hover:bg-indigo-500 disabled:cursor-not-allowed disabled:opacity-50"
-            @click="sendMessage()"
+            class="mt-2 w-full rounded-lg border border-neutral-300 py-1.5 text-xs font-medium text-neutral-600 hover:bg-neutral-100 dark:border-neutral-700 dark:text-neutral-300 dark:hover:bg-neutral-800"
+            data-testid="forward-cancel"
+            @click="forwardSource = null"
           >
-            {{ t("chat.composerSend") }}
+            {{ t("chat.forwardPickerCancel") }}
           </button>
-        </footer>
+        </div>
       </div>
     </template>
   </AppShell>

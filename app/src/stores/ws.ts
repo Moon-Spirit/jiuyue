@@ -12,7 +12,10 @@ import type {
   Frame,
   MsgAck,
   MsgNew,
+  MsgRecalled,
+  ReadReceipt,
   SyncRes,
+  Typing,
 } from "../lib/protocol/frames";
 import {
   parseFrame,
@@ -44,7 +47,8 @@ import { useAuthStore } from "./auth";
 export type WsStatus =
   "idle" | "connecting" | "open" | "reconnecting" | "closed";
 
-export type MessageStatus = "sending" | "delivered" | "failed";
+/** M2: `read` = the peer's read receipt covered this message. */
+export type MessageStatus = "sending" | "delivered" | "read" | "failed";
 
 export interface ChatMessage {
   /** Idempotency key; empty for messages that arrived from the wire only. */
@@ -58,6 +62,13 @@ export interface ChatMessage {
   sentAt: string;
   mine: boolean;
   status: MessageStatus;
+  /** Recall tombstone: render a placeholder instead of the (empty) body. */
+  recalled: boolean;
+  /** Quote metadata resolved server-side on msg.new (null when not a reply). */
+  replyToMessageId: string | null;
+  replyToSenderId: string | null;
+  replyToBodyPreview: string | null;
+  forwardedFromUsername: string | null;
 }
 
 export interface Conversation {
@@ -69,8 +80,20 @@ export interface Conversation {
   unread: number;
   /** Highest seq marked as read (opening the conversation advances this). */
   lastSeenSeq: number;
-  /** Highest seq seen locally 鈥?sent as the sync cursor on reconnect. */
+  /** Highest seq seen locally — sent as the sync cursor on reconnect. */
   maxSeq: number;
+  /**
+   * Epoch-ms deadline while the peer's typing indicator is visible
+   * (transient, never meaningful across reloads).
+   */
+  peerTypingUntil: number | null;
+}
+
+/** Composer-level reply context shown above the input until cancelled. */
+export interface ReplyContext {
+  messageId: string;
+  senderId: string;
+  bodyPreview: string;
 }
 
 const CONVOS_KEY = "jiuyue.convos";
@@ -81,6 +104,22 @@ export const BACKOFF_CAP_MS = 15_000;
 export const MAX_MESSAGES_PER_CONV = 500;
 export const STALE_AFTER_MS = 90_000;
 export const STALE_CHECK_INTERVAL_MS = 15_000;
+
+// --- M2 message-experience constants -------------------------------------
+/** How long a peer typing indicator stays visible without a refresh. */
+export const TYPING_VISIBLE_MS = 6_000;
+/** Minimum gap between outbound typing{start} frames. */
+export const TYPING_SEND_THROTTLE_MS = 3_000;
+/** Debounce for auto read.update frames after new messages arrive. */
+export const READ_UPDATE_DEBOUNCE_MS = 300;
+/** Sender-only recall window (mirrors the server-side RecallPolicy). */
+export const RECALL_WINDOW_MS = 120_000;
+/**
+ * DECISION (forwarding): forward is a pure client-side compose of a NEW
+ * normal message whose body is prefixed with this marker — zero wire or
+ * schema change, visible to every receiver regardless of client.
+ */
+export const FORWARD_BODY_PREFIX = "[转发] ";
 
 /**
  * Backoff schedule for reconnect attempt `n` (0-based): 500ms路2^n capped at
@@ -117,6 +156,8 @@ function loadPersistedConversations(): Conversation[] {
     if (raw === null) return [];
     const parsed: unknown = JSON.parse(raw);
     if (!Array.isArray(parsed)) return [];
+    // Defensive shape upgrade: M2 adds peerTypingUntil; older caches lack
+    // it (and M1 caches lack nothing else) — every field defaults.
     return parsed.filter(isRecord).map((c) => ({
       conversationId: Number(c["conversationId"]),
       peerUserId: String(c["peerUserId"] ?? ""),
@@ -129,6 +170,8 @@ function loadPersistedConversations(): Conversation[] {
       unread: Number(c["unread"] ?? 0),
       lastSeenSeq: Number(c["lastSeenSeq"] ?? 0),
       maxSeq: Number(c["maxSeq"] ?? 0),
+      peerTypingUntil:
+        typeof c["peerTypingUntil"] === "number" ? c["peerTypingUntil"] : null,
     }));
   } catch {
     // Corrupted cache degrades to an empty list; sync will repopulate.
@@ -146,6 +189,8 @@ function loadPersistedMessages(): Record<number, ChatMessage[]> {
       if (!Number.isInteger(conversationId)) continue;
       const parsed: unknown = JSON.parse(localStorage.getItem(key) ?? "null");
       if (!Array.isArray(parsed)) continue;
+      // Defensive shape upgrade: M2 adds recalled/reply/forward fields;
+      // entries persisted by older builds load with neutral defaults.
       out[conversationId] = parsed.filter(isRecord).map((m) => ({
         clientMsgId: String(m["clientMsgId"] ?? ""),
         messageId: typeof m["messageId"] === "string" ? m["messageId"] : null,
@@ -158,7 +203,26 @@ function loadPersistedMessages(): Record<number, ChatMessage[]> {
         status:
           m["status"] === "sending" || m["status"] === "failed"
             ? m["status"]
-            : "delivered",
+            : m["status"] === "read"
+              ? "read"
+              : "delivered",
+        recalled: m["recalled"] === true,
+        replyToMessageId:
+          typeof m["replyToMessageId"] === "string"
+            ? m["replyToMessageId"]
+            : null,
+        replyToSenderId:
+          typeof m["replyToSenderId"] === "string"
+            ? m["replyToSenderId"]
+            : null,
+        replyToBodyPreview:
+          typeof m["replyToBodyPreview"] === "string"
+            ? m["replyToBodyPreview"]
+            : null,
+        forwardedFromUsername:
+          typeof m["forwardedFromUsername"] === "string"
+            ? m["forwardedFromUsername"]
+            : null,
       }));
     }
   } catch {
@@ -173,6 +237,34 @@ let intentionalClose = false;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 let stalenessTimer: ReturnType<typeof setInterval> | null = null;
 let lastFrameAt = 0;
+
+// --- M2 ephemeral state (never persisted) --------------------------------
+/** Per-conversation expiry timers for peer typing indicators. */
+const typingExpiryTimers = new Map<number, ReturnType<typeof setTimeout>>();
+/** Epoch ms of the last outbound typing{start}; throttles repeats. */
+let lastTypingSentAt = 0;
+/** True between a sent typing{start} and its matching stop. */
+let typingActive = false;
+/** Per-conversation debounced read.update timers. */
+const readUpdateTimers = new Map<number, ReturnType<typeof setTimeout>>();
+/** Highest seq already reported via read.update per conversation. */
+const lastSentReadSeq = new Map<number, number>();
+
+function clearTypingExpiry(conversationId: number): void {
+  const timer = typingExpiryTimers.get(conversationId);
+  if (timer !== undefined) {
+    clearTimeout(timer);
+    typingExpiryTimers.delete(conversationId);
+  }
+}
+
+function clearReadUpdateTimer(conversationId: number): void {
+  const timer = readUpdateTimers.get(conversationId);
+  if (timer !== undefined) {
+    clearTimeout(timer);
+    readUpdateTimers.delete(conversationId);
+  }
+}
 
 function clearReconnectTimer(): void {
   if (reconnectTimer !== null) {
@@ -202,6 +294,8 @@ export const useWsStore = defineStore("ws", {
       retryable: boolean;
     } | null,
     reconnectAttempt: 0,
+    /** Composer reply context (quote block above the input); null = off. */
+    replyContext: null as ReplyContext | null,
   }),
 
   getters: {
@@ -305,6 +399,17 @@ export const useWsStore = defineStore("ws", {
       this.queuedFrames = [];
       this.lastError = null;
       this.reconnectAttempt = 0;
+      this.replyContext = null;
+      for (const conversation of this.conversations) {
+        conversation.peerTypingUntil = null;
+      }
+      for (const timer of typingExpiryTimers.values()) clearTimeout(timer);
+      typingExpiryTimers.clear();
+      for (const timer of readUpdateTimers.values()) clearTimeout(timer);
+      readUpdateTimers.clear();
+      lastTypingSentAt = 0;
+      typingActive = false;
+      lastSentReadSeq.clear();
     },
 
     scheduleReconnect(): void {
@@ -363,6 +468,7 @@ export const useWsStore = defineStore("ws", {
               // (user story 7) instead of trusting last_seq as local truth.
               lastSeenSeq: 0,
               maxSeq: 0,
+              peerTypingUntil: null,
             });
           }
           this.persistConversations();
@@ -421,12 +527,22 @@ export const useWsStore = defineStore("ws", {
         case "sync.res":
           this.handleSyncRes(frame.d);
           break;
+        case "read.receipt":
+          this.handleReadReceipt(frame.d);
+          break;
+        case "typing":
+          this.handleTypingNotice(frame.d);
+          break;
+        case "msg.recalled":
+          this.handleMsgRecalled(frame.d);
+          break;
         case "error":
           this.handleErrorFrame(frame.d);
           break;
         default:
-          // auth.ticket.* / sync.req / msg.send never come inbound; unknown
-          // types already degrade to error frames inside parseFrame.
+          // auth.ticket.* / sync.req / msg.send / read.update / typing (C→S
+          // shape) / msg.recall never come inbound; unknown types already
+          // degrade to error frames inside parseFrame.
           break;
       }
     },
@@ -458,6 +574,7 @@ export const useWsStore = defineStore("ws", {
         }
         if (this.activeConversationId === conversation.conversationId) {
           conversation.lastSeenSeq = conversation.maxSeq;
+          this.scheduleReadUpdate(conversation.conversationId);
         }
         this.persistConversations();
         this.persistMessages(conversation.conversationId);
@@ -482,6 +599,7 @@ export const useWsStore = defineStore("ws", {
           unread: 0,
           lastSeenSeq: 0,
           maxSeq: 0,
+          peerTypingUntil: null,
         };
         this.conversations.push(conversation);
       }
@@ -489,7 +607,7 @@ export const useWsStore = defineStore("ws", {
       const mine = m.sender_id === this.mySenderId();
       const messages = this.messagesByConversation[m.conversation_id] ?? [];
 
-      // Idempotent re-delivery: same message_id or same (conv, seq) 鈫?skip.
+      // Idempotent re-delivery: same message_id or same (conv, seq) — skip.
       const duplicate = messages.some(
         (msg) =>
           msg.messageId === m.message_id ||
@@ -497,9 +615,12 @@ export const useWsStore = defineStore("ws", {
       );
       if (duplicate) return;
 
+      // Tombstone contract: a recalled entry never carries body content.
+      const body = m.recalled === true ? "" : m.body;
+
       // Lost-ack recovery: our own unacked optimistic bubble with identical
       // body gets adopted instead of spawning a second entry.
-      if (mine) {
+      if (mine && m.recalled !== true) {
         const orphan = messages.find(
           (msg) =>
             msg.seq === null &&
@@ -524,13 +645,21 @@ export const useWsStore = defineStore("ws", {
         conversationId: m.conversation_id,
         seq: m.seq,
         senderId: m.sender_id,
-        body: m.body,
+        body,
         sentAt: m.sent_at,
         mine,
         status: "delivered",
+        recalled: m.recalled === true,
+        replyToMessageId: m.reply_to_message_id ?? null,
+        replyToSenderId: m.reply_to_sender_id ?? null,
+        replyToBodyPreview: m.reply_to_body_preview ?? null,
+        forwardedFromUsername: m.forwarded_from_username ?? null,
       });
       this.sortMessages(messages);
       this.messagesByConversation[m.conversation_id] = messages;
+
+      // A fresh incoming message from the peer proves they stopped typing.
+      if (!mine) this.clearPeerTyping(m.conversation_id);
 
       this.bumpConversationForIncoming(conversation, m, mine);
       this.persistConversations();
@@ -551,6 +680,7 @@ export const useWsStore = defineStore("ws", {
       if (this.activeConversationId === conversation.conversationId) {
         // Open conversation: immediately seen, unread stays zero.
         conversation.lastSeenSeq = conversation.maxSeq;
+        this.scheduleReadUpdate(conversation.conversationId);
       } else if (!mine && m.seq > conversation.lastSeenSeq) {
         conversation.unread += 1;
       }
@@ -562,6 +692,70 @@ export const useWsStore = defineStore("ws", {
       for (const m of res.messages) {
         this.ingestMessage(m);
       }
+    },
+
+    /**
+     * Peer read receipt: upgrade MY messages with seq <= last_read_seq from
+     * delivered → read (✓✓已读). Idempotent — already-read entries stay put.
+     */
+    handleReadReceipt(receipt: ReadReceipt): void {
+      const messages = this.messagesByConversation[receipt.conversation_id];
+      if (messages === undefined) return;
+      let changed = false;
+      for (const m of messages) {
+        if (
+          m.mine &&
+          m.seq !== null &&
+          m.seq <= receipt.last_read_seq &&
+          m.status === "delivered"
+        ) {
+          m.status = "read";
+          changed = true;
+        }
+      }
+      if (changed) this.persistMessages(receipt.conversation_id);
+    },
+
+    /** Peer typing signal: show for TYPING_VISIBLE_MS, clear on stop. */
+    handleTypingNotice(notice: Typing): void {
+      // Own multi-device echo would be nonsense feedback.
+      if (notice.user_id === this.mySenderId()) return;
+      const conversation = this.conversations.find(
+        (c) => c.conversationId === notice.conversation_id,
+      );
+      if (conversation === undefined) return;
+      if (notice.state === "start") {
+        conversation.peerTypingUntil = Date.now() + TYPING_VISIBLE_MS;
+        clearTypingExpiry(conversation.conversationId);
+        typingExpiryTimers.set(
+          conversation.conversationId,
+          setTimeout(() => {
+            typingExpiryTimers.delete(conversation.conversationId);
+            conversation.peerTypingUntil = null;
+          }, TYPING_VISIBLE_MS),
+        );
+      } else {
+        this.clearPeerTyping(conversation.conversationId);
+      }
+    },
+
+    /** Clears the peer typing indicator immediately (stop / new message). */
+    clearPeerTyping(conversationId: number): void {
+      clearTypingExpiry(conversationId);
+      const conversation = this.conversations.find(
+        (c) => c.conversationId === conversationId,
+      );
+      if (conversation !== undefined) conversation.peerTypingUntil = null;
+    },
+
+    /** Recall broadcast: swap the bubble for a localized tombstone. */
+    handleMsgRecalled(payload: MsgRecalled): void {
+      const messages = this.messagesByConversation[payload.conversation_id];
+      const entry = messages?.find((m) => m.messageId === payload.message_id);
+      if (entry === undefined) return;
+      entry.recalled = true;
+      entry.body = "";
+      this.persistMessages(payload.conversation_id);
     },
 
     handleErrorFrame(payload: ErrorPayload): void {
@@ -609,6 +803,7 @@ export const useWsStore = defineStore("ws", {
           unread: 0,
           lastSeenSeq: 0,
           maxSeq: 0,
+          peerTypingUntil: null,
         };
         this.conversations.push(conversation);
       }
@@ -623,6 +818,11 @@ export const useWsStore = defineStore("ws", {
         sentAt: new Date().toISOString(),
         mine: true,
         status: "sending",
+        recalled: false,
+        replyToMessageId: null,
+        replyToSenderId: null,
+        replyToBodyPreview: null,
+        forwardedFromUsername: null,
       };
       const messages = this.messagesByConversation[conversationId] ?? [];
       messages.push(message);
@@ -632,6 +832,11 @@ export const useWsStore = defineStore("ws", {
       conversation.lastMessagePreview = trimmed;
       conversation.lastActivityAt = message.sentAt;
 
+      // Attach (and consume) the composer reply context. Conditional spread:
+      // a plain message must not carry a reply_to key at all.
+      const replyTo = this.replyContext?.messageId;
+      this.clearReplyContext();
+
       const frame: Frame = {
         v: 1,
         t: "msg.send",
@@ -639,6 +844,9 @@ export const useWsStore = defineStore("ws", {
           conversation_id: conversationId,
           client_msg_id: message.clientMsgId,
           body: trimmed,
+          ...(replyTo !== undefined && replyTo !== null
+            ? { reply_to: replyTo }
+            : {}),
         },
       };
       const outcome = this.transmitFrame(frame);
@@ -681,6 +889,130 @@ export const useWsStore = defineStore("ws", {
         this.persistMessages(entry.conversationId);
         return;
       }
+    },
+
+    // ------------------------------------------------------------------
+    // M2 outbound: typing / read receipts / recall / forward / reply
+    // ------------------------------------------------------------------
+
+    /**
+     * Composer activity ping. Throttled to one frame per
+     * TYPING_SEND_THROTTLE_MS; ephemeral frames are never queued offline.
+     */
+    notifyTypingStart(conversationId: number): void {
+      const now = Date.now();
+      if (now - lastTypingSentAt < TYPING_SEND_THROTTLE_MS) return;
+      lastTypingSentAt = now;
+      typingActive = true;
+      this.transmitEphemeral({
+        v: 1,
+        t: "typing",
+        d: { conversation_id: conversationId, state: "start" },
+      });
+    },
+
+    /** Composer blur / send / clear: stop the peer's indicator promptly. */
+    notifyTypingStop(conversationId: number): void {
+      if (!typingActive) return;
+      typingActive = false;
+      lastTypingSentAt = 0;
+      this.transmitEphemeral({
+        v: 1,
+        t: "typing",
+        d: { conversation_id: conversationId, state: "stop" },
+      });
+    },
+
+    /**
+     * Debounced auto read-cursor report while the conversation is open and
+     * the window is focused. Skipped silently when nothing new was read.
+     */
+    scheduleReadUpdate(conversationId: number): void {
+      if (this.activeConversationId !== conversationId) return;
+      if (
+        typeof document !== "undefined" &&
+        typeof document.hasFocus === "function" &&
+        !document.hasFocus()
+      ) {
+        return;
+      }
+      clearReadUpdateTimer(conversationId);
+      readUpdateTimers.set(
+        conversationId,
+        setTimeout(() => {
+          readUpdateTimers.delete(conversationId);
+          const conversation = this.conversations.find(
+            (c) => c.conversationId === conversationId,
+          );
+          if (conversation === undefined) return;
+          const alreadySent = lastSentReadSeq.get(conversationId) ?? 0;
+          if (conversation.maxSeq <= alreadySent) return;
+          lastSentReadSeq.set(conversationId, conversation.maxSeq);
+          this.transmitEphemeral({
+            v: 1,
+            t: "read.update",
+            d: {
+              conversation_id: conversationId,
+              last_read_seq: conversation.maxSeq,
+            },
+          });
+        }, READ_UPDATE_DEBOUNCE_MS),
+      );
+    },
+
+    /** Sets the composer reply context from a message bubble action. */
+    setReplyContext(message: ChatMessage): void {
+      if (message.messageId === null || message.recalled) return;
+      this.replyContext = {
+        messageId: message.messageId,
+        senderId: message.senderId,
+        bodyPreview: message.body.slice(0, 80),
+      };
+    },
+
+    clearReplyContext(): void {
+      this.replyContext = null;
+    },
+
+    /**
+     * Forward = pure CLIENT-side compose of a NEW normal message with a
+     * "[转发] " body prefix (see FORWARD_BODY_PREFIX). Zero wire/schema
+     * change by decision; recalled sources have no content to forward.
+     */
+    forwardMessage(
+      toConversationId: number,
+      source: ChatMessage,
+    ): ChatMessage | null {
+      if (source.recalled || source.body.length === 0) return null;
+      return this.send(
+        toConversationId,
+        `${FORWARD_BODY_PREFIX}${source.body}`,
+      );
+    },
+
+    /**
+     * Recall request for one of MY recent messages. No optimistic swap —
+     * the authoritative msg.recalled broadcast (which includes the sender)
+     * performs the tombstone transition everywhere.
+     */
+    recallMessage(conversationId: number, message: ChatMessage): void {
+      if (message.messageId === null || !message.mine || message.recalled) {
+        return;
+      }
+      this.transmitEphemeral({
+        v: 1,
+        t: "msg.recall",
+        d: { conversation_id: conversationId, message_id: message.messageId },
+      });
+    },
+
+    /**
+     * Like transmitFrame but for EPHEMERAL signals (typing / read.update /
+     * msg.recall): dropped when the socket is not open — they are pointless
+     * once stale and must never sit in the reconnect queue.
+     */
+    transmitEphemeral(frame: Frame): void {
+      void this.transmitFrame(frame);
     },
 
     /**
@@ -728,6 +1060,7 @@ export const useWsStore = defineStore("ws", {
           unread: 0,
           lastSeenSeq: 0,
           maxSeq: 0,
+          peerTypingUntil: null,
         };
         this.conversations.push(conversation);
       } else {
@@ -739,7 +1072,10 @@ export const useWsStore = defineStore("ws", {
       return conversation;
     },
 
-    /** Open a conversation: clears unread and marks history as seen. */
+    /**
+     * Open a conversation: clears unread, marks history as seen, reports the
+     * read cursor, and re-arms (or clears) any stale peer typing indicator.
+     */
     openConversation(conversationId: number): void {
       this.activeConversationId = conversationId;
       const conversation = this.conversations.find(
@@ -748,7 +1084,22 @@ export const useWsStore = defineStore("ws", {
       if (conversation === undefined) return;
       conversation.unread = 0;
       conversation.lastSeenSeq = conversation.maxSeq;
+      if (conversation.peerTypingUntil !== null) {
+        if (conversation.peerTypingUntil <= Date.now()) {
+          conversation.peerTypingUntil = null;
+        } else {
+          clearTypingExpiry(conversationId);
+          typingExpiryTimers.set(
+            conversationId,
+            setTimeout(() => {
+              typingExpiryTimers.delete(conversationId);
+              conversation.peerTypingUntil = null;
+            }, conversation.peerTypingUntil - Date.now()),
+          );
+        }
+      }
       this.persistConversations();
+      this.scheduleReadUpdate(conversationId);
     },
 
     closeConversation(): void {

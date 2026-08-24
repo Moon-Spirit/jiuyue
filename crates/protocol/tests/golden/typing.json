@@ -1,0 +1,8 @@
+{
+  "v": 1,
+  "t": "typing",
+  "d": {
+    "conversation_id": 42,
+    "state": "start"
+  }
+}

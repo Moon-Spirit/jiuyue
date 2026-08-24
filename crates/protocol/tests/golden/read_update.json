@@ -1,0 +1,8 @@
+{
+  "v": 1,
+  "t": "read.update",
+  "d": {
+    "conversation_id": 42,
+    "last_read_seq": 128
+  }
+}

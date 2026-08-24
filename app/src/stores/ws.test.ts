@@ -85,6 +85,7 @@ function seedConversation(
     unread: 0,
     lastSeenSeq: 0,
     maxSeq: 0,
+    peerTypingUntil: null,
     ...overrides,
   };
   store.conversations.push(conversation);
@@ -114,6 +115,11 @@ function seededMessage(overrides: Partial<ChatMessage>): ChatMessage {
     sentAt: new Date("2026-08-24T09:00:00Z").toISOString(),
     mine: false,
     status: "delivered",
+    recalled: false,
+    replyToMessageId: null,
+    replyToSenderId: null,
+    replyToBodyPreview: null,
+    forwardedFromUsername: null,
     ...overrides,
   };
 }
@@ -127,7 +133,8 @@ async function connectAndOpen(): Promise<MockWebSocket> {
   // reconnects fetch the ticket endpoint again.
   fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
     const url = String(input);
-    if (url.includes("/api/auth/ws-ticket")) return jsonResponse(200, { ticket: "t1" });
+    if (url.includes("/api/auth/ws-ticket"))
+      return jsonResponse(200, { ticket: "t1" });
     if (url.includes("/api/conversations")) return jsonResponse(200, []);
     return jsonResponse(200, { ticket: "t1" });
   });
@@ -506,5 +513,326 @@ describe("ws store 鈥?persistence", () => {
     const messages = stored as ChatMessage[];
     expect(messages[0]?.seq).toBe(6);
     expect(messages.at(-1)?.seq).toBe(505);
+  });
+});
+
+function readUpdateFrames(sock: MockWebSocket): Array<Record<string, unknown>> {
+  return sentFrames(sock)
+    .filter((f) => f.t === "read.update")
+    .map((f) => f.d as Record<string, unknown>);
+}
+
+describe("ws store — M2 read receipts", () => {
+  it("upgrades matching mine-messages from delivered to read on read.receipt", async () => {
+    const store = useWsStore();
+    seedConversation(store, 1);
+    store.messagesByConversation[1] = [
+      seededMessage({
+        messageId: "m-mine",
+        seq: 2,
+        senderId: "7",
+        mine: true,
+        status: "delivered",
+      }),
+      seededMessage({
+        messageId: "m-mine-late",
+        seq: 5,
+        senderId: "7",
+        mine: true,
+        status: "delivered",
+      }),
+      seededMessage({ messageId: "m-theirs", seq: 3, mine: false }),
+    ];
+    const sock = await connectAndOpen();
+
+    // Peer read through seq 2: only the covered own message flips to read.
+    sock.serverFrame({
+      v: 1,
+      t: "read.receipt",
+      d: { conversation_id: 1, user_id: "peer-1", last_read_seq: 2 },
+    });
+
+    const messages = store.messagesByConversation[1] ?? [];
+    expect(messages.find((m) => m.messageId === "m-mine")?.status).toBe("read");
+    expect(messages.find((m) => m.messageId === "m-mine-late")?.status).toBe(
+      "delivered",
+    );
+    expect(messages.find((m) => m.messageId === "m-theirs")?.status).toBe(
+      "delivered",
+    );
+
+    // Idempotent: an older receipt must never regress read → delivered.
+    sock.serverFrame({
+      v: 1,
+      t: "read.receipt",
+      d: { conversation_id: 1, user_id: "peer-1", last_read_seq: 1 },
+    });
+    expect(messages.find((m) => m.messageId === "m-mine")?.status).toBe("read");
+  });
+
+  it("auto-sends a debounced read.update while the conversation is open and focused", async () => {
+    vi.useFakeTimers();
+    vi.spyOn(document, "hasFocus").mockReturnValue(true);
+    const store = useWsStore();
+    seedConversation(store, 1, { maxSeq: 5, lastSeenSeq: 5 });
+    const sock = await connectAndOpen();
+
+    store.openConversation(1);
+    await vi.advanceTimersByTimeAsync(299);
+    expect(readUpdateFrames(sock)).toHaveLength(0);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(readUpdateFrames(sock)).toEqual([
+      { conversation_id: 1, last_read_seq: 5 },
+    ]);
+
+    // New arrivals in the OPEN conversation trigger exactly one more report
+    // covering the advanced cursor (the debounce collapses bursts).
+    sock.serverFrame({
+      v: 1,
+      t: "msg.new",
+      d: msgNew({ message_id: "m-live", seq: 6 }),
+    });
+    sock.serverFrame({
+      v: 1,
+      t: "msg.new",
+      d: msgNew({ message_id: "m-live2", seq: 7 }),
+    });
+    await vi.advanceTimersByTimeAsync(300);
+    expect(readUpdateFrames(sock)).toEqual([
+      { conversation_id: 1, last_read_seq: 5 },
+      { conversation_id: 1, last_read_seq: 7 },
+    ]);
+  });
+
+  it("skips the auto read.update when the window is not focused", async () => {
+    vi.useFakeTimers();
+    vi.spyOn(document, "hasFocus").mockReturnValue(false);
+    const store = useWsStore();
+    seedConversation(store, 1, { maxSeq: 4, lastSeenSeq: 4 });
+    const sock = await connectAndOpen();
+
+    store.openConversation(1);
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(readUpdateFrames(sock)).toHaveLength(0);
+  });
+});
+
+describe("ws store — M2 typing indicators", () => {
+  it("shows the peer indicator on start and clears on stop and on new incoming message", async () => {
+    const store = useWsStore();
+    seedConversation(store, 1);
+    const sock = await connectAndOpen();
+    const conversation = store.conversations[0];
+
+    sock.serverFrame({
+      v: 1,
+      t: "typing",
+      d: { conversation_id: 1, user_id: "peer-1", state: "start" },
+    });
+    expect(conversation?.peerTypingUntil).not.toBeNull();
+
+    sock.serverFrame({
+      v: 1,
+      t: "typing",
+      d: { conversation_id: 1, user_id: "peer-1", state: "stop" },
+    });
+    expect(conversation?.peerTypingUntil).toBeNull();
+
+    sock.serverFrame({
+      v: 1,
+      t: "typing",
+      d: { conversation_id: 1, user_id: "peer-1", state: "start" },
+    });
+    expect(conversation?.peerTypingUntil).not.toBeNull();
+    // A fresh incoming message proves the peer stopped typing.
+    sock.serverFrame({
+      v: 1,
+      t: "msg.new",
+      d: msgNew({ message_id: "m-in", seq: 9 }),
+    });
+    expect(conversation?.peerTypingUntil).toBeNull();
+  });
+
+  it("expires the indicator after 6 seconds without a refresh", async () => {
+    vi.useFakeTimers();
+    const store = useWsStore();
+    seedConversation(store, 1);
+    const sock = await connectAndOpen();
+    const conversation = store.conversations[0];
+
+    sock.serverFrame({
+      v: 1,
+      t: "typing",
+      d: { conversation_id: 1, user_id: "peer-1", state: "start" },
+    });
+    expect(conversation?.peerTypingUntil).not.toBeNull();
+    await vi.advanceTimersByTimeAsync(6_000);
+    expect(conversation?.peerTypingUntil).toBeNull();
+  });
+
+  it("ignores own multi-device typing echoes", async () => {
+    const store = useWsStore();
+    seedConversation(store, 1);
+    const sock = await connectAndOpen();
+
+    sock.serverFrame({
+      v: 1,
+      t: "typing",
+      d: { conversation_id: 1, user_id: "7", state: "start" },
+    });
+    expect(store.conversations[0]?.peerTypingUntil).toBeNull();
+  });
+
+  it("throttles outbound start frames to one per 3s and stops once", async () => {
+    const store = useWsStore();
+    seedConversation(store, 1);
+    const sock = await connectAndOpen();
+
+    store.notifyTypingStart(1);
+    store.notifyTypingStart(1);
+    store.notifyTypingStart(1);
+    let typing = sentFrames(sock).filter((f) => f.t === "typing");
+    expect(typing).toHaveLength(1);
+    expect(typing[0]?.d).toEqual({ conversation_id: 1, state: "start" });
+
+    store.notifyTypingStop(1);
+    store.notifyTypingStop(1);
+    typing = sentFrames(sock).filter((f) => f.t === "typing");
+    expect(typing).toHaveLength(2);
+    expect(typing[1]?.d).toEqual({ conversation_id: 1, state: "stop" });
+  });
+
+  it("never queues ephemeral signals while offline", () => {
+    const store = useWsStore();
+    seedConversation(store, 1);
+
+    store.notifyTypingStart(1);
+    store.scheduleReadUpdate(1);
+    store.recallMessage(1, seededMessage({ messageId: "m-x", mine: true }));
+
+    expect(store.queuedFrames).toHaveLength(0);
+  });
+});
+
+describe("ws store — M2 recall", () => {
+  it("swaps the bubble content for a tombstone on msg.recalled", async () => {
+    const store = useWsStore();
+    seedConversation(store, 1);
+    store.messagesByConversation[1] = [
+      seededMessage({ messageId: "m-gone", seq: 1, body: "secret" }),
+    ];
+    const sock = await connectAndOpen();
+
+    sock.serverFrame({
+      v: 1,
+      t: "msg.recalled",
+      d: { conversation_id: 1, message_id: "m-gone" },
+    });
+
+    const entry = store.messagesByConversation[1]?.find(
+      (m) => m.messageId === "m-gone",
+    );
+    expect(entry?.recalled).toBe(true);
+    expect(entry?.body).toBe("");
+  });
+
+  it("sends msg.recall for own messages and ignores foreign ones", async () => {
+    const store = useWsStore();
+    seedConversation(store, 1);
+    const sock = await connectAndOpen();
+
+    store.recallMessage(
+      1,
+      seededMessage({ messageId: "m-mine", mine: true, senderId: "7" }),
+    );
+    const recalls = sentFrames(sock).filter((f) => f.t === "msg.recall");
+    expect(recalls).toHaveLength(1);
+    expect(recalls[0]?.d).toEqual({ conversation_id: 1, message_id: "m-mine" });
+
+    store.recallMessage(
+      1,
+      seededMessage({ messageId: "m-theirs", mine: false }),
+    );
+    expect(sentFrames(sock).filter((f) => f.t === "msg.recall")).toHaveLength(
+      1,
+    );
+  });
+});
+
+describe("ws store — M2 reply quoting", () => {
+  it("sets and cancels the composer reply context", async () => {
+    const store = useWsStore();
+    seedConversation(store, 1);
+    await connectAndOpen();
+
+    store.setReplyContext(
+      seededMessage({
+        messageId: "m-quote",
+        body: "quoted content",
+        senderId: "p",
+      }),
+    );
+    expect(store.replyContext).toEqual({
+      messageId: "m-quote",
+      senderId: "p",
+      bodyPreview: "quoted content",
+    });
+
+    store.clearReplyContext();
+    expect(store.replyContext).toBeNull();
+  });
+
+  it("attaches reply_to to the send frame and consumes the context", async () => {
+    const store = useWsStore();
+    seedConversation(store, 1);
+    const sock = await connectAndOpen();
+
+    store.setReplyContext(seededMessage({ messageId: "m-quote" }));
+    store.send(1, "answer");
+
+    const sendFrame = sentFrames(sock).at(-1);
+    expect(sendFrame?.t).toBe("msg.send");
+    expect(sendFrame?.d["reply_to"]).toBe("m-quote");
+    expect(store.replyContext).toBeNull();
+
+    // A plain send afterwards carries NO reply_to key at all.
+    store.send(1, "plain");
+    const plainFrame = sentFrames(sock).at(-1);
+    expect("reply_to" in (plainFrame?.d ?? {})).toBe(false);
+  });
+});
+
+describe("ws store — M2 forwarding", () => {
+  it("composes a NEW prefixed message into the target conversation", async () => {
+    const store = useWsStore();
+    seedConversation(store, 1);
+    seedConversation(store, 2);
+    const sock = await connectAndOpen();
+
+    const result = store.forwardMessage(
+      2,
+      seededMessage({ messageId: "m-src", body: "original text" }),
+    );
+
+    expect(result?.body).toBe("[转发] original text");
+    expect(result?.conversationId).toBe(2);
+    expect(result?.clientMsgId).not.toBe("");
+    const sendFrame = sentFrames(sock).at(-1);
+    expect(sendFrame?.t).toBe("msg.send");
+    expect(sendFrame?.d["conversation_id"]).toBe(2);
+    expect(sendFrame?.d["body"]).toBe("[转发] original text");
+  });
+
+  it("refuses to forward recalled (empty-content) sources", async () => {
+    const store = useWsStore();
+    seedConversation(store, 1);
+    seedConversation(store, 2);
+    await connectAndOpen();
+
+    const result = store.forwardMessage(
+      2,
+      seededMessage({ messageId: "m-dead", body: "", recalled: true }),
+    );
+    expect(result).toBeNull();
   });
 });

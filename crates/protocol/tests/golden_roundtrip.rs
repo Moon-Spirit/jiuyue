@@ -18,8 +18,9 @@ use serde_json::Value;
 
 const GOLDEN_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/golden");
 
-/// All M1 wire types that must have a roundtrip fixture.
-const ALL_M1_TYPES: [&str; 8] = [
+/// Every wire type that must have a roundtrip fixture (M1 core + M2
+/// message-experience suite).
+const ALL_WIRE_TYPES: [&str; 13] = [
     "auth.ticket.req",
     "auth.ticket.res",
     "msg.send",
@@ -27,6 +28,11 @@ const ALL_M1_TYPES: [&str; 8] = [
     "msg.new",
     "sync.req",
     "sync.res",
+    "read.update",
+    "read.receipt",
+    "typing",
+    "msg.recall",
+    "msg.recalled",
     "error",
 ];
 
@@ -76,14 +82,14 @@ fn every_known_golden_fixture_roundtrips_through_rust_and_json() {
         seen_types.insert(t.to_owned());
     }
 
-    let missing: Vec<&str> = ALL_M1_TYPES
+    let missing: Vec<&str> = ALL_WIRE_TYPES
         .iter()
         .copied()
         .filter(|t| !seen_types.contains(*t))
         .collect();
     assert!(
         missing.is_empty(),
-        "golden fixtures missing for M1 types: {missing:?}"
+        "golden fixtures missing for wire types: {missing:?}"
     );
 }
 

@@ -6,20 +6,27 @@
 //! [`ErrorCode::UnknownType`] (forward compat), so a newer peer never breaks
 //! an older connection mid-stream.
 //!
-//! # M1 frame-type table
+//! # Frame-type table
 //!
 //! | `t`                | direction | `d` payload                                                                                          |
 //! |--------------------|-----------|------------------------------------------------------------------------------------------------------|
 //! | `auth.ticket.req`  | C → S     | `{}`                                                                                                 |
 //! | `auth.ticket.res`  | S → C     | `{ ticket }`                                                                                         |
-//! | `msg.send`         | C → S     | `{ conversation_id, client_msg_id, body }`                                                           |
+//! | `msg.send`         | C → S     | `{ conversation_id, client_msg_id, body, reply_to? }`                                                |
 //! | `msg.ack`          | S → C     | `{ client_msg_id, message_id, seq, duplicate }`                                                      |
-//! | `msg.new`          | S → C     | `{ message_id, conversation_id, seq, sender_id, body, sent_at }`                                     |
+//! | `msg.new`          | S → C     | `{ message_id, conversation_id, seq, sender_id, body, sent_at, reply_to_message_id?, reply_to_sender_id?, reply_to_body_preview?, forwarded_from_username?, recalled? }` |
 //! | `sync.req`         | C → S     | `{ cursors: [{ conversation_id, last_delivered_seq }] }`                                             |
 //! | `sync.res`         | S → C     | `{ messages: [msg.new-shaped], complete }`                                                           |
+//! | `read.update`      | C → S     | `{ conversation_id, last_read_seq }`                                                                 |
+//! | `read.receipt`     | S → C     | `{ conversation_id, user_id, last_read_seq }`                                                        |
+//! | `typing`           | C ⇄ S     | `{ conversation_id, state: "start"\|"stop", user_id? }` — `user_id` present only on the server relay   |
+//! | `msg.recall`       | C → S     | `{ conversation_id, message_id }`                                                                    |
+//! | `msg.recalled`     | S → C     | `{ conversation_id, message_id }`                                                                    |
 //! | `error`            | S → C     | `{ code, message, retryable }`                                                                       |
 //!
-//! Reserved namespaces (`read.update`, `typing`, `recall`, `e2ee.*`,
+//! Optional `msg.*` metadata fields are null-absent: when absent they are
+//! omitted from the wire entirely (never serialized as `null`), so M1-era
+//! fixtures and peers stay byte-identical. Reserved namespaces (`e2ee.*`,
 //! `signal.*`) follow in later milestones; until then they arrive here as
 //! `unknown_type` errors.
 //!
@@ -79,6 +86,12 @@ pub struct SyncCursor {
 ///
 /// `sent_at` is an RFC 3339 string passed through verbatim so heterogeneous
 /// clients agree byte-for-byte on what the server sent.
+///
+/// M2 optional metadata is null-absent: absent fields are skipped during
+/// serialization so a plain M1-shaped message produces the exact same bytes
+/// as before (golden fixtures stay byte-identical). `recalled` marks a
+/// tombstone — when `true` the server always sends an empty `body` and
+/// clients render a localized placeholder instead.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MsgNew {
     pub message_id: Uuid,
@@ -87,6 +100,28 @@ pub struct MsgNew {
     pub sender_id: Uuid,
     pub body: String,
     pub sent_at: String,
+    /// Id of the message this one replies to (same conversation only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to_message_id: Option<Uuid>,
+    /// Sender of the replied-to message, resolved server-side.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to_sender_id: Option<Uuid>,
+    /// First 80 chars of the replied-to body (plaintext, decrypted
+    /// server-side) so receivers can render the quote without extra fetches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to_body_preview: Option<String>,
+    /// Original author username when this message is known to be a forward.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forwarded_from_username: Option<String>,
+    /// True for recall tombstones: `body` is then empty by contract.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub recalled: bool,
+}
+
+/// `skip_serializing_if` helper: omit `recalled` while it carries its
+/// default (`false`) so M1-era frames stay byte-identical.
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// Server-issued authentication ticket.
@@ -102,6 +137,10 @@ pub struct MsgSend {
     /// Client-generated idempotency key (UUIDv7).
     pub client_msg_id: Uuid,
     pub body: String,
+    /// Optional reply target: must reference an existing message in the SAME
+    /// conversation or the server rejects the send with `bad_request`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to: Option<Uuid>,
 }
 
 /// Server acknowledgement of a [`MsgSend`].
@@ -137,6 +176,60 @@ pub struct ErrorPayload {
     pub retryable: bool,
 }
 
+/// Client-to-server read cursor update: the sender has the conversation open
+/// and consumed everything up to `last_read_seq`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReadUpdate {
+    pub conversation_id: i64,
+    pub last_read_seq: i64,
+}
+
+/// Server-to-peer read receipt echo: `user_id` advanced its persisted read
+/// cursor to `last_read_seq`. Never sent back to the reader itself.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReadReceipt {
+    pub conversation_id: i64,
+    pub user_id: Uuid,
+    pub last_read_seq: i64,
+}
+
+/// Typing state change. Client→server frames carry only
+/// `(conversation_id, state)`; the server relay to peers overwrites/adds
+/// `user_id` with the authenticated sender (a client-supplied `user_id` is
+/// never trusted).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Typing {
+    pub conversation_id: i64,
+    pub state: TypingState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<Uuid>,
+}
+
+/// Transient typing direction; never persisted anywhere.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TypingState {
+    Start,
+    Stop,
+}
+
+/// Client-to-server recall request (sender-only, time-windowed — enforced
+/// server-side by the domain crate's `RecallPolicy` + `MessageStateMachine`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MsgRecall {
+    pub conversation_id: i64,
+    pub message_id: Uuid,
+}
+
+/// Server broadcast after a successful recall: the message is now a
+/// tombstone. Sent to ALL members including the requester (self-ack style
+/// confirmation); content is gone forever — clients render a placeholder.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MsgRecalled {
+    pub conversation_id: i64,
+    pub message_id: Uuid,
+}
+
 /// Tagged payload of a [`Frame`] — serialized as `"t"` (type) plus `"d"`
 /// (data) inside the envelope.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -156,6 +249,16 @@ pub enum Payload {
     SyncReq(SyncReq),
     #[serde(rename = "sync.res")]
     SyncRes(SyncRes),
+    #[serde(rename = "read.update")]
+    ReadUpdate(ReadUpdate),
+    #[serde(rename = "read.receipt")]
+    ReadReceipt(ReadReceipt),
+    #[serde(rename = "typing")]
+    Typing(Typing),
+    #[serde(rename = "msg.recall")]
+    MsgRecall(MsgRecall),
+    #[serde(rename = "msg.recalled")]
+    MsgRecalled(MsgRecalled),
     #[serde(rename = "error")]
     Error(ErrorPayload),
 }
@@ -250,6 +353,11 @@ fn decode_payload(t: &str, d: Value) -> Result<Payload, FrameError> {
         "msg.new" => Ok(Payload::MsgNew(decode_as(t, d)?)),
         "sync.req" => Ok(Payload::SyncReq(decode_as(t, d)?)),
         "sync.res" => Ok(Payload::SyncRes(decode_as(t, d)?)),
+        "read.update" => Ok(Payload::ReadUpdate(decode_as(t, d)?)),
+        "read.receipt" => Ok(Payload::ReadReceipt(decode_as(t, d)?)),
+        "typing" => Ok(Payload::Typing(decode_as(t, d)?)),
+        "msg.recall" => Ok(Payload::MsgRecall(decode_as(t, d)?)),
+        "msg.recalled" => Ok(Payload::MsgRecalled(decode_as(t, d)?)),
         "error" => Ok(Payload::Error(decode_as(t, d)?)),
         other => Ok(Payload::Error(ErrorPayload {
             code: ErrorCode::UnknownType,
@@ -277,6 +385,7 @@ mod tests {
                 conversation_id: 42,
                 client_msg_id: "018f6d2a-7b3c-7c05-9a2f-3d8f1e2b4c11".parse().unwrap(),
                 body: "你好".to_owned(),
+                reply_to: None,
             }),
         };
 
@@ -384,6 +493,57 @@ mod tests {
     }
 
     #[test]
+    fn m2_optional_fields_are_null_absent_on_plain_messages() {
+        // M1 byte-compat guarantee: a message without reply/forward/recall
+        // metadata serializes EXACTLY like the frozen M1 shape — no
+        // `null`-valued or default-valued keys may appear on the wire.
+        let frame = Frame {
+            v: 1,
+            payload: Payload::MsgNew(MsgNew {
+                message_id: "0190aabb-ccdd-7e01-8a1b-2c3d4e5f6071".parse().unwrap(),
+                conversation_id: 42,
+                seq: 128,
+                sender_id: "018e1122-3344-7006-9a2b-1c2d3e4f5a6b".parse().unwrap(),
+                body: "plain".to_owned(),
+                sent_at: "2026-08-24T08:30:00.123Z".to_owned(),
+                reply_to_message_id: None,
+                reply_to_sender_id: None,
+                reply_to_body_preview: None,
+                forwarded_from_username: None,
+                recalled: false,
+            }),
+        };
+        let value = serde_json::to_value(&frame).unwrap();
+        assert_eq!(
+            value,
+            json!({
+                "v": 1,
+                "t": "msg.new",
+                "d": {
+                    "message_id": "0190aabb-ccdd-7e01-8a1b-2c3d4e5f6071",
+                    "conversation_id": 42,
+                    "seq": 128,
+                    "sender_id": "018e1122-3344-7006-9a2b-1c2d3e4f5a6b",
+                    "body": "plain",
+                    "sent_at": "2026-08-24T08:30:00.123Z"
+                }
+            })
+        );
+
+        let send = Frame {
+            v: 1,
+            payload: Payload::MsgSend(MsgSend {
+                conversation_id: 42,
+                client_msg_id: "018f6d2a-7b3c-7c05-9a2f-3d8f1e2b4c11".parse().unwrap(),
+                body: "plain".to_owned(),
+                reply_to: None,
+            }),
+        };
+        let value = serde_json::to_value(&send).unwrap();
+        assert_eq!(value["d"].as_object().unwrap().len(), 3, "no reply_to key");
+    }
+
+    #[test]
     fn every_payload_variant_roundtrips_through_json() {
         let frames = vec![
             Frame {
@@ -402,6 +562,7 @@ mod tests {
                     conversation_id: i64::MAX,
                     client_msg_id: "018f6d2a-7b3c-7c05-9a2f-3d8f1e2b4c11".parse().unwrap(),
                     body: String::new(),
+                    reply_to: None,
                 }),
             },
             Frame {
@@ -422,6 +583,11 @@ mod tests {
                     sender_id: "018e1122-3344-7006-9a2b-1c2d3e4f5a6b".parse().unwrap(),
                     body: "body".to_owned(),
                     sent_at: "2026-08-24T08:30:00.123Z".to_owned(),
+                    reply_to_message_id: None,
+                    reply_to_sender_id: None,
+                    reply_to_body_preview: None,
+                    forwarded_from_username: None,
+                    recalled: false,
                 }),
             },
             Frame {
@@ -438,6 +604,51 @@ mod tests {
                 payload: Payload::SyncRes(SyncRes {
                     messages: Vec::new(),
                     complete: false,
+                }),
+            },
+            Frame {
+                v: 1,
+                payload: Payload::ReadUpdate(ReadUpdate {
+                    conversation_id: 42,
+                    last_read_seq: 128,
+                }),
+            },
+            Frame {
+                v: 1,
+                payload: Payload::ReadReceipt(ReadReceipt {
+                    conversation_id: 42,
+                    user_id: "018e1122-3344-7006-9a2b-1c2d3e4f5a6b".parse().unwrap(),
+                    last_read_seq: 129,
+                }),
+            },
+            Frame {
+                v: 1,
+                payload: Payload::Typing(Typing {
+                    conversation_id: 42,
+                    state: TypingState::Start,
+                    user_id: None,
+                }),
+            },
+            Frame {
+                v: 1,
+                payload: Payload::Typing(Typing {
+                    conversation_id: 42,
+                    state: TypingState::Stop,
+                    user_id: Some("018e1122-3344-7006-9a2b-1c2d3e4f5a6b".parse().unwrap()),
+                }),
+            },
+            Frame {
+                v: 1,
+                payload: Payload::MsgRecall(MsgRecall {
+                    conversation_id: 42,
+                    message_id: "0190aabb-ccdd-7e01-8a1b-2c3d4e5f6071".parse().unwrap(),
+                }),
+            },
+            Frame {
+                v: 1,
+                payload: Payload::MsgRecalled(MsgRecalled {
+                    conversation_id: 42,
+                    message_id: "0190aabb-ccdd-7e01-8a1b-2c3d4e5f6071".parse().unwrap(),
                 }),
             },
             Frame {
