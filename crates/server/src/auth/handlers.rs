@@ -254,7 +254,7 @@ pub async fn register(
     // Wrong code vs unknown target: identical generic 401 (anti-enumeration).
     let dev_code_allowed = cfg!(debug_assertions);
     if !state.codes.verify(channel_str, &target, &req.code, dev_code_allowed) {
-        return Err(AppError::InvalidCredentials);
+        return Err(AppError::InvalidCode);
     }
     state.codes.consume(channel_str, &target);
 

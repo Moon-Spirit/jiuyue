@@ -26,6 +26,11 @@ pub enum AppError {
     /// callers cannot distinguish "unknown account" from "bad secret".
     #[error("invalid credentials")]
     InvalidCredentials,
+    /// Register-path verification-code failure. Deliberately distinct from
+    /// `InvalidCredentials` so clients show an actionable hint instead of
+    /// "wrong password" on the SIGN-UP screen.
+    #[error("invalid or expired verification code")]
+    InvalidCode,
 
     /// 409 — unique constraint violated.
     #[error("conflict: {0:?}")]
@@ -62,6 +67,11 @@ impl IntoResponse for AppError {
                 StatusCode::UNAUTHORIZED,
                 "invalid_credentials",
                 "invalid credentials".to_string(),
+            ),
+            AppError::InvalidCode => (
+                StatusCode::UNAUTHORIZED,
+                "invalid_or_expired_code",
+                "invalid or expired verification code".to_string(),
             ),
             AppError::Conflict(ConflictKind::UsernameTaken) => (
                 StatusCode::CONFLICT,

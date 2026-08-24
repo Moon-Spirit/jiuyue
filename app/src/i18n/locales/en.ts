@@ -106,6 +106,7 @@ const en: MessageSchema = {
   },
   errors: {
     invalid_credentials: "Incorrect account or password",
+    invalid_or_expired_code: "Invalid or expired code. Tap send code first.",
     username_taken: "Username already taken, try another one",
     identity_already_bound:
       "This email/phone is already bound to another account",

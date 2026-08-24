@@ -67,6 +67,8 @@ export interface ConversationListItem {
 export function apiErrorMessage(error: unknown, translate: Translate): string {
   if (!(error instanceof ApiError)) return translate("errors.unknown");
   switch (error.machine) {
+    case "invalid_or_expired_code":
+      return translate("errors.invalid_or_expired_code");
     case "invalid_credentials":
       return translate("errors.invalid_credentials");
     case "username_taken":

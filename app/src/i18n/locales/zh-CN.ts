@@ -101,6 +101,7 @@ const zhCN = {
   },
   errors: {
     invalid_credentials: "账号或密码错误",
+    invalid_or_expired_code: "验证码无效或已过期，请先点击发送验证码",
     username_taken: "用户名已被占用，换一个试试",
     identity_already_bound: "该邮箱/手机号已绑定其他账号",
     validation_error: "提交的信息不合法，请检查后重试",

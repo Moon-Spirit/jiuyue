@@ -144,6 +144,16 @@ fn generic_401_body() -> Value {
     })
 }
 
+/// Register-path code failures share ONE body between wrong-code and
+/// unknown-target (no enumeration leak) but use a DEDICATED machine code so
+/// clients can render an actionable hint instead of "wrong password".
+fn generic_code_body() -> Value {
+    json!({
+        "error": "invalid_or_expired_code",
+        "message": "invalid or expired verification code"
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -340,9 +350,10 @@ async fn phone_channel_accepts_dev_code_and_wrong_code_is_generic_401() {
     .await;
     assert_eq!(status_known, StatusCode::UNAUTHORIZED, "{body_known}");
 
-    // identical generic bodies - no account-existence leak
-    assert_eq!(body_unknown, generic_401_body());
-    assert_eq!(body_known, generic_401_body());
+    // identical generic bodies - no account-existence leak; register code
+    // failures carry their own machine code (distinct from login credentials)
+    assert_eq!(body_unknown, generic_code_body());
+    assert_eq!(body_known, generic_code_body());
 }
 
 #[tokio::test]
@@ -744,4 +755,22 @@ async fn login_response_includes_profile_for_client_display() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["user_id"], Value::String(user_id), "{body}");
     assert_eq!(body["username"], "profileuser");
+}
+#[tokio::test]
+async fn register_with_bad_code_returns_dedicated_machine_code() {
+    let _guard = GATE.lock().await;
+    let t = test_app().await;
+    let (status, body) = send(
+        &t.app,
+        "POST",
+        "/api/auth/register",
+        None,
+        Some(json!({
+            "channel": "email", "target": "codefail@example.com", "code": "111111",
+            "username": "codefail", "password": "password123"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    assert_eq!(body["error"], "invalid_or_expired_code", "{body}");
 }
