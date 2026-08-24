@@ -1,20 +1,23 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, ref, watch } from "vue";
 import { useI18n } from "vue-i18n";
-import { useRouter } from "vue-router";
+import { useRoute, useRouter } from "vue-router";
 import AppShell from "../components/layout/AppShell.vue";
 import LanguageToggle from "../components/LanguageToggle.vue";
 import ThemeToggle from "../components/ThemeToggle.vue";
 import { apiErrorMessage } from "../lib/api/messages";
 import * as olm from "../lib/crypto/olm-lite";
 import { useAuthStore } from "../stores/auth";
+import { useFriendsStore } from "../stores/friends";
 import { RECALL_WINDOW_MS, useWsStore } from "../stores/ws";
 import type { ChatMessage, Conversation } from "../stores/ws";
 
 const { t, locale } = useI18n();
 const router = useRouter();
+const route = useRoute();
 const auth = useAuthStore();
 const ws = useWsStore();
+const friends = useFriendsStore();
 
 const PREVIEW_MAX_CHARS = 40;
 
@@ -302,6 +305,24 @@ function onComposerBlur(): void {
         </span>
         <ThemeToggle />
         <LanguageToggle />
+        <router-link
+          to="/contacts"
+          data-testid="nav-contacts"
+          class="relative inline-flex h-9 items-center justify-center gap-1 whitespace-nowrap rounded-lg px-2 text-xs font-medium text-neutral-600 hover:bg-neutral-100 hover:text-neutral-900 lg:w-full dark:text-neutral-300 dark:hover:bg-neutral-800 dark:hover:text-white"
+          :class="{
+            'bg-neutral-100 text-neutral-900 dark:bg-neutral-800 dark:text-white':
+              route.name === 'contacts',
+          }"
+        >
+          {{ t("nav.contacts") }}
+          <span
+            v-if="friends.pendingCount > 0"
+            data-testid="nav-contacts-badge"
+            class="flex h-4 min-w-4 items-center justify-center rounded-full bg-indigo-600 px-1 text-[10px] font-semibold text-white"
+          >
+            {{ friends.pendingCount }}
+          </span>
+        </router-link>
         <button
           type="button"
           data-testid="logout-button"

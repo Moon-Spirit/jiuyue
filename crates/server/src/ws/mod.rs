@@ -183,6 +183,25 @@ fn error_frame(code: ErrorCode, message: impl Into<String>) -> Frame {
     }
 }
 
+/// Fire-and-forget relay for friend-system frames (M5): pushes one
+/// server-to-client payload to every live device of `to_user` through the
+/// connection registry (same drop-lag policy as typing).
+///
+/// These frames are NEVER persisted and NEVER replayed by `sync.req` —
+/// authoritative friend state lives in the `/api/friends` REST surface, so
+/// delivery is best-effort by design. Called from REST handlers after their
+/// transaction commits; a fully offline recipient simply misses the live
+/// notice and discovers the change on the next REST read.
+pub(crate) fn relay_friend_payload(state: &AppState, to_user: Uuid, payload: Payload) {
+    let frame = Frame {
+        v: PROTOCOL_VERSION,
+        payload,
+    };
+    let wire = serialize_frame(&frame);
+    let delivered = state.registry.deliver_to(to_user, &wire);
+    tracing::debug!(%to_user, delivered, "friend frame relayed");
+}
+
 /// What the frame loop should do after handling one frame.
 enum Flow {
     Continue,
@@ -622,7 +641,9 @@ async fn handle_frame(
         | Payload::AuthTicketRes(_)
         | Payload::SyncRes(_)
         | Payload::ReadReceipt(_)
-        | Payload::MsgRecalled(_) => {
+        | Payload::MsgRecalled(_)
+        | Payload::FriendRequested(_)
+        | Payload::FriendAccepted(_) => {
             let _ = out_tx
                 .send(serialize_frame(&error_frame(
                     ErrorCode::BadRequest,

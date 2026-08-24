@@ -30,6 +30,12 @@ export const router = createRouter({
       component: () => import("../views/ChatView.vue"),
       meta: { requiresAuth: true },
     },
+    {
+      path: "/contacts",
+      name: "contacts",
+      component: () => import("../views/ContactsView.vue"),
+      meta: { requiresAuth: true },
+    },
     { path: "/:pathMatch(.*)*", redirect: "/" },
   ],
 });

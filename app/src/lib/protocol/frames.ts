@@ -22,6 +22,8 @@
  * | msg.recall       | C → S     | `{ conversation_id, message_id }`                              |
  * | msg.recalled     | S → C     | `{ conversation_id, message_id }`                              |
  * | e2ee.msg         | C ⇄ S     | `{ conversation_id, ciphertext, message_type }`                |
+ * | friend.requested | S → C     | `{ request_id, from: { user_id, username } }`                  |
+ * | friend.accepted  | S → C     | `{ friend: { user_id, username } }`                            |
  * | error            | S → C     | `{ code, message, retryable }`                                 |
  *
  * M2 optional `msg.*` metadata fields are null-absent: absent on the wire
@@ -149,6 +151,23 @@ export interface E2eeMsg {
   message_type: number;
 }
 
+/** Shared `{ user_id, username }` reference inside friend frames. */
+export interface FriendUserRef {
+  user_id: string;
+  username: string;
+}
+
+/** Server → client: a peer sent me a friend request. */
+export interface FriendRequested {
+  request_id: string;
+  from: FriendUserRef;
+}
+
+/** Server → client: one of my outgoing friend requests was accepted. */
+export interface FriendAccepted {
+  friend: FriendUserRef;
+}
+
 export type ErrorCode =
   | "bad_request"
   | "unauthorized"
@@ -178,6 +197,8 @@ export const FRAME_TYPES = [
   "msg.recall",
   "msg.recalled",
   "e2ee.msg",
+  "friend.requested",
+  "friend.accepted",
   "error",
 ] as const;
 
@@ -203,6 +224,8 @@ export type Frame =
   | Envelope<"msg.recall", MsgRecall>
   | Envelope<"msg.recalled", MsgRecalled>
   | Envelope<"e2ee.msg", E2eeMsg>
+  | Envelope<"friend.requested", FriendRequested>
+  | Envelope<"friend.accepted", FriendAccepted>
   | Envelope<"error", ErrorPayload>;
 
 /** Thrown when a raw value cannot be interpreted as a v1 frame at all. */
@@ -362,6 +385,21 @@ export function isE2eeMsg(d: unknown): d is E2eeMsg {
     hasInt(d, "message_type")
   );
 }
+
+function isFriendUserRef(v: unknown): v is FriendUserRef {
+  return isRecord(v) && hasString(v, "user_id") && hasString(v, "username");
+}
+
+export function isFriendRequested(d: unknown): d is FriendRequested {
+  return (
+    isRecord(d) && hasString(d, "request_id") && isFriendUserRef(d["from"])
+  );
+}
+
+export function isFriendAccepted(d: unknown): d is FriendAccepted {
+  return isRecord(d) && isFriendUserRef(d["friend"]);
+}
+
 const PAYLOAD_GUARDS: { [T in FrameType]: (d: unknown) => boolean } = {
   "auth.ticket.req": isAuthTicketReq,
   "auth.ticket.res": isAuthTicketRes,
@@ -376,6 +414,8 @@ const PAYLOAD_GUARDS: { [T in FrameType]: (d: unknown) => boolean } = {
   "msg.recall": isMsgRecall,
   "msg.recalled": isMsgRecalled,
   "e2ee.msg": isE2eeMsg,
+  "friend.requested": isFriendRequested,
+  "friend.accepted": isFriendAccepted,
   error: isErrorPayload,
 };
 

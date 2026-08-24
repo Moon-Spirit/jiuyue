@@ -22,6 +22,8 @@
 //! | `typing`           | C ⇄ S     | `{ conversation_id, state: "start"\|"stop", user_id? }` — `user_id` present only on the server relay   |
 //! | `msg.recall`       | C → S     | `{ conversation_id, message_id }`                                                                    |
 //! | `msg.recalled`     | S → C     | `{ conversation_id, message_id }`                                                                    |
+//! | `friend.requested` | S → C     | `{ request_id, from: { user_id, username } }`                                                        |
+//! | `friend.accepted`  | S → C     | `{ friend: { user_id, username } }`                                                                  |
 //! | `error`            | S → C     | `{ code, message, retryable }`                                                                       |
 //!
 //! Optional `msg.*` metadata fields are null-absent: when absent they are
@@ -230,6 +232,31 @@ pub struct MsgRecalled {
     pub message_id: Uuid,
 }
 
+/// Minimal user identity block carried inside friend-system frames.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserIdentity {
+    pub user_id: Uuid,
+    pub username: String,
+}
+
+/// Server push when a friend request is created (`friend.requested`): sent
+/// live to the RECIPIENT. Fire-and-forget registry relay only — never
+/// persisted, never replayed by `sync.req`; authoritative state lives in the
+/// `/api/friends` REST surface.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FriendRequested {
+    pub request_id: Uuid,
+    pub from: UserIdentity,
+}
+
+/// Server push when a friend request is accepted (`friend.accepted`): sent
+/// live to the ORIGINAL SENDER, with `friend` naming the user who accepted.
+/// Same fire-and-forget contract as [`FriendRequested`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FriendAccepted {
+    pub friend: UserIdentity,
+}
+
 /// Client-to-server end-to-end-encrypted send request (secret chats).
 ///
 /// `ciphertext` is an opaque Olm message produced by the sender's device;
@@ -289,6 +316,10 @@ pub enum Payload {
     MsgRecall(MsgRecall),
     #[serde(rename = "msg.recalled")]
     MsgRecalled(MsgRecalled),
+    #[serde(rename = "friend.requested")]
+    FriendRequested(FriendRequested),
+    #[serde(rename = "friend.accepted")]
+    FriendAccepted(FriendAccepted),
     #[serde(rename = "e2ee.msg")]
     E2eeMsg(E2eeMsg),
     #[serde(rename = "error")]
@@ -390,6 +421,8 @@ fn decode_payload(t: &str, d: Value) -> Result<Payload, FrameError> {
         "typing" => Ok(Payload::Typing(decode_as(t, d)?)),
         "msg.recall" => Ok(Payload::MsgRecall(decode_as(t, d)?)),
         "msg.recalled" => Ok(Payload::MsgRecalled(decode_as(t, d)?)),
+        "friend.requested" => Ok(Payload::FriendRequested(decode_as(t, d)?)),
+        "friend.accepted" => Ok(Payload::FriendAccepted(decode_as(t, d)?)),
         "e2ee.msg" => Ok(Payload::E2eeMsg(decode_as(t, d)?)),
         "error" => Ok(Payload::Error(decode_as(t, d)?)),
         other => Ok(Payload::Error(ErrorPayload {

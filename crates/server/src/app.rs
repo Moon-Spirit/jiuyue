@@ -2,7 +2,7 @@
 //! drive it with `tower::ServiceExt::oneshot` (HTTP) or a real listener (WS).
 
 use crate::state::AppState;
-use crate::{auth, chat, e2ee, push, ws};
+use crate::{auth, chat, e2ee, friends, push, ws};
 use axum::routing::get;
 use axum::Router;
 
@@ -11,12 +11,13 @@ async fn healthz() -> &'static str {
 }
 
 /// Full application router: `/healthz` + `/api/auth/*` + `/api/conversations`
-/// + `/api/e2ee/*` + `/ws` (+ `/api/dev/push-log` in dev builds only).
+/// + `/api/e2ee/*` + `/api/friends/*` + `/ws` (dev builds add `/api/dev/push-log`).
 pub fn build_router(state: AppState) -> Router {
     let mut router = Router::new()
         .route("/healthz", get(healthz))
         .nest("/api/auth", auth::router())
         .nest("/api/e2ee", e2ee::router())
+        .nest("/api/friends", friends::router())
         .route(
             "/api/conversations",
             get(chat::list_conversations).post(chat::create_direct),

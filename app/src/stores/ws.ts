@@ -26,6 +26,7 @@ import {
   serializeFrame,
 } from "../lib/protocol/frames";
 import { useAuthStore } from "./auth";
+import { useFriendsStore } from "./friends";
 
 /**
  * Realtime chat store: owns the WebSocket lifecycle, optimistic sending with
@@ -573,6 +574,14 @@ export const useWsStore = defineStore("ws", {
           break;
         case "e2ee.msg":
           this.handleE2eeMsg(frame.d);
+          break;
+        case "friend.requested":
+          // Friends store instantiated lazily inside the handler (same
+          // store-to-store pattern as useAuthStore) to avoid circular init.
+          useFriendsStore().onFriendRequested(frame.d);
+          break;
+        case "friend.accepted":
+          useFriendsStore().onFriendAccepted(frame.d);
           break;
         case "error":
           this.handleErrorFrame(frame.d);

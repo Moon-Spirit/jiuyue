@@ -18,6 +18,11 @@ pub enum ConflictKind {
     /// M3 key distribution: the target user's bundle has no one-time keys
     /// left to claim (pool drained by earlier fetches).
     NoOneTimeKeys,
+    /// M5 friends: the pair is already befriended (either direction).
+    AlreadyFriends,
+    /// M5 friends: a pending request already exists between the pair in
+    /// EITHER direction.
+    RequestAlreadyPending,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -39,6 +44,16 @@ pub enum AppError {
     /// 404 — referenced resource does not exist.
     #[error("peer user not found")]
     PeerNotFound,
+
+    /// 404 — generic resource absence (e.g. an unknown friend-request id, or
+    /// a request the caller is not a party of — existence is never revealed
+    /// to non-participants).
+    #[error("resource not found")]
+    ResourceNotFound,
+
+    /// 400 — friend-system self-action (requesting yourself as a peer).
+    #[error("self request")]
+    SelfRequest,
 
     /// 422 — semantically invalid input (username format, weak password, bad target).
     #[error("validation failed: {0}")]
@@ -87,6 +102,26 @@ impl IntoResponse for AppError {
                 StatusCode::CONFLICT,
                 "no_one_time_keys",
                 "no one-time keys left for this user".to_string(),
+            ),
+            AppError::Conflict(ConflictKind::AlreadyFriends) => (
+                StatusCode::CONFLICT,
+                "already_friends",
+                "you are already friends with this user".to_string(),
+            ),
+            AppError::Conflict(ConflictKind::RequestAlreadyPending) => (
+                StatusCode::CONFLICT,
+                "request_already_pending",
+                "a friend request between you two is already pending".to_string(),
+            ),
+            AppError::ResourceNotFound => (
+                StatusCode::NOT_FOUND,
+                "not_found",
+                "resource not found".to_string(),
+            ),
+            AppError::SelfRequest => (
+                StatusCode::BAD_REQUEST,
+                "self_request",
+                "cannot target yourself".to_string(),
             ),
             AppError::PeerNotFound => (
                 StatusCode::NOT_FOUND,

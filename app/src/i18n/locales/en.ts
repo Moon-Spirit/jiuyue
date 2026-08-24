@@ -8,8 +8,23 @@ const en: MessageSchema = {
   },
   nav: {
     chat: "Chat",
+    contacts: "Contacts",
     logout: "Sign out",
     anonymous: "Anonymous user",
+  },
+  contacts: {
+    title: "Contacts",
+    emptyState: "Select a friend to start chatting",
+    friendsEmpty: "No friends yet — add one",
+    addPlaceholder: "Enter their username",
+    addSubmit: "Add friend",
+    addSubmitting: "Sending…",
+    requestsTitle: "Friend requests",
+    accept: "Accept",
+    decline: "Decline",
+    sendMessage: "Message",
+    unfriend: "Remove",
+    unfriendConfirm: "Confirm",
   },
   lang: {
     toggle: "Switch language",
@@ -113,6 +128,9 @@ const en: MessageSchema = {
     validation_error:
       "Submitted information is invalid, please check and retry",
     peer_not_found: "The other party does not exist",
+    self_request: "You cannot add yourself as a friend",
+    already_friends: "You are already friends",
+    request_already_pending: "A request is already pending their response",
     no_one_time_keys:
       "The peer has run out of one-time keys; ask them to come online and retry",
     bad_request: "Invalid request, please retry",
