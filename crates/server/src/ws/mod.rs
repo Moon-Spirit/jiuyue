@@ -36,8 +36,9 @@ use axum::extract::{Query, State};
 use axum::response::{IntoResponse, Response};
 use futures_util::{SinkExt, StreamExt};
 use jiuyue_protocol::{
-    ErrorCode, ErrorPayload, Frame, MsgAck, MsgNew, MsgRecall, MsgRecalled, MsgSend, Payload,
-    ReadReceipt, ReadUpdate, SyncReq, SyncRes, Typing, TypingState, PROTOCOL_VERSION,
+    E2eeMsg, ErrorCode, ErrorPayload, Frame, MsgAck, MsgNew, MsgRecall, MsgRecalled, MsgSend,
+    Payload, ReadReceipt, ReadUpdate, SyncMessage, SyncReq, SyncRes, Typing, TypingState,
+    PROTOCOL_VERSION,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -397,6 +398,62 @@ async fn handle_frame(
             }
             Err(SendRejection::Internal(err)) => {
                 tracing::error!(%sender_id, error = %format!("{err:#}"), "msg.send failed");
+                let _ = out_tx
+                    .send(serialize_frame(&error_frame(
+                        ErrorCode::Internal,
+                        "internal error",
+                    )))
+                    .await;
+                Flow::Continue
+            }
+        },
+        // M3 secret chats: `e2ee.msg` reuses the msg.send persist-then-ack
+        // pipeline shape (membership gate → seq tx → idempotent insert →
+        // identical ACK) with TWO deliberate asymmetries vs plaintext sends:
+        //
+        // 1. AT REST: `body_enc` stores the RAW UTF-8 BYTES of the
+        //    client-produced ciphertext string verbatim (`kind='e2ee'`,
+        //    `key_id='e2ee:<message_type>'`) — the server holds no key
+        //    material and MUST NOT be able to decrypt it.
+        // 2. ON THE WIRE: peers receive the SAME `e2ee.msg` frame mirrored
+        //    back rather than a `msg.new`, because msg.new's frozen shape
+        //    carries plaintext fields the server cannot produce. `sync.req`
+        //    replays stored rows as `SyncMessage::Encrypted(e2ee.msg)`
+        //    entries for the same reason (recalled tombstones excepted —
+        //    they render as empty-body msg.new tombstones like plaintext).
+        Payload::E2eeMsg(send) => match process_e2ee_send(state, sender_id, &send).await {
+            Ok(outcome) => {
+                let ack = Frame {
+                    v: PROTOCOL_VERSION,
+                    payload: Payload::MsgAck(MsgAck {
+                        client_msg_id: send.client_msg_id,
+                        message_id: outcome.message_id,
+                        seq: outcome.seq,
+                        duplicate: outcome.duplicate,
+                    }),
+                };
+                let _ = out_tx.send(serialize_frame(&ack)).await;
+                if !outcome.duplicate {
+                    fanout_e2ee(state, sender_id, sender_device_id, &send, &outcome).await;
+                }
+                Flow::Continue
+            }
+            Err(SendRejection::BadRequest(reason)) => {
+                let _ = out_tx
+                    .send(serialize_frame(&error_frame(ErrorCode::BadRequest, reason)))
+                    .await;
+                Flow::Continue
+            }
+            Err(SendRejection::Unauthorized(reason)) => {
+                let _ = out_tx
+                    .send(serialize_frame(&error_frame(ErrorCode::Unauthorized, reason)))
+                    .await;
+                // Same policy as msg.send: reaching for a foreign
+                // conversation kills the connection.
+                Flow::Close
+            }
+            Err(SendRejection::Internal(err)) => {
+                tracing::error!(%sender_id, error = %format!("{err:#}"), "e2ee.msg failed");
                 let _ = out_tx
                     .send(serialize_frame(&error_frame(
                         ErrorCode::Internal,
@@ -872,6 +929,176 @@ async fn fanout_msg_new(
     });
 }
 
+/// Outcome of the persist-then-ack pipeline for one `e2ee.msg`.
+struct E2eeSendOutcome {
+    message_id: Uuid,
+    conversation_id: i64,
+    seq: i64,
+    duplicate: bool,
+}
+
+/// Persist-then-ack pipeline for one `e2ee.msg` frame — mirrors
+/// [`process_msg_send`] minus everything a ciphertext cannot have (no
+/// server-side encryption, no reply-quote resolution). See the dispatch-site
+/// comment in [`handle_frame`] for the at-rest/wire asymmetry decisions.
+async fn process_e2ee_send(
+    state: &AppState,
+    sender_id: Uuid,
+    send: &E2eeMsg,
+) -> Result<E2eeSendOutcome, SendRejection> {
+    // Membership authorization before touching the sequence counter
+    // (`::int8` so the scalar decodes as i64 — same convention as msg.send).
+    let member: Option<i64> = sqlx::query_scalar(
+        "SELECT 1::int8 FROM conversation_members WHERE conversation_id = $1 AND user_id = $2",
+    )
+    .bind(send.conversation_id)
+    .bind(sender_id)
+    .fetch_optional(&state.pool)
+    .await?;
+    if member.is_none() {
+        return Err(SendRejection::Unauthorized(
+            "sender is not a member of this conversation",
+        ));
+    }
+
+    let mut tx = state.pool.begin().await?;
+    let allocated_seq: Option<i64> =
+        sqlx::query_scalar("UPDATE conversations SET last_seq = last_seq + 1 WHERE id = $1 RETURNING last_seq")
+            .bind(send.conversation_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    let Some(seq) = allocated_seq else {
+        let _ = tx.rollback().await;
+        return Err(SendRejection::Unauthorized("conversation does not exist"));
+    };
+
+    let candidate_id = Uuid::now_v7();
+    // Ciphertext-at-rest decision: store the ciphertext STRING BYTES
+    // verbatim (valid UTF-8 by construction — it arrived as a JSON string).
+    // The olm message type rides in `key_id` (`e2ee:<type>`), the only
+    // metadata column that stays untouched by the verbatim-bytes rule.
+    let body_enc = send.ciphertext.as_bytes().to_vec();
+    let key_id = format!("e2ee:{}", send.message_type);
+    let fresh: Option<(Uuid, i64)> = sqlx::query_as(
+        "INSERT INTO messages (id, conversation_id, seq, sender_id, client_msg_id, key_id, body_enc, kind) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, 'e2ee') \
+         ON CONFLICT (conversation_id, client_msg_id) DO NOTHING \
+         RETURNING id, seq",
+    )
+    .bind(candidate_id)
+    .bind(send.conversation_id)
+    .bind(seq)
+    .bind(sender_id)
+    .bind(send.client_msg_id)
+    .bind(&key_id)
+    .bind(&body_enc)
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    if let Some((message_id, seq)) = fresh {
+        tx.commit().await?;
+        return Ok(E2eeSendOutcome {
+            message_id,
+            conversation_id: send.conversation_id,
+            seq,
+            duplicate: false,
+        });
+    }
+
+    // Duplicate delivery: give back the just-burned seq, then read the row
+    // the winning transaction committed (identical to the msg.send path).
+    tx.rollback().await?;
+    let (message_id, seq): (Uuid, i64) = sqlx::query_as(
+        "SELECT id, seq FROM messages WHERE conversation_id = $1 AND client_msg_id = $2",
+    )
+    .bind(send.conversation_id)
+    .bind(send.client_msg_id)
+    .fetch_one(&state.pool)
+    .await?;
+    Ok(E2eeSendOutcome {
+        message_id,
+        conversation_id: send.conversation_id,
+        seq,
+        duplicate: true,
+    })
+}
+
+/// Pushes the mirrored `e2ee.msg` frame to every member's live devices with
+/// the SAME fanout set as `msg.new` (all members incl. the sender's OTHER
+/// devices, minus the exact sending device which already got its ACK),
+/// advances delivered cursors and fires the Redis notify hook. The
+/// ciphertext passes through byte-for-byte; the server never inspects it.
+async fn fanout_e2ee(
+    state: &AppState,
+    sender_id: Uuid,
+    sender_device_id: Uuid,
+    send: &E2eeMsg,
+    outcome: &E2eeSendOutcome,
+) {
+    let members: Vec<Uuid> = match sqlx::query_scalar(
+        "SELECT user_id FROM conversation_members WHERE conversation_id = $1",
+    )
+    .bind(outcome.conversation_id)
+    .fetch_all(&state.pool)
+    .await
+    {
+        Ok(rows) => rows,
+        Err(err) => {
+            tracing::error!(
+                conversation_id = outcome.conversation_id,
+                error = %err,
+                "e2ee fanout member lookup failed"
+            );
+            Vec::new()
+        }
+    };
+
+    let frame = serialize_frame(&Frame {
+        v: PROTOCOL_VERSION,
+        payload: Payload::E2eeMsg(E2eeMsg {
+            conversation_id: outcome.conversation_id,
+            client_msg_id: send.client_msg_id,
+            ciphertext: send.ciphertext.clone(),
+            message_type: send.message_type,
+        }),
+    });
+    for user_id in members {
+        let delivered = if user_id == sender_id {
+            state
+                .registry
+                .deliver_to_excluding(user_id, sender_device_id, &frame)
+        } else {
+            state.registry.deliver_to(user_id, &frame)
+        };
+        tracing::debug!(
+            %user_id,
+            delivered,
+            conversation_id = outcome.conversation_id,
+            "e2ee fanout"
+        );
+        if delivered > 0 {
+            spawn_advance_delivered_cursor(state, outcome.conversation_id, user_id, outcome.seq);
+        }
+    }
+
+    // Fire-and-forget pub/sub notify on the shared `conv:{id}` channel —
+    // pointer payload (message id) only, never key or ciphertext material.
+    let mut conn = state.redis.clone();
+    let channel = format!("conv:{}", outcome.conversation_id);
+    let payload = outcome.message_id.to_string();
+    tokio::spawn(async move {
+        match redis::cmd("PUBLISH")
+            .arg(&channel)
+            .arg(&payload)
+            .query_async::<i64>(&mut conn)
+            .await
+        {
+            Ok(receivers) => tracing::debug!(channel = %channel, receivers, "redis publish"),
+            Err(err) => tracing::debug!(channel = %channel, error = %err, "redis publish failed"),
+        }
+    });
+}
+
 /// Fire-and-forget delivery-cursor advance: once at least one of the user's
 /// devices accepted the live frame, `last_delivered_seq` moves forward
 /// monotonically (`GREATEST`). Failures are logged, never fatal — the cursor
@@ -1211,7 +1438,9 @@ async fn broadcast_msg_recalled(state: &AppState, conversation_id: i64, message_
 const SYNC_BATCH_LIMIT: i64 = 200;
 
 /// One tombstone-aware sync row: the message columns plus the LEFT-JOINed
-/// reply-target columns (`r.sender_id`, `r.body_enc`, `r.recalled_at`).
+/// reply-target columns (`r.sender_id`, `r.body_enc`, `r.recalled_at`) and
+/// the trailing `m.client_msg_id` / `m.key_id` / `m.kind` triple used to
+/// route secret-chat rows into `SyncMessage::Encrypted` entries.
 type SyncMessageRow = (
     Uuid,
     i64,
@@ -1225,11 +1454,15 @@ type SyncMessageRow = (
     Option<Uuid>,
     Option<Vec<u8>>,
     Option<OffsetDateTime>,
+    Uuid,
+    String,
+    String,
 );
 
 const SYNC_MESSAGE_QUERY: &str = "SELECT m.id, m.conversation_id, m.seq, m.sender_id, m.sent_at, \
      m.body_enc, m.recalled_at, m.reply_to, m.forwarded_from_username, \
-     r.sender_id, r.body_enc, r.recalled_at \
+     r.sender_id, r.body_enc, r.recalled_at, \
+     m.client_msg_id, m.key_id, m.kind \
      FROM messages m \
      LEFT JOIN messages r ON r.id = m.reply_to \
      WHERE m.conversation_id = $1 AND m.seq > $2 ORDER BY m.seq ASC LIMIT $3";
@@ -1297,9 +1530,48 @@ async fn process_sync_req(
             reply_sender_id,
             reply_body_enc,
             reply_recalled_at,
+            client_msg_id,
+            key_id,
+            kind,
         ) in rows
         {
             let recalled = recalled_at.is_some();
+            let sent_at_rfc3339 = sent_at.format(&Rfc3339)?;
+
+            // Secret-chat rows (kind='e2ee', see the e2ee.msg dispatch-site
+            // decision) bypass decryption entirely — the server cannot. They
+            // replay as `SyncMessage::Encrypted` entries carrying the stored
+            // ciphertext VERBATIM; the olm message type is recovered from the
+            // `key_id` marker (`e2ee:<type>`). Recalled tombstones seal their
+            // content forever, so they render as empty-body msg.new
+            // tombstones instead — consistent with plaintext recall.
+            if kind == "e2ee" {
+                let entry = if recalled {
+                    SyncMessage::Plain(MsgNew {
+                        message_id,
+                        conversation_id,
+                        seq,
+                        sender_id,
+                        body: String::new(),
+                        sent_at: sent_at_rfc3339,
+                        reply_to_message_id: reply_to,
+                        reply_to_sender_id: None,
+                        reply_to_body_preview: None,
+                        forwarded_from_username,
+                        recalled: true,
+                    })
+                } else {
+                    SyncMessage::Encrypted(E2eeMsg {
+                        conversation_id,
+                        client_msg_id,
+                        ciphertext: String::from_utf8_lossy(&body_enc).into_owned(),
+                        message_type: e2ee_message_type_from_key_id(&key_id),
+                    })
+                };
+                messages.push((conversation_id, seq, entry));
+                continue;
+            }
+
             // Decrypt at-rest bodies before they leave the server — except
             // tombstones, whose content stays sealed forever. A row we
             // cannot decrypt is an internal fault surfaced as a generic
@@ -1322,26 +1594,45 @@ async fn process_sync_req(
                         Some(truncate_chars(&plaintext, REPLY_PREVIEW_MAX_CHARS));
                 }
             }
-            messages.push(MsgNew {
-                message_id,
+            messages.push((
                 conversation_id,
                 seq,
-                sender_id,
-                body,
-                sent_at: sent_at.format(&Rfc3339)?,
-                // Quote metadata survives recall: it describes the QUOTED
-                // message, not the tombstone's own (sealed) content.
-                reply_to_message_id: reply_to,
-                reply_to_sender_id,
-                reply_to_body_preview,
-                forwarded_from_username,
-                recalled,
-            });
+                SyncMessage::Plain(MsgNew {
+                    message_id,
+                    conversation_id,
+                    seq,
+                    sender_id,
+                    body,
+                    sent_at: sent_at_rfc3339,
+                    // Quote metadata survives recall: it describes the QUOTED
+                    // message, not the tombstone's own (sealed) content.
+                    reply_to_message_id: reply_to,
+                    reply_to_sender_id,
+                    reply_to_body_preview,
+                    forwarded_from_username,
+                    recalled,
+                }),
+            ));
         }
     }
 
-    messages.sort_by_key(|m| (m.conversation_id, m.seq));
-    Ok(SyncRes { messages, complete })
+    messages.sort_by_key(|(conversation_id, seq, _)| (*conversation_id, *seq));
+    Ok(SyncRes {
+        messages: messages
+            .into_iter()
+            .map(|(_, _, entry)| entry)
+            .collect(),
+        complete,
+    })
+}
+
+/// Recovers the olm message type stored in `key_id` (`e2ee:<type>`); falls
+/// back to `1` (normal) on malformed markers so replays stay deliverable.
+fn e2ee_message_type_from_key_id(key_id: &str) -> i32 {
+    key_id
+        .strip_prefix("e2ee:")
+        .and_then(|raw| raw.parse::<i32>().ok())
+        .unwrap_or(1)
 }
 
 #[cfg(test)]

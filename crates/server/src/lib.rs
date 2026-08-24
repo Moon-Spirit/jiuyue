@@ -9,6 +9,7 @@ pub mod chat;
 pub mod code_store;
 pub mod config;
 pub mod crypto;
+pub mod e2ee;
 pub mod error;
 pub mod state;
 pub mod ws;

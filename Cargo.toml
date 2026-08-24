@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/domain", "crates/protocol", "crates/server"]
+members = ["crates/crypto", "crates/domain", "crates/protocol", "crates/server"]
 
 [workspace.package]
 version = "0.1.0"
@@ -26,6 +26,7 @@ time = { version = "0.3", features = ["serde", "formatting", "parsing"] }
 tokio = { version = "1", features = ["full"] }
 tower-http = { version = "0.6", features = ["trace", "cors"] }
 uuid = { version = "1", features = ["v7", "serde"] }
+vodozemac = "0.10"
 
 [profile.dev]
 debug = 1

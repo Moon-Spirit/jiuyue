@@ -20,6 +20,11 @@ use uuid::Uuid;
 #[derive(Debug, Deserialize)]
 pub struct CreateDirectRequest {
     pub peer_username: String,
+    /// Optional conversation kind: `"direct"` (default) or `"secret"`.
+    /// Secret pairs share the sorted-pair-key create-or-get contract via the
+    /// `conversations_secret_pair_key_uq` partial index.
+    #[serde(default)]
+    pub kind: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -33,6 +38,8 @@ pub struct CreateDirectResponse {
     pub conversation_id: i64,
     /// True when this call created the row; false for create-or-get hits.
     pub created: bool,
+    /// `"direct"` or `"secret"` — echoes the resolved request kind.
+    pub kind: String,
     pub peer: PeerInfo,
 }
 
@@ -48,6 +55,7 @@ pub async fn create_direct(
     if peer_username.is_empty() {
         return Err(AppError::BadRequest("peer_username is required".to_owned()));
     }
+    let kind = normalize_kind(req.kind.as_deref()).map_err(AppError::BadRequest)?;
 
     let peer: Option<(Uuid, String)> =
         sqlx::query_as("SELECT id, username FROM users WHERE username = $1 LIMIT 1")
@@ -68,12 +76,15 @@ pub async fn create_direct(
 
     let pair_key = direct_pair_key(user.0, peer_id);
     let mut tx = state.pool.begin().await.map_err(AppError::internal)?;
-    let inserted: Option<i64> = sqlx::query_scalar(
+    // `kind` is whitelisted above ('direct'|'secret'), so interpolating it
+    // into the statement (the ON CONFLICT clause must name the matching
+    // partial-index predicate) is injection-safe.
+    let inserted: Option<i64> = sqlx::query_scalar(&format!(
         "INSERT INTO conversations (kind, pair_key, created_by) \
-         VALUES ('direct', $1, $2) \
-         ON CONFLICT (pair_key) WHERE kind = 'direct' DO NOTHING \
-         RETURNING id",
-    )
+         VALUES ('{kind}', $1, $2) \
+         ON CONFLICT (pair_key) WHERE kind = '{kind}' DO NOTHING \
+         RETURNING id"
+    ))
     .bind(&pair_key)
     .bind(user.0)
     .fetch_optional(&mut *tx)
@@ -85,9 +96,9 @@ pub async fn create_direct(
         None => {
             // Lost the race: the winner's row is committed (or at least
             // visible under read-committed once its tx committed) — fetch it.
-            let existing: i64 = sqlx::query_scalar(
-                "SELECT id FROM conversations WHERE pair_key = $1 AND kind = 'direct'",
-            )
+            let existing: i64 = sqlx::query_scalar(&format!(
+                "SELECT id FROM conversations WHERE pair_key = $1 AND kind = '{kind}'"
+            ))
             .bind(&pair_key)
             .fetch_one(&mut *tx)
             .await
@@ -109,12 +120,13 @@ pub async fn create_direct(
     }
     tx.commit().await.map_err(AppError::internal)?;
 
-    tracing::info!(%conversation_id, created, "direct conversation ready");
+    tracing::info!(%conversation_id, created, kind, "conversation ready");
     Ok((
         StatusCode::CREATED,
         Json(CreateDirectResponse {
             conversation_id,
             created,
+            kind: kind.to_owned(),
             peer: PeerInfo {
                 user_id: peer_id,
                 username: peer_username,
@@ -128,6 +140,17 @@ pub async fn create_direct(
 fn direct_pair_key(a: Uuid, b: Uuid) -> String {
     let (low, high) = if a.as_bytes() <= b.as_bytes() { (a, b) } else { (b, a) };
     format!("{low}:{high}")
+}
+
+/// Validates the optional `kind` field; absent/empty means `"direct"`.
+fn normalize_kind(kind: Option<&str>) -> Result<&'static str, String> {
+    match kind.map(str::trim) {
+        None | Some("") | Some("direct") => Ok("direct"),
+        Some("secret") => Ok("secret"),
+        Some(other) => Err(format!(
+            "unsupported kind `{other}`; expected \"direct\" or \"secret\""
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -149,6 +172,16 @@ mod tests {
         let a = Uuid::now_v7();
         let key = direct_pair_key(a, a);
         assert_eq!(key, format!("{a}:{a}"), "self-pair is well-formed (server rejects it earlier)");
+    }
+
+    #[test]
+    fn normalize_kind_defaults_to_direct_and_accepts_secret() {
+        assert_eq!(normalize_kind(None).unwrap(), "direct");
+        assert_eq!(normalize_kind(Some("")).unwrap(), "direct");
+        assert_eq!(normalize_kind(Some("direct")).unwrap(), "direct");
+        assert_eq!(normalize_kind(Some(" secret ")).unwrap(), "secret");
+        assert!(normalize_kind(Some("group")).is_err());
+        assert!(normalize_kind(Some("SECRET")).is_err(), "kinds are lowercase-only");
     }
 }
 

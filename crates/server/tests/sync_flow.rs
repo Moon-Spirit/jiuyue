@@ -338,6 +338,16 @@ async fn expect_sync_res(ws: &mut WsClient) -> jiuyue_protocol::SyncRes {
     }
 }
 
+/// M3: sync entries became untagged `SyncMessage`s (plain `msg.new` or
+/// encrypted `e2ee.msg`). These tests only exercise plaintext conversations,
+/// so unwrap the plain variant.
+fn as_plain(entry: &jiuyue_protocol::SyncMessage) -> &jiuyue_protocol::MsgNew {
+    match entry {
+        jiuyue_protocol::SyncMessage::Plain(msg) => msg,
+        other => panic!("expected a plain msg.new sync entry, got {other:?}"),
+    }
+}
+
 /// Polls `cond` until true or `timeout` elapses (for fire-and-forget side
 /// effects: spawned cursor updates, eviction teardown, pub/sub delivery).
 async fn eventually<F, Fut>(mut cond: F, timeout: Duration, what: &str)
@@ -435,6 +445,7 @@ async fn disconnect_mid_send_gap_is_filled_exactly_by_sync_req() {
     let got: Vec<(i64, String)> = res
         .messages
         .iter()
+        .map(as_plain)
         .map(|m| (m.seq, m.body.clone()))
         .collect();
     let want: Vec<(i64, String)> = sent
@@ -442,12 +453,17 @@ async fn disconnect_mid_send_gap_is_filled_exactly_by_sync_req() {
         .map(|(_, seq, body)| (*seq, body.clone()))
         .collect();
     assert_eq!(got, want, "exactly the missing seqs, in order");
-    for m in &res.messages {
+    for entry in &res.messages {
+        let m = as_plain(entry);
         assert_eq!(m.conversation_id, conversation_id);
         assert_eq!(m.sender_id, a_id);
     }
     assert_eq!(
-        res.messages.iter().map(|m| m.message_id).collect::<Vec<_>>(),
+        res.messages
+            .iter()
+            .map(as_plain)
+            .map(|m| m.message_id)
+            .collect::<Vec<_>>(),
         sent.iter().map(|(id, _, _)| *id).collect::<Vec<_>>(),
         "sync replay preserves server message identity"
     );
@@ -836,6 +852,7 @@ async fn multi_cursor_sync_aggregates_into_one_ordered_response() {
     let order: Vec<(i64, i64, String)> = res
         .messages
         .iter()
+        .map(as_plain)
         .map(|m| (m.conversation_id, m.seq, m.body.clone()))
         .collect();
     assert_eq!(
@@ -848,7 +865,7 @@ async fn multi_cursor_sync_aggregates_into_one_ordered_response() {
         "aggregated by (conversation_id, seq)"
     );
     // Bodies arrive decrypted to plaintext (at-rest ciphertext never leaks).
-    assert_eq!(res.messages[0].body, "ab-1");
+    assert_eq!(as_plain(&res.messages[0]).body, "ab-1");
 
     // Partial cursors: only the actual gaps are replayed.
     send_sync_req(&mut ws_a, vec![(conv_ab, 2), (conv_ac, 0)]).await;
@@ -856,6 +873,7 @@ async fn multi_cursor_sync_aggregates_into_one_ordered_response() {
     let order: Vec<(i64, i64)> = res
         .messages
         .iter()
+        .map(as_plain)
         .map(|m| (m.conversation_id, m.seq))
         .collect();
     assert_eq!(order, vec![(conv_ac, 1)]);

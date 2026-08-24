@@ -19,8 +19,8 @@ use serde_json::Value;
 const GOLDEN_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/golden");
 
 /// Every wire type that must have a roundtrip fixture (M1 core + M2
-/// message-experience suite).
-const ALL_WIRE_TYPES: [&str; 13] = [
+/// message-experience suite + M3 secret-chat frame).
+const ALL_WIRE_TYPES: [&str; 14] = [
     "auth.ticket.req",
     "auth.ticket.res",
     "msg.send",
@@ -33,6 +33,7 @@ const ALL_WIRE_TYPES: [&str; 13] = [
     "typing",
     "msg.recall",
     "msg.recalled",
+    "e2ee.msg",
     "error",
 ];
 

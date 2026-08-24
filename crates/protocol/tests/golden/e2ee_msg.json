@@ -1,0 +1,10 @@
+{
+  "v": 1,
+  "t": "e2ee.msg",
+  "d": {
+    "conversation_id": 42,
+    "client_msg_id": "018f6d2a-7b3c-7c05-9a2f-3d8f1e2b4c11",
+    "ciphertext": "AwACBkF0ZXN0AQ",
+    "message_type": 0
+  }
+}

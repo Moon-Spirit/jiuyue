@@ -163,7 +163,7 @@ pub struct SyncReq {
 /// Server catch-up response.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SyncRes {
-    pub messages: Vec<MsgNew>,
+    pub messages: Vec<SyncMessage>,
     /// True when no more messages remain beyond the requested cursors.
     pub complete: bool,
 }
@@ -230,6 +230,36 @@ pub struct MsgRecalled {
     pub message_id: Uuid,
 }
 
+/// Client-to-server end-to-end-encrypted send request (secret chats).
+///
+/// `ciphertext` is an opaque Olm message produced by the sender's device;
+/// the server relays and stores it verbatim WITHOUT any ability to decrypt
+/// it. `client_msg_id` carries the exact same idempotency contract as
+/// [`MsgSend`]; `message_type` mirrors the libolm convention (`0` = pre-key,
+/// `1` = normal).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct E2eeMsg {
+    pub conversation_id: i64,
+    /// Client-generated idempotency key (UUIDv7).
+    pub client_msg_id: Uuid,
+    /// Opaque Olm ciphertext (base64), relayed byte-for-byte.
+    pub ciphertext: String,
+    /// libolm message type: `0` = pre-key, `1` = normal.
+    pub message_type: i32,
+}
+
+/// One entry of [`SyncRes::messages`].
+///
+/// Untagged so the plain variant serializes EXACTLY like the frozen M1/M2
+/// `msg.new` shape (existing fixtures stay byte-identical); secret-chat rows
+/// replay as `e2ee.msg` entries carrying the stored ciphertext verbatim.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum SyncMessage {
+    Plain(MsgNew),
+    Encrypted(E2eeMsg),
+}
+
 /// Tagged payload of a [`Frame`] — serialized as `"t"` (type) plus `"d"`
 /// (data) inside the envelope.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -259,6 +289,8 @@ pub enum Payload {
     MsgRecall(MsgRecall),
     #[serde(rename = "msg.recalled")]
     MsgRecalled(MsgRecalled),
+    #[serde(rename = "e2ee.msg")]
+    E2eeMsg(E2eeMsg),
     #[serde(rename = "error")]
     Error(ErrorPayload),
 }
@@ -358,6 +390,7 @@ fn decode_payload(t: &str, d: Value) -> Result<Payload, FrameError> {
         "typing" => Ok(Payload::Typing(decode_as(t, d)?)),
         "msg.recall" => Ok(Payload::MsgRecall(decode_as(t, d)?)),
         "msg.recalled" => Ok(Payload::MsgRecalled(decode_as(t, d)?)),
+        "e2ee.msg" => Ok(Payload::E2eeMsg(decode_as(t, d)?)),
         "error" => Ok(Payload::Error(decode_as(t, d)?)),
         other => Ok(Payload::Error(ErrorPayload {
             code: ErrorCode::UnknownType,
@@ -541,6 +574,64 @@ mod tests {
         };
         let value = serde_json::to_value(&send).unwrap();
         assert_eq!(value["d"].as_object().unwrap().len(), 3, "no reply_to key");
+    }
+
+    #[test]
+    fn e2ee_msg_frame_roundtrips_with_opaque_ciphertext() {
+        let frame = Frame {
+            v: 1,
+            payload: Payload::E2eeMsg(E2eeMsg {
+                conversation_id: 42,
+                client_msg_id: "018f6d2a-7b3c-7c05-9a2f-3d8f1e2b4c11".parse().unwrap(),
+                ciphertext: "AwACBkF0ZXN0AQ".to_owned(),
+                message_type: 0,
+            }),
+        };
+        let value = serde_json::to_value(&frame).unwrap();
+        assert_eq!(value["t"], json!("e2ee.msg"));
+        assert_eq!(value["d"]["conversation_id"], json!(42));
+        assert_eq!(value["d"]["message_type"], json!(0));
+        let back: Frame = serde_json::from_value(value).unwrap();
+        assert_eq!(frame, back);
+    }
+
+    #[test]
+    fn sync_res_entries_are_untagged_plain_or_e2ee() {
+        let res = Frame {
+            v: 1,
+            payload: Payload::SyncRes(SyncRes {
+                messages: vec![
+                    SyncMessage::Plain(MsgNew {
+                        message_id: "0190aabb-ccdd-7e01-8a1b-2c3d4e5f6071".parse().unwrap(),
+                        conversation_id: 42,
+                        seq: 128,
+                        sender_id: "018e1122-3344-7006-9a2b-1c2d3e4f5a6b".parse().unwrap(),
+                        body: "plain".to_owned(),
+                        sent_at: "2026-08-24T08:30:00.123Z".to_owned(),
+                        reply_to_message_id: None,
+                        reply_to_sender_id: None,
+                        reply_to_body_preview: None,
+                        forwarded_from_username: None,
+                        recalled: false,
+                    }),
+                    SyncMessage::Encrypted(E2eeMsg {
+                        conversation_id: 43,
+                        client_msg_id: "018f6d2a-7b3c-7c05-9a2f-3d8f1e2b4c11".parse().unwrap(),
+                        ciphertext: "Q0lQSEVU".to_owned(),
+                        message_type: 1,
+                    }),
+                ],
+                complete: true,
+            }),
+        };
+        let value = serde_json::to_value(&res).unwrap();
+        // Plain entry keeps the frozen msg.new shape (no discriminator key).
+        assert_eq!(value["d"]["messages"][0]["body"], json!("plain"));
+        assert!(value["d"]["messages"][0].get("kind").is_none());
+        // Encrypted entry rides as a nested e2ee.msg-shaped object.
+        assert_eq!(value["d"]["messages"][1]["ciphertext"], json!("Q0lQSEVU"));
+        let back: Frame = serde_json::from_value(value).unwrap();
+        assert_eq!(res, back);
     }
 
     #[test]

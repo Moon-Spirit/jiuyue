@@ -15,6 +15,9 @@ struct ErrorBody {
 pub enum ConflictKind {
     UsernameTaken,
     IdentityAlreadyBound,
+    /// M3 key distribution: the target user's bundle has no one-time keys
+    /// left to claim (pool drained by earlier fetches).
+    NoOneTimeKeys,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -69,6 +72,11 @@ impl IntoResponse for AppError {
                 StatusCode::CONFLICT,
                 "identity_already_bound",
                 "this email/phone is already bound to an account".to_string(),
+            ),
+            AppError::Conflict(ConflictKind::NoOneTimeKeys) => (
+                StatusCode::CONFLICT,
+                "no_one_time_keys",
+                "no one-time keys left for this user".to_string(),
             ),
             AppError::PeerNotFound => (
                 StatusCode::NOT_FOUND,

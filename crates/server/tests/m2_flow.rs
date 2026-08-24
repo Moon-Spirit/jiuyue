@@ -357,6 +357,16 @@ async fn expect_sync_res(ws: &mut WsClient) -> jiuyue_protocol::SyncRes {
     }
 }
 
+/// M3: sync entries became untagged `SyncMessage`s (plain `msg.new` or
+/// encrypted `e2ee.msg`). These tests only exercise plaintext conversations,
+/// so unwrap the plain variant.
+fn as_plain(entry: &jiuyue_protocol::SyncMessage) -> &jiuyue_protocol::MsgNew {
+    match entry {
+        jiuyue_protocol::SyncMessage::Plain(msg) => msg,
+        other => panic!("expected a plain msg.new sync entry, got {other:?}"),
+    }
+}
+
 async fn member_last_read_seq(pool: &PgPool, conversation_id: i64, user_id: Uuid) -> i64 {
     sqlx::query_scalar(
         "SELECT last_read_seq FROM conversation_members \
@@ -597,7 +607,7 @@ async fn recall_within_window_tombstones_message_and_sync_serves_no_body() {
     send_sync_req(&mut ws_b, vec![(conversation_id, 0)]).await;
     let res = expect_sync_res(&mut ws_b).await;
     assert_eq!(res.messages.len(), 1);
-    let entry = &res.messages[0];
+    let entry = as_plain(&res.messages[0]);
     assert_eq!(entry.message_id, message_id);
     assert!(entry.recalled, "sync entry must carry the tombstone flag");
     assert!(
@@ -666,7 +676,7 @@ async fn recall_by_non_sender_is_rejected_but_connection_survives() {
     send_sync_req(&mut ws_b, vec![(conversation_id, 0)]).await;
     let res = expect_sync_res(&mut ws_b).await;
     assert_eq!(res.messages.len(), 1);
-    assert!(!res.messages[0].recalled);
+    assert!(!as_plain(&res.messages[0]).recalled);
 
     let recalled_count: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM messages WHERE id = $1 AND recalled_at IS NOT NULL",
