@@ -28,6 +28,10 @@ pub enum AppError {
     #[error("conflict: {0:?}")]
     Conflict(ConflictKind),
 
+    /// 404 — referenced resource does not exist.
+    #[error("peer user not found")]
+    PeerNotFound,
+
     /// 422 — semantically invalid input (username format, weak password, bad target).
     #[error("validation failed: {0}")]
     Validation(String),
@@ -65,6 +69,11 @@ impl IntoResponse for AppError {
                 StatusCode::CONFLICT,
                 "identity_already_bound",
                 "this email/phone is already bound to an account".to_string(),
+            ),
+            AppError::PeerNotFound => (
+                StatusCode::NOT_FOUND,
+                "peer_not_found",
+                "no user with that username".to_string(),
             ),
             AppError::Validation(msg) => (
                 StatusCode::UNPROCESSABLE_ENTITY,

@@ -30,10 +30,12 @@ pub async fn issue(state: &AppState, user_id: Uuid) -> anyhow::Result<String> {
     Ok(ticket)
 }
 
-/// Atomically consumes a ticket via WATCH/GET/MULTI/DEL/EXEC (GETDEL semantics
-/// without requiring Redis >= 6.2): exactly one contender observes the value and
-/// its DEL commits; every later attempt finds an empty key. Second redemption
-/// and expired/unknown tickets collapse into `InvalidCredentials`.
+/// Atomically consumes a ticket via WATCH/GET/MULTI(GET+DEL)/EXEC (GETDEL
+/// semantics without requiring Redis >= 6.2): the GET inside the transaction
+/// is the single non-ignored reply, so a concurrent winner's write aborts our
+/// EXEC (Nil) and we retry — exactly one contender ever observes the value.
+/// Second redemption and expired/unknown tickets collapse into
+/// `InvalidCredentials`.
 pub async fn consume(state: &AppState, ticket: &str) -> Result<Uuid, AppError> {
     let key = key(ticket);
     let mut conn = state.redis.clone();
@@ -50,28 +52,29 @@ pub async fn consume(state: &AppState, ticket: &str) -> Result<Uuid, AppError> {
             .query_async(&mut conn)
             .await
             .map_err(AppError::internal)?;
-        let user_id = match value {
-            Some(user_id) => user_id,
-            None => {
-                // Nothing to consume; clear the WATCH before leaving.
-                redis::cmd("UNWATCH")
-                    .query_async::<()>(&mut conn)
-                    .await
-                    .map_err(AppError::internal)?;
-                break;
-            }
-        };
-        // EXEC yields Nil when the watched key changed since WATCH, i.e. another
-        // consumer won the race; `Option<()>` maps that to `None` and we retry.
-        let committed: Option<()> = redis::pipe()
+        if value.is_none() {
+            // Nothing to consume; clear the WATCH before leaving.
+            redis::cmd("UNWATCH")
+                .query_async::<()>(&mut conn)
+                .await
+                .map_err(AppError::internal)?;
+            break;
+        }
+        // MULTI/EXEC: GET must return the value for the transaction to count;
+        // if another consumer deleted the key between WATCH and EXEC, EXEC
+        // yields Nil (`None`) and we retry — the loser never sees a value.
+        // (Keeping GET non-ignored is what makes this race-safe: an
+        // all-ignored pipe cannot distinguish commit from abort.)
+        let (committed,): (Option<String>,) = redis::pipe()
             .atomic()
+            .get(key.as_str())
             .del(key.as_str())
             .ignore()
             .query_async(&mut conn)
             .await
             .map_err(AppError::internal)?;
-        if committed.is_some() {
-            held = Some(user_id);
+        if let Some(value) = committed {
+            held = Some(value);
             break;
         }
     }

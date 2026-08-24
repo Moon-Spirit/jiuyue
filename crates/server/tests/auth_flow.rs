@@ -5,12 +5,18 @@
 //! Isolation strategy: the whole binary shares one global async mutex; the first
 //! entrant resets the schema (DROP + fresh migrate), every test truncates all
 //! tables up front. Tests therefore run serialized but fully isolated.
+//!
+//! Cross-binary isolation: cargo runs several integration-test binaries in
+//! parallel against the same database. Every test holds a session-level PG
+//! advisory lock for its whole lifetime (released automatically when the
+//! guard connection drops), so a schema reset in one binary can never race a
+//! running test in another.
 
 use axum::http::{Request, StatusCode};
 use axum::{body::Body, Router};
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
-use sqlx::PgPool;
+use sqlx::{Connection, PgConnection, PgPool};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::LazyLock;
 use tower::ServiceExt;
@@ -24,11 +30,16 @@ static GATE: LazyLock<tokio::sync::Mutex<()>> =
     LazyLock::new(|| tokio::sync::Mutex::const_new(()));
 static SCHEMA_READY: AtomicBool = AtomicBool::new(false);
 
+/// Arbitrary fixed key shared by every JiuYue test binary.
+const TEST_ADVISORY_LOCK_KEY: i64 = 0x6A_75_59_55_00_01;
+
 struct TestApp {
     app: Router,
     state: AppState,
     pool: PgPool,
     redis: redis::aio::ConnectionManager,
+    /// Holds the advisory lock; dropping it releases the lock (session end).
+    _lock_conn: PgConnection,
 }
 
 fn env_var(name: &str) -> String {
@@ -37,6 +48,15 @@ fn env_var(name: &str) -> String {
 
 async fn test_app() -> TestApp {
     dotenvy::dotenv().ok();
+
+    let mut lock_conn = PgConnection::connect(&env_var("TEST_DATABASE_URL"))
+        .await
+        .expect("connect lock session");
+    sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(TEST_ADVISORY_LOCK_KEY)
+        .execute(&mut lock_conn)
+        .await
+        .expect("acquire cross-binary test lock");
 
     if !SCHEMA_READY.load(Ordering::SeqCst) {
         let admin = sqlx::postgres::PgPoolOptions::new()
@@ -65,10 +85,13 @@ async fn test_app() -> TestApp {
         .connect(&env_var("TEST_DATABASE_URL"))
         .await
         .expect("connect TEST_DATABASE_URL");
-    sqlx::query("TRUNCATE users, auth_identities, devices, refresh_tokens RESTART IDENTITY CASCADE")
-        .execute(&pool)
-        .await
-        .expect("truncate tables");
+    sqlx::query(
+        "TRUNCATE users, auth_identities, devices, refresh_tokens, \
+         conversations, conversation_members, messages RESTART IDENTITY CASCADE",
+    )
+    .execute(&pool)
+    .await
+    .expect("truncate tables");
     let redis_client = redis::Client::open(env_var("REDIS_URL").as_str()).expect("parse redis url");
     let redis = redis::aio::ConnectionManager::new(redis_client)
         .await
@@ -79,6 +102,7 @@ async fn test_app() -> TestApp {
         state,
         pool,
         redis,
+        _lock_conn: lock_conn,
     }
 }
 

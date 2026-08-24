@@ -15,11 +15,13 @@ path = "src/main.rs"
 [dependencies]
 jiuyue-domain.workspace = true
 jiuyue-protocol.workspace = true
+aes-gcm.workspace = true
 anyhow.workspace = true
 argon2.workspace = true
-axum = "0.8"
+axum = { version = "0.8", features = ["ws"] }
 base64 = "0.22"
 dashmap.workspace = true
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 dotenvy = "0.15"
 jsonwebtoken.workspace = true
 rand.workspace = true
@@ -38,4 +40,5 @@ uuid.workspace = true
 
 [dev-dependencies]
 http-body-util = "0.1"
+tokio-tungstenite = "0.26"
 tower = { version = "0.5", features = ["util"] }

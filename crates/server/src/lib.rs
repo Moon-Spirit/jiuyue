@@ -5,10 +5,13 @@
 
 pub mod app;
 pub mod auth;
+pub mod chat;
 pub mod code_store;
 pub mod config;
+pub mod crypto;
 pub mod error;
 pub mod state;
+pub mod ws;
 
 pub use app::build_router;
 
