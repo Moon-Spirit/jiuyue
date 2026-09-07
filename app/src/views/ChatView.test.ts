@@ -386,14 +386,14 @@ describe("ChatView — unread and composer", () => {
         username: "me",
         uid: 1000007,
         displayName: "Me Myself",
-        avatar: "🐼",
+        avatar: "💎",
       };
       const wrapper = await mountView(pinia);
 
       const selfButton = navPane(wrapper).find('[data-testid="nav-self"]');
       expect(selfButton.exists()).toBe(true);
       // Avatar prefers the emoji when set.
-      expect(selfButton.find('[data-testid="avatar-emoji"]').text()).toBe("🐼");
+      expect(selfButton.find('[data-testid="avatar-emoji"]').text()).toBe("💎");
       // Label under the avatar shows the username.
       expect(selfButton.find('[data-testid="nav-username"]').text()).toBe("me");
 
@@ -413,7 +413,7 @@ describe("ChatView — unread and composer", () => {
           peerUserId: "peer-1",
           peerUsername: "alice",
           peerDisplayName: "Alice",
-          peerAvatar: "🦊",
+          peerAvatar: "💎",
           lastActivityAt: isoAt(-MINUTE),
         }),
       );
@@ -423,7 +423,7 @@ describe("ChatView — unread and composer", () => {
       // Rendered name prefers the peer display name.
       expect(row.find('[data-testid="session-name"]').text()).toBe("Alice");
       const avatar = row.find('[data-testid="session-avatar"]');
-      expect(avatar.find('[data-testid="avatar-emoji"]').text()).toBe("🦊");
+      expect(avatar.find('[data-testid="avatar-emoji"]').text()).toBe("💎");
 
       // Avatar click: navigate to the peer's profile, conversation stays closed.
       await avatar.trigger("click");

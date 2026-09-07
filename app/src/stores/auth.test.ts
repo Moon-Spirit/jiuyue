@@ -144,7 +144,7 @@ describe("auth store", () => {
         username: "roundtrip",
         uid: 4242,
         displayName: "Round Trip",
-        avatar: "🐳",
+        avatar: "💎",
         bio: "正在环游世界",
       }),
     );
@@ -161,7 +161,7 @@ describe("auth store", () => {
     await store.ensureAccessToken();
 
     expect(store.user?.displayName).toBe("Round Trip");
-    expect(store.user?.avatar).toBe("🐳");
+    expect(store.user?.avatar).toBe("💎");
     expect(store.user?.bio).toBe("正在环游世界");
 
     // A fresh store boots from the same persisted JSON and sees them again.

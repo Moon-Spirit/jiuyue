@@ -29,6 +29,14 @@ export function xpForLevel(level: number): number {
   return total;
 }
 
+/**
+ * XP earned inside the CURRENT level: total XP minus the cumulative cost of
+ * every level below it. The level bar renders `progressInLevel / xpToNext(level)`.
+ */
+export function progressInLevel(totalXp: number, level: number): number {
+  return Math.max(0, Math.floor(totalXp) - xpForLevel(level));
+}
+
 /** i18n key suffix of the title band holding `level` (see rankTitles in the
  *  locale files: profile.rankTitles.dirt … profile.rankTitles.dragonEgg). */
 export type RankKey =

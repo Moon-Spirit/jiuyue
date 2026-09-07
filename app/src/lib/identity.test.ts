@@ -17,7 +17,7 @@ describe("identity helpers", () => {
   });
 
   it("returns the avatar emoji only when it belongs to the curated set", () => {
-    expect(avatarEmojiOf("🐶")).toBe("🐶");
+    expect(avatarEmojiOf("💎")).toBe("💎");
     expect(avatarEmojiOf("🐱")).toBe("🐱");
     // Unset / unknown values fall back to the initial circle.
     expect(avatarEmojiOf(null)).toBeNull();

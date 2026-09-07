@@ -5,7 +5,7 @@ import { useRoute, useRouter } from "vue-router";
 import Avatar from "../components/Avatar.vue";
 import { AVATAR_EMOJIS } from "../lib/avatars";
 import { displayNameOf } from "../lib/identity";
-import { bandOf } from "../lib/levels";
+import { bandOf, progressInLevel, xpToNext } from "../lib/levels";
 import type { RankKey } from "../lib/levels";
 import { PROFILE_LIMITS } from "../lib/api/profile";
 import type { UserProfile } from "../lib/api/profile";
@@ -85,23 +85,34 @@ const xpLabel = computed<string>(() =>
   t("profile.xpLabel", { level: viewed.value.level }),
 );
 
+/** XP earned inside the current level (bar numerator). */
+const inLevelXp = computed<number>(() =>
+  progressInLevel(viewed.value.xp, viewed.value.level),
+);
+
+/** Total XP required to leave the current level (bar denominator). */
+const levelRequirement = computed<number>(() =>
+  Math.max(1, xpToNext(viewed.value.level)),
+);
+
 const xpToNextLabel = computed<string>(() =>
   t("profile.xpToNext", {
-    xp: viewed.value.xp,
-    xpToNext: viewed.value.xp_to_next,
+    inLevel: inLevelXp.value,
+    total: levelRequirement.value,
+    remaining: Math.max(0, levelRequirement.value - inLevelXp.value),
   }),
 );
 
 /** Percentage width of the level progress bar (clamped 0-100). */
 const progressPct = computed<number>(() => {
-  const total = viewed.value.xp_to_next;
-  if (!(total > 0)) return 0;
-  const pct = Math.round((viewed.value.xp / total) * 100);
+  const total = levelRequirement.value;
+  const pct = Math.round((inLevelXp.value / total) * 100);
   return Math.min(100, Math.max(0, pct));
 });
 
+/** XP still needed to reach the next level. */
 const remainingXp = computed<number>(() =>
-  Math.max(0, viewed.value.xp_to_next - viewed.value.xp),
+  Math.max(0, levelRequirement.value - inLevelXp.value),
 );
 
 function startEditing(): void {
@@ -121,14 +132,70 @@ function selectAvatar(emoji: string): void {
   pickerOpen.value = false;
 }
 
+/** Custom avatar upload: read → downscale to 256×256 → JPEG data URL. */
+async function onAvatarFile(event: Event): Promise<void> {
+  const input = event.target as HTMLInputElement;
+  const file = input.files?.[0];
+  input.value = "";
+  if (file === undefined) return;
+  try {
+    const dataUrl = await fileToAvatarDataUrl(file);
+    if (dataUrl !== null) {
+      draftAvatar.value = dataUrl;
+      pickerOpen.value = false;
+    }
+  } catch {
+    // Unsupported/undecodable image: silently keep the current draft. The
+    // picker stays open so the user can retry with another file.
+  }
+}
+
+const AVATAR_MAX_EDGE = 256;
+const AVATAR_JPEG_QUALITY = 0.85;
+
+function fileToAvatarDataUrl(file: File): Promise<string | null> {
+  return new Promise((resolve) => {
+    const url = URL.createObjectURL(file);
+    const image = new Image();
+    image.onload = () => {
+      try {
+        const scale = Math.min(
+          1,
+          AVATAR_MAX_EDGE / Math.max(image.naturalWidth, image.naturalHeight),
+        );
+        const canvas = document.createElement("canvas");
+        canvas.width = Math.max(1, Math.round(image.naturalWidth * scale));
+        canvas.height = Math.max(1, Math.round(image.naturalHeight * scale));
+        const ctx = canvas.getContext("2d");
+        if (ctx === null) {
+          resolve(null);
+          return;
+        }
+        ctx.drawImage(image, 0, 0, canvas.width, canvas.height);
+        resolve(canvas.toDataURL("image/jpeg", AVATAR_JPEG_QUALITY));
+      } catch {
+        resolve(null);
+      } finally {
+        URL.revokeObjectURL(url);
+      }
+    };
+    image.onerror = () => {
+      URL.revokeObjectURL(url);
+      resolve(null);
+    };
+    image.src = url;
+  });
+}
+
 async function saveEdits(): Promise<void> {
-  const name = draftName.value.trim();
-  if (bioTooLong.value || nameTooLong.value || name.length === 0) return;
+  // Empty display_name is allowed (server clears it and UI falls back to the
+  // username); only length limits and in-flight saves block submission.
+  if (bioTooLong.value || nameTooLong.value) return;
   if (saving.value) return;
   saving.value = true;
   try {
     await profile.saveMe({
-      display_name: name.length > 0 ? name : undefined,
+      display_name: draftName.value.trim(),
       bio: draftBio.value.trim(),
       avatar: draftAvatar.value ?? undefined,
     });
@@ -412,6 +479,19 @@ watch(peerId, () => {
         <p class="pb-3 text-[11px] text-neutral-400 dark:text-neutral-500">
           {{ t("profile.avatarPickerHint") }}
         </p>
+        <label
+          class="mb-3 flex cursor-pointer items-center justify-center gap-2 rounded-lg border border-dashed border-neutral-300 py-2 text-xs font-medium text-neutral-500 hover:bg-neutral-100 dark:border-neutral-700 dark:text-neutral-400 dark:hover:bg-neutral-800"
+          data-testid="avatar-upload-label"
+        >
+          {{ t("profile.avatarUpload") }}
+          <input
+            type="file"
+            accept="image/png,image/jpeg,image/webp"
+            class="hidden"
+            data-testid="avatar-upload-input"
+            @change="onAvatarFile($event)"
+          />
+        </label>
         <div class="grid grid-cols-6 gap-1">
           <button
             v-for="emoji in AVATAR_EMOJIS"

@@ -130,7 +130,7 @@ describe("ProfileView — self mode (/profile)", () => {
     );
     const choices = wrapper.findAll('[data-testid="avatar-choice"]');
     expect(choices.length).toBeGreaterThanOrEqual(30);
-    await choices.find((c) => c.text() === "🦊")?.trigger("click");
+    await choices.find((c) => c.text() === "💎")?.trigger("click");
 
     await nameInput.setValue("Alice 改");
     await wrapper
@@ -142,7 +142,7 @@ describe("ProfileView — self mode (/profile)", () => {
       jsonResponse(200, {
         ...SELF,
         display_name: "Alice 改",
-        avatar: "🦊",
+        avatar: "💎",
         bio: "新的签名",
       }),
     );
@@ -164,7 +164,7 @@ describe("ProfileView — self mode (/profile)", () => {
     expect(JSON.parse(String(init.body))).toEqual({
       display_name: "Alice 改",
       bio: "新的签名",
-      avatar: "🦊",
+      avatar: "💎",
     });
     expect((init.headers as Headers).get("Authorization")).toBe(
       "Bearer test-token",
@@ -172,7 +172,7 @@ describe("ProfileView — self mode (/profile)", () => {
 
     // Local auth store mirrors the edited display fields.
     expect(useAuthStore().user?.displayName).toBe("Alice 改");
-    expect(useAuthStore().user?.avatar).toBe("🦊");
+    expect(useAuthStore().user?.avatar).toBe("💎");
     expect(useProfileStore().me?.bio).toBe("新的签名");
     expect(wrapper.find('[data-testid="profile-display-name"]').text()).toBe(
       "Alice 改",
@@ -214,7 +214,7 @@ describe("ProfileView — peer mode (/profile/:userId)", () => {
       username: "bob",
       uid: 200001,
       display_name: "Bob Builder",
-      avatar: "🦊",
+      avatar: "💎",
       bio: "盖房子中",
       level: 44,
       title: "龙蛋",
@@ -255,7 +255,7 @@ describe("ProfileView — peer mode (/profile/:userId)", () => {
       wrapper
         .find('[data-testid="profile-card"] [data-testid="avatar-emoji"]')
         .text(),
-    ).toBe("🦊");
+    ).toBe("💎");
   });
 
   it("fetches the peer profile from the server on entry", async () => {

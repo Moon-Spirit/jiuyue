@@ -32,7 +32,7 @@ use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, State};
 use axum::Json;
 use jiuyue_domain::{
-    level_from_xp, title_for_level, total_xp_for, xp_for_level, DAILY_LOGIN_XP,
+    level_from_xp, title_for_level, xp_for_level, DAILY_LOGIN_XP,
     MSG_XP_CHAR_BLOCK, MSG_XP_DAILY_CAP, MSG_XP_PER_BLOCK,
 };
 use serde::{Deserialize, Serialize};
@@ -52,8 +52,31 @@ pub const AVATARS: &[&str] = &[
     "📦", "🚪", "🗺️", "🧭", "🏔️", "🌋", "🌙", "☀️", "👑", "💀", "👾", "⚡", "🌀", "🌸",
 ];
 
+/// Maximum accepted size of a custom data-URL avatar (raw base64 payload).
+/// ~256 KB of base64 → roughly 192 KB of decoded image data.
+const MAX_CUSTOM_AVATAR_BYTES: usize = 256 * 1024;
+
 fn is_valid_avatar(value: &str) -> bool {
-    value.is_empty() || AVATARS.contains(&value)
+    if value.is_empty() || AVATARS.contains(&value) {
+        return true;
+    }
+    is_valid_custom_avatar(value)
+}
+
+/// Custom uploads arrive as `data:image/{png|jpeg|webp};base64,…` strings.
+/// The decoder is lenient (a few hundred KB), so validation is a shape check
+/// plus a payload-size cap rather than a full re-decode.
+fn is_valid_custom_avatar(value: &str) -> bool {
+    let Some(rest) = value.strip_prefix("data:image/") else {
+        return false;
+    };
+    let Some((mime, payload)) = rest.split_once(";base64,") else {
+        return false;
+    };
+    if !matches!(mime, "png" | "jpeg" | "webp") {
+        return false;
+    }
+    payload.len() <= MAX_CUSTOM_AVATAR_BYTES && !payload.is_empty()
 }
 
 // ---------------------------------------------------------------------------
@@ -76,7 +99,7 @@ pub struct ProfileResponse {
     /// level via the domain pure fn, never stored itself.
     pub title: &'static str,
     pub xp: i64,
-    /// XP still needed to reach the next level.
+    /// Total XP required to advance from the current level (bar denominator).
     pub xp_to_next: i64,
 }
 
@@ -128,7 +151,7 @@ async fn load_profile(state: &AppState, user_id: Uuid) -> Result<ProfileResponse
     };
     let level = i64::from(level);
     // xp_to_next = req(level) − progress within the current level.
-    let xp_to_next = xp_for_level(level) - (xp - total_xp_for(level));
+    let xp_to_next = xp_for_level(level);
     Ok(ProfileResponse {
         user_id: uid_user_id,
         uid,

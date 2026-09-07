@@ -1,4 +1,4 @@
-﻿//! M7 profile + XP integration tests.
+//! M7 profile + XP integration tests.
 //!
 //! Coverage (mirroring the frozen rules the frontend renders in parallel):
 //!
@@ -525,6 +525,61 @@ async fn profile_patch_validates_lengths_and_avatar_membership() {
 }
 
 #[tokio::test]
+async fn custom_data_url_avatars_are_validated_and_roundtrip() {
+    let _guard = GATE.lock().await;
+    let t = test_app().await;
+
+    let (_a_id, a_access, _a_uid) = register_user(&t, "ca-a@example.com", "caalice").await;
+
+    // A well-formed 1x1 PNG data URL is accepted and echoed back.
+    let tiny_png = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+    let (status, body) = send_http(
+        &t.app,
+        "PATCH",
+        "/api/users/profile",
+        Some(&a_access),
+        Some(json!({ "avatar": tiny_png })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["avatar"], tiny_png, "custom avatar roundtrips");
+
+    // webp and jpeg MIME types are accepted too.
+    let webp = format!("data:image/webp;base64,{}", "A".repeat(64));
+    let (status, body) = send_http(
+        &t.app,
+        "PATCH",
+        "/api/users/profile",
+        Some(&a_access),
+        Some(json!({ "avatar": webp })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["avatar"], webp);
+
+    // Oversized payloads, unknown MIME types and malformed shapes → 422.
+    let oversized = format!("data:image/png;base64,{}", "A".repeat(300 * 1024));
+    for bad in [
+        oversized.as_str(),
+        "data:image/gif;base64,AAAA",
+        "data:image/png;base64,",
+        "data:image/png,AAAA",
+        "data:text/html;base64,AAAA",
+        "http://evil.example/a.png",
+    ] {
+        let (status, body) = send_http(
+            &t.app,
+            "PATCH",
+            "/api/users/profile",
+            Some(&a_access),
+            Some(json!({ "avatar": bad })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "avatar {bad:?}: {body}");
+    }
+}
+
+#[tokio::test]
 async fn patch_is_self_only_even_for_known_peers() {
     let _guard = GATE.lock().await;
     let t = test_app().await;
@@ -602,7 +657,7 @@ async fn daily_login_bonus_grants_20_xp_once_per_utc_day() {
     assert_eq!(body["xp"], 20);
     assert_eq!(body["level"], 1);
     assert_eq!(body["title"], "土块");
-    assert_eq!(body["xp_to_next"], 30, "50 req - 20 progress = 30 left");
+    assert_eq!(body["xp_to_next"], 50, "xp_to_next is the full level requirement (bar denominator)");
 }
 
 #[tokio::test]
@@ -750,7 +805,7 @@ async fn message_xp_caps_at_200_per_day() {
     assert_eq!(body["xp"], 220);
     assert_eq!(body["level"], 4);
     assert_eq!(body["title"], "土块", "band 1-5 is 土块");
-    assert_eq!(body["xp_to_next"], 13, "req(4)=67 minus progress (220-166=54)");
+    assert_eq!(body["xp_to_next"], 67, "xp_to_next is the full level-4 requirement");
 }
 
 #[tokio::test]
@@ -852,7 +907,7 @@ async fn level_is_stored_recomputed_from_accumulated_xp() {
     assert_eq!(body["level"], 4);
     assert_eq!(body["title"], "土块", "220 XP is still band 1-5");
     assert_eq!(body["xp"], 220);
-    assert_eq!(body["xp_to_next"], 13, "req(4)=67 minus progress (220-166=54)");
+    assert_eq!(body["xp_to_next"], 67, "xp_to_next is the full level-4 requirement");
 }
 
 // ---------------------------------------------------------------------------

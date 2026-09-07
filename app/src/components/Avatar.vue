@@ -46,9 +46,17 @@ const label = computed<string>(() => {
   return display.length > 0 ? display : props.username;
 });
 
-const emoji = computed<string | null>(() =>
-  avatarEmojiOf(props.avatar ?? null),
-);
+const emoji = computed<string | null>(() => {
+  const raw = props.avatar ?? null;
+  if (raw !== null && raw.startsWith("data:image/")) return null;
+  return avatarEmojiOf(raw);
+});
+
+/** Custom uploaded image (data: URL) renders as an <img>, not a glyph. */
+const customImage = computed<string | null>(() => {
+  const raw = props.avatar ?? null;
+  return raw !== null && raw.startsWith("data:image/") ? raw : null;
+});
 
 const initial = computed<string>(() => {
   const first = label.value.trim().charAt(0);
@@ -103,8 +111,15 @@ function handleClick(event: MouseEvent): void {
     :aria-label="label"
     @click="handleClick($event)"
   >
+    <img
+      v-if="customImage !== null"
+      :src="customImage"
+      :alt="label"
+      class="h-full w-full rounded-full object-cover"
+      data-testid="avatar-image"
+    />
     <span
-      v-if="emoji !== null"
+      v-else-if="emoji !== null"
       class="leading-none"
       data-testid="avatar-emoji"
       >{{ emoji }}</span
