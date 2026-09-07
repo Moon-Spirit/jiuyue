@@ -101,4 +101,52 @@ describe("auth store", () => {
     expect(fetchMock).not.toHaveBeenCalled();
     expect(store.status).toBe("anon");
   });
+  it("logout wipes the previous account's ws/friends data and scoped storage", async () => {
+    const auth = useAuthStore();
+    fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes("/api/auth/ws-ticket")) return jsonResponse(200, { ticket: "t1" });
+      return jsonResponse(200, {
+        access_token: "a1",
+        refresh_token: "r1",
+        expires_in: 900,
+        user_id: "u-1",
+        username: "alice",
+      });
+    });
+    await auth.login("alice", "password123");
+
+    const { useWsStore } = await import("./ws");
+    const { useFriendsStore } = await import("./friends");
+    const ws = useWsStore();
+    const friends = useFriendsStore();
+    ws.conversations.push({
+      conversationId: 1,
+      peerUserId: "p1",
+      peerUsername: "bob",
+      lastMessagePreview: "hi",
+      lastActivityAt: "",
+      unread: 0,
+      lastSeenSeq: 0,
+      maxSeq: 0,
+      kind: "direct",
+      peerTypingUntil: null,
+    });
+    ws.messagesByConversation[1] = [];
+    localStorage.setItem("jiuyue.convos", JSON.stringify([{ conversationId: 1 }]));
+    localStorage.setItem("jiuyue.msgs.1", "[]");
+    localStorage.setItem("jiuyue.e2ee.identity", "identity-bytes");
+    friends.friends = [{ user_id: "p1", username: "bob", since: "2026" }];
+    friends.loaded = true;
+
+    await auth.logout();
+
+    expect(auth.status).toBe("anon");
+    expect(ws.conversations).toHaveLength(0);
+    expect(friends.friends).toHaveLength(0);
+    expect(friends.loaded).toBe(false);
+    expect(localStorage.getItem("jiuyue.convos")).toBeNull();
+    expect(localStorage.getItem("jiuyue.msgs.1")).toBeNull();
+    expect(localStorage.getItem("jiuyue.e2ee.identity")).toBeNull();
+  });
 });

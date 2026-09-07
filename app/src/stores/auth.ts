@@ -38,7 +38,11 @@ function readPersistedUser(): AuthUser | null {
     const parsed: unknown = JSON.parse(raw);
     if (!isRecord(parsed)) return null;
     const { userId, username } = parsed;
-    if (typeof userId === "string" && userId.length > 0 && typeof username === "string") {
+    if (
+      typeof userId === "string" &&
+      userId.length > 0 &&
+      typeof username === "string"
+    ) {
       return { userId, username };
     }
     return null;
@@ -47,7 +51,6 @@ function readPersistedUser(): AuthUser | null {
     return null;
   }
 }
-
 
 export const useAuthStore = defineStore("auth", {
   state: () => ({
@@ -119,6 +122,14 @@ export const useAuthStore = defineStore("auth", {
       // No server-side revoke endpoint exists; clearing is client-side only.
       await secureRemoveRefresh();
       localStorage.removeItem(USER_KEY);
+      // Drop the previous account's in-memory + persisted data so a
+      // subsequent login/registration never inherits conversations, friends,
+      // or (critically) the E2EE identity of the prior user.
+      const { useWsStore } = await import("./ws");
+      const { useFriendsStore } = await import("./friends");
+      useWsStore().dispose();
+      useWsStore().wipeUserData();
+      useFriendsStore().reset();
     },
 
     async performRefresh(): Promise<string | null> {

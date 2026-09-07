@@ -47,6 +47,14 @@ export const useFriendsStore = defineStore("friends", {
       this.loaded = true;
     },
 
+    /** Clears cached lists; called on logout so a new account starts clean. */
+    reset(): void {
+      this.friends = [];
+      this.incoming = [];
+      this.outgoing = [];
+      this.loaded = false;
+    },
+
     async fetchFriends(): Promise<void> {
       this.friends = await listFriends(await this.token());
     },

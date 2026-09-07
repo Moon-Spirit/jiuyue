@@ -451,6 +451,28 @@ export const useWsStore = defineStore("ws", {
       lastSentReadSeq.clear();
     },
 
+    /**
+     * Wipes user-scoped data: in-memory lists plus persisted caches
+     * (conversations, per-conversation messages, e2ee identity/sessions).
+     * Called on logout so a new account on the same browser never inherits
+     * the previous account's conversations, friends or crypto identity.
+     */
+    wipeUserData(): void {
+      this.conversations = [];
+      this.messagesByConversation = {};
+      for (let i = localStorage.length - 1; i >= 0; i -= 1) {
+        const key = localStorage.key(i);
+        if (key === null) continue;
+        if (
+          key.startsWith(MSGS_KEY_PREFIX) ||
+          key === CONVOS_KEY ||
+          key.startsWith("jiuyue.e2ee.")
+        ) {
+          localStorage.removeItem(key);
+        }
+      }
+    },
+
     scheduleReconnect(): void {
       clearReconnectTimer();
       const delay = computeBackoffDelay(this.reconnectAttempt);
