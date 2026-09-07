@@ -24,7 +24,7 @@ function freshSession(): Pinia {
   const pinia = createPinia();
   setActivePinia(pinia);
   const auth = useAuthStore();
-  auth.user = { userId: "7", username: "me" };
+  auth.user = { userId: "7", username: "me", uid: 1000007 };
   // Cached token keeps friends actions off the refresh path (no network).
   auth.accessToken = "test-token";
   return pinia;
@@ -59,6 +59,12 @@ function mainPane(wrapper: VueWrapper): DOMWrapper<Element> {
   return wrapper.find('[data-testid="shell-main-desktop"]');
 }
 
+/** Types a query into the search box and runs the search immediately. */
+async function typeAndSearch(pane: DOMWrapper<Element>, query: string) {
+  await pane.find('[data-testid="user-search-input"]').setValue(query);
+  await pane.find('[data-testid="user-search-input"]').trigger("keydown.enter");
+}
+
 beforeEach(() => {
   localStorage.clear();
   fetchMock.mockReset();
@@ -66,17 +72,17 @@ beforeEach(() => {
 });
 
 describe("ContactsView — 通讯录面板", () => {
-  it("渲染标题、添加好友表单与空态文案", async () => {
-    const wrapper = await mountView(freshSession());
+  it("渲染标题、搜索框与空态文案", async () => {
+    const pinia = freshSession();
+    // Mirrors a completed load so the "no friends yet" empty state shows.
+    useFriendsStore().loaded = true;
+    const wrapper = await mountView(pinia);
 
     expect(
       sessionsPane(wrapper).find('[data-testid="contacts-title"]').text(),
     ).toBe("通讯录");
     expect(
-      sessionsPane(wrapper).find('[data-testid="add-friend-input"]').exists(),
-    ).toBe(true);
-    expect(
-      sessionsPane(wrapper).find('[data-testid="add-friend-submit"]').exists(),
+      sessionsPane(wrapper).find('[data-testid="user-search-input"]').exists(),
     ).toBe(true);
     expect(
       sessionsPane(wrapper).find('[data-testid="friends-empty"]').exists(),
@@ -92,11 +98,12 @@ describe("ContactsView — 通讯录面板", () => {
     friends.friends.push({
       user_id: "u1",
       username: "alice",
+      uid: 100001,
       since: "2026-01-01T00:00:00Z",
     });
     friends.incoming.push({
       request_id: "r1",
-      from: { user_id: "u2", username: "bob" },
+      from: { user_id: "u2", username: "bob", uid: 100002 },
       created_at: new Date().toISOString(),
     });
 
@@ -104,50 +111,121 @@ describe("ContactsView — 通讯录面板", () => {
     const pane = sessionsPane(wrapper);
 
     expect(pane.find('[data-testid="friend-item"]').text()).toContain("alice");
+    expect(pane.find('[data-testid="friend-uid"]').text()).toContain("100001");
     expect(pane.find('[data-testid="message-friend"]').exists()).toBe(true);
     expect(pane.find('[data-testid="incoming-item"]').text()).toContain("bob");
     expect(pane.find('[data-testid="accept-request"]').exists()).toBe(true);
     expect(pane.find('[data-testid="decline-request"]').exists()).toBe(true);
   });
 
-  it("提交合法用户名后发送申请并清空输入框", async () => {
-    fetchMock.mockResolvedValue(
-      jsonResponse(201, {
-        request_id: "r9",
-        to: { user_id: "u8", username: "carol" },
-      }),
-    );
+  it("搜索用户后渲染结果卡片（用户名 + UID），添加后按钮变为已发送", async () => {
+    fetchMock.mockImplementation(async (path: string, init?: RequestInit) => {
+      if (path.startsWith("/api/users/search")) {
+        return jsonResponse(200, [
+          { user_id: "u8", username: "carol", uid: 100023 },
+        ]);
+      }
+      if (path === "/api/friends/requests" && init?.method === "POST") {
+        return jsonResponse(201, {
+          request_id: "r9",
+          to: { user_id: "u8", username: "carol", uid: 100023 },
+        });
+      }
+      return jsonResponse(404, { error: "not_found", message: "x" });
+    });
     const pinia = freshSession();
     const wrapper = await mountView(pinia);
     const pane = sessionsPane(wrapper);
 
-    await pane.find('[data-testid="add-friend-input"]').setValue("carol");
-    await pane.find("form").trigger("submit");
-    await vi.waitFor(() => {
-      expect(
-        (
-          pane.find('[data-testid="add-friend-input"]')
-            .element as HTMLInputElement
-        ).value,
-      ).toBe("");
-    });
+    await typeAndSearch(pane, "carol");
 
+    await vi.waitFor(() => {
+      expect(pane.find('[data-testid="search-result-item"]').exists()).toBe(
+        true,
+      );
+    });
+    const item = pane.find('[data-testid="search-result-item"]');
+    expect(item.find('[data-testid="search-result-name"]').text()).toBe(
+      "carol",
+    );
+    expect(item.find('[data-testid="search-result-uid"]').text()).toContain(
+      "100023",
+    );
+
+    // Sending the request flips the card to the disabled 已发送 state.
+    await pane.find('[data-testid="search-result-add"]').trigger("click");
+    await vi.waitFor(() => {
+      expect(pane.find('[data-testid="search-result-sent"]').exists()).toBe(
+        true,
+      );
+    });
     expect(useFriendsStore().outgoing.map((r) => r.to.username)).toEqual([
       "carol",
     ]);
   });
 
-  it("后端返回 peer_not_found 时展示本地化错误", async () => {
-    fetchMock.mockResolvedValue(
-      jsonResponse(404, { error: "peer_not_found", message: "nope" }),
-    );
+  it("已添加的好友不出现在搜索结果中（按钮禁用为已添加）", async () => {
+    fetchMock.mockImplementation(async (path: string) => {
+      if (path.startsWith("/api/users/search")) {
+        return jsonResponse(200, [
+          { user_id: "u1", username: "alice", uid: 100001 },
+        ]);
+      }
+      return jsonResponse(404, { error: "not_found", message: "x" });
+    });
+    const pinia = freshSession();
+    const friends = useFriendsStore();
+    friends.friends.push({
+      user_id: "u1",
+      username: "alice",
+      uid: 100001,
+      since: "2026-01-01T00:00:00Z",
+    });
+
+    const wrapper = await mountView(pinia);
+    const pane = sessionsPane(wrapper);
+
+    await typeAndSearch(pane, "alice");
+    await vi.waitFor(() => {
+      expect(
+        pane.find('[data-testid="search-result-already-friend"]').exists(),
+      ).toBe(true);
+    });
+    expect(pane.find('[data-testid="search-result-add"]').exists()).toBe(false);
+  });
+
+  it("搜索无结果时展示空态文案", async () => {
+    fetchMock.mockResolvedValue(jsonResponse(200, []));
     const wrapper = await mountView(freshSession());
     const pane = sessionsPane(wrapper);
 
-    await pane.find('[data-testid="add-friend-input"]').setValue("ghost");
-    await pane.find("form").trigger("submit");
+    await typeAndSearch(pane, "nobody_here");
     await vi.waitFor(() => {
-      expect(pane.find('[data-testid="add-friend-error"]').text()).toBe(
+      expect(pane.find('[data-testid="search-empty"]').exists()).toBe(true);
+    });
+  });
+
+  it("发送好友申请返回 peer_not_found 时展示本地化错误", async () => {
+    fetchMock.mockImplementation(async (path: string) => {
+      if (path.startsWith("/api/users/search")) {
+        return jsonResponse(200, [
+          { user_id: "u9", username: "ghost", uid: 100099 },
+        ]);
+      }
+      return jsonResponse(404, { error: "peer_not_found", message: "nope" });
+    });
+    const wrapper = await mountView(freshSession());
+    const pane = sessionsPane(wrapper);
+
+    await typeAndSearch(pane, "ghost");
+    await vi.waitFor(() => {
+      expect(pane.find('[data-testid="search-result-item"]').exists()).toBe(
+        true,
+      );
+    });
+    await pane.find('[data-testid="search-result-add"]').trigger("click");
+    await vi.waitFor(() => {
+      expect(pane.find('[data-testid="search-error"]').text()).toBe(
         i18n.global.t("errors.peer_not_found"),
       );
     });
@@ -159,6 +237,7 @@ describe("ContactsView — 通讯录面板", () => {
     friends.friends.push({
       user_id: "u1",
       username: "alice",
+      uid: 100001,
       since: "2026-01-01T00:00:00Z",
     });
 

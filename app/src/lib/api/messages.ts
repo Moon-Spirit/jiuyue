@@ -6,6 +6,8 @@ export interface ConversationPeer {
   /** Server-side user UUID (a string, never a number). */
   user_id: string;
   username: string;
+  /** Numeric user identifier (QQ-style); present on newer server responses. */
+  uid?: number;
 }
 
 /** Conversation kind: plain direct chat or end-to-end encrypted secret chat. */

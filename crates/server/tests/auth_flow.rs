@@ -193,6 +193,11 @@ async fn email_register_login_refresh_and_ws_ticket_roundtrip() {
     assert_eq!(status, StatusCode::CREATED, "{reg}");
     assert_eq!(reg["username"], "alice");
     assert_eq!(reg["expires_in"], 900);
+    let reg_uid = reg["uid"].as_i64().expect("register carries numeric uid");
+    assert!(
+        reg_uid >= 100_000,
+        "uid allocation starts at 100000 (QQ-style), got {reg_uid}"
+    );
     let user_id: uuid::Uuid = reg["user_id"].as_str().unwrap().parse().unwrap();
     let access = reg["access_token"].as_str().unwrap().to_string();
     let refresh1 = reg["refresh_token"].as_str().unwrap().to_string();
@@ -216,6 +221,12 @@ async fn email_register_login_refresh_and_ws_ticket_roundtrip() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{login_email}");
+
+    // Login mirrors the profile (incl. the stable uid) for client display.
+    assert_eq!(login_user["uid"], json!(reg_uid), "login by username carries the same uid");
+    assert_eq!(login_email["uid"], json!(reg_uid), "login by email carries the same uid");
+    assert_eq!(login_user["user_id"], reg["user_id"]);
+    assert_eq!(login_email["username"], "alice");
 
     // refresh rotates
     let (status, rotated) = send(
@@ -755,6 +766,11 @@ async fn login_response_includes_profile_for_client_display() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["user_id"], Value::String(user_id), "{body}");
     assert_eq!(body["username"], "profileuser");
+    assert_eq!(
+        body["uid"],
+        reg["uid"],
+        "login profile carries the same uid the register response returned"
+    );
 }
 #[tokio::test]
 async fn register_with_bad_code_returns_dedicated_machine_code() {

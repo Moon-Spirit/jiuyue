@@ -31,7 +31,7 @@ beforeEach(() => {
   vi.stubGlobal("fetch", fetchMock);
   const auth = useAuthStore();
   auth.accessToken = "test-token";
-  auth.user = { userId: "me-1", username: "me" };
+  auth.user = { userId: "me-1", username: "me", uid: 1000007 };
 });
 
 afterEach(() => {
@@ -151,6 +151,72 @@ describe("friends store — 好友申请生命周期", () => {
     const [path, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(path).toBe("/api/friends/u2");
     expect(init.method).toBe("DELETE");
+  });
+});
+
+describe("friends store — UID / username 用户搜索", () => {
+  it("search 以 Bearer 调用 /api/users/search 并编码查询参数", async () => {
+    fetchMock.mockResolvedValue(
+      jsonResponse(200, [{ user_id: "u1", username: "alice", uid: 100001 }]),
+    );
+    const store = useFriendsStore();
+
+    const results = await store.search("alice");
+
+    expect(results).toEqual([
+      { user_id: "u1", username: "alice", uid: 100001 },
+    ]);
+    const [path, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(path).toBe("/api/users/search?q=alice");
+    expect(init.method).toBe("GET");
+    expect((init.headers as Headers).get("Authorization")).toBe(
+      "Bearer test-token",
+    );
+  });
+
+  it("searchAndAdd 命中时向第一个结果的用户名发送申请", async () => {
+    fetchMock.mockImplementation(async (path: string) => {
+      if (path.startsWith("/api/users/search")) {
+        return jsonResponse(200, [
+          { user_id: "u1", username: "alice", uid: 100001 },
+          { user_id: "u2", username: "alice_2", uid: 100002 },
+        ]);
+      }
+      return jsonResponse(201, {
+        request_id: "r1",
+        to: { user_id: "u1", username: "alice", uid: 100001 },
+      });
+    });
+    const store = useFriendsStore();
+
+    const results = await store.searchAndAdd("alice");
+
+    expect(results).toHaveLength(2);
+    expect(store.outgoing).toHaveLength(1);
+    expect(store.outgoing[0]?.to.username).toBe("alice");
+    const [searchPath, searchInit] = fetchMock.mock.calls[0] as [
+      string,
+      RequestInit,
+    ];
+    expect(searchPath).toBe("/api/users/search?q=alice");
+    expect(searchInit.method).toBe("GET");
+    const [sendPath, sendInit] = fetchMock.mock.calls[1] as [
+      string,
+      RequestInit,
+    ];
+    expect(sendPath).toBe("/api/friends/requests");
+    expect(JSON.parse(String(sendInit.body))).toEqual({ username: "alice" });
+  });
+
+  it("searchAndAdd 空结果时不发送申请，原样返回空数组", async () => {
+    fetchMock.mockResolvedValue(jsonResponse(200, []));
+    const store = useFriendsStore();
+
+    const results = await store.searchAndAdd("no_such_user");
+
+    expect(results).toEqual([]);
+    expect(store.outgoing).toHaveLength(0);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 });
 

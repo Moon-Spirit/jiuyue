@@ -17,6 +17,12 @@ const USER_KEY = "jiuyue.user";
 export interface AuthUser {
   userId: string;
   username: string;
+  /**
+   * Numeric user identifier. Required on fresh login/register responses;
+   * a pre-UID persisted profile restores as 0 (unknown) until the next
+   * successful auth round-trip refreshes it.
+   */
+  uid: number;
 }
 
 export type AuthStatus = "anon" | "authed" | "loading";
@@ -43,7 +49,10 @@ function readPersistedUser(): AuthUser | null {
       userId.length > 0 &&
       typeof username === "string"
     ) {
-      return { userId, username };
+      // Tolerate profiles persisted before UIDs existed: uid degrades to 0
+      // and gets backfilled on the next login/register round-trip.
+      const uid = typeof parsed["uid"] === "number" ? parsed["uid"] : 0;
+      return { userId, username, uid };
     }
     return null;
   } catch {
@@ -73,6 +82,7 @@ export const useAuthStore = defineStore("auth", {
         await this.adoptTokens(result.access_token, result.refresh_token, {
           userId: result.user_id,
           username: result.username,
+          uid: result.uid,
         });
       } catch (error) {
         this.status = "anon";
@@ -87,6 +97,7 @@ export const useAuthStore = defineStore("auth", {
         await this.adoptTokens(result.access_token, result.refresh_token, {
           userId: result.user_id,
           username: result.username,
+          uid: result.uid,
         });
       } catch (error) {
         this.status = "anon";

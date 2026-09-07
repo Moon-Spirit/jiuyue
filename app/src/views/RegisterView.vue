@@ -24,6 +24,8 @@ const submitting = ref(false);
 const sendingCode = ref(false);
 const errorMessage = ref("");
 const countdown = ref(0);
+/** Post-registration success screen shows the freshly-assigned UID. */
+const registeredUid = ref<number | null>(null);
 
 let countdownTimer: number | null = null;
 
@@ -129,12 +131,17 @@ async function submit(): Promise<void> {
       username: username.value,
       password: password.value,
     });
-    await router.push("/chat");
+    // Surface the new numeric UID once, prominently, before entering the app.
+    registeredUid.value = auth.user?.uid ?? null;
   } catch (error) {
     errorMessage.value = apiErrorMessage(error, (key) => t(key));
   } finally {
     submitting.value = false;
   }
+}
+
+async function continueToChat(): Promise<void> {
+  await router.push("/chat");
 }
 </script>
 
@@ -150,8 +157,30 @@ async function submit(): Promise<void> {
         {{ t("register.subtitle") }}
       </p>
 
+      <!-- Post-registration success: show the fresh UID before entering -->
+      <div
+        v-if="registeredUid !== null"
+        class="mt-4 rounded-xl border border-indigo-200 bg-indigo-50 p-4 dark:border-indigo-800 dark:bg-indigo-950/40"
+        data-testid="register-success"
+      >
+        <p
+          class="text-sm font-medium leading-relaxed text-indigo-700 dark:text-indigo-300"
+          data-testid="register-uid"
+        >
+          {{ t("register.uidIntro", { uid: registeredUid }) }}
+        </p>
+        <button
+          type="button"
+          data-testid="register-continue"
+          class="mt-3 w-full rounded-lg bg-indigo-600 px-4 py-2 text-sm font-medium text-white hover:bg-indigo-500"
+          @click="continueToChat()"
+        >
+          {{ t("register.continue") }}
+        </button>
+      </div>
+
       <p
-        v-if="errorMessage"
+        v-else-if="errorMessage"
         role="alert"
         data-testid="register-error"
         class="mt-4 rounded-lg bg-red-50 px-3 py-2 text-sm text-red-600 dark:bg-red-950/50 dark:text-red-400"
@@ -159,7 +188,11 @@ async function submit(): Promise<void> {
         {{ errorMessage }}
       </p>
 
-      <form class="mt-4 space-y-4" @submit.prevent="submit()">
+      <form
+        v-if="registeredUid === null"
+        class="mt-4 space-y-4"
+        @submit.prevent="submit()"
+      >
         <!-- Channel tabs -->
         <div
           class="grid grid-cols-2 gap-1 rounded-lg bg-neutral-100 p-1 dark:bg-neutral-800"
@@ -298,6 +331,7 @@ async function submit(): Promise<void> {
       </form>
 
       <p
+        v-if="registeredUid === null"
         class="mt-4 text-center text-sm text-neutral-500 dark:text-neutral-400"
       >
         {{ t("register.hasAccount") }}

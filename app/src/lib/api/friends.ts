@@ -7,6 +7,8 @@ type Translate = (key: string) => string;
 export interface FriendUser {
   user_id: string;
   username: string;
+  /** Numeric user identifier (QQ-style). Present on newer server responses. */
+  uid?: number;
 }
 
 /** POST /api/friends/requests → 201 { request_id, to } */
@@ -45,6 +47,8 @@ export interface AcceptFriendRequestResult {
 export interface Friend {
   user_id: string;
   username: string;
+  /** Numeric user identifier; the add-friend flow relies on it. */
+  uid?: number;
   /** RFC 3339 timestamp of when the friendship was established. */
   since: string;
 }

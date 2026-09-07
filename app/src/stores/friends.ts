@@ -13,6 +13,8 @@ import type {
   IncomingFriendRequest,
   OutgoingFriendRequest,
 } from "../lib/api/friends";
+import { searchUsers } from "../lib/api/users";
+import type { UserSearchResult } from "../lib/api/users";
 import type { FriendAccepted, FriendRequested } from "../lib/protocol/frames";
 import { ApiError } from "../lib/api/client";
 import { useAuthStore } from "./auth";
@@ -77,6 +79,28 @@ export const useFriendsStore = defineStore("friends", {
       }
     },
 
+    /**
+     * Runs the UID/username user search and returns the hit list (capped by
+     * the server at 10). Empty hits come back as `[]` — callers render the
+     * "no user found" empty state.
+     */
+    async search(query: string): Promise<UserSearchResult[]> {
+      return searchUsers(await this.token(), query);
+    },
+
+    /**
+     * Search-then-add (UID or username): runs the user search and, when it
+     * hits, sends the friend request to the first result's username. Empty
+     * results are a typed no-op (returns `[]`); callers render "not found".
+     */
+    async searchAndAdd(query: string): Promise<UserSearchResult[]> {
+      const results = await this.search(query);
+      if (results.length > 0) {
+        await this.sendRequest(results[0].username);
+      }
+      return results;
+    },
+
     /** Accepts an incoming request: friend added, request removed. */
     async accept(requestId: string): Promise<void> {
       const result = await acceptFriendRequest(await this.token(), requestId);
@@ -85,6 +109,7 @@ export const useFriendsStore = defineStore("friends", {
         this.friends.push({
           user_id: result.friend.user_id,
           username: result.friend.username,
+          uid: result.friend.uid,
           since: new Date().toISOString(),
         });
       }
@@ -132,6 +157,7 @@ export const useFriendsStore = defineStore("friends", {
         this.friends.push({
           user_id: payload.friend.user_id,
           username: payload.friend.username,
+          uid: payload.friend.uid,
           since: new Date().toISOString(),
         });
       }

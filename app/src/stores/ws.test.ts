@@ -128,7 +128,7 @@ function seededMessage(overrides: Partial<ChatMessage>): ChatMessage {
 async function connectAndOpen(): Promise<MockWebSocket> {
   const auth = useAuthStore();
   auth.accessToken = "tok";
-  auth.user = { userId: "7", username: "me" };
+  auth.user = { userId: "7", username: "me", uid: 1000007 };
   // Fresh Response per call: a Response body can only be consumed once and
   // reconnects fetch the ticket endpoint again.
   fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
@@ -855,7 +855,8 @@ describe("ws store — M2 forwarding", () => {
     // Backfill fetch resolves with the peer identity.
     fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
       const url = String(input);
-      if (url.includes("/api/auth/ws-ticket")) return jsonResponse(200, { ticket: "t1" });
+      if (url.includes("/api/auth/ws-ticket"))
+        return jsonResponse(200, { ticket: "t1" });
       if (url.includes("/api/conversations"))
         return jsonResponse(200, [
           {

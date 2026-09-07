@@ -28,6 +28,7 @@ describe("auth store", () => {
         // Login now carries the profile (server-side change, ticket 08 fix).
         user_id: "01a03367-0000-7000-8000-00000000aaaa",
         username: "alice",
+        uid: 100023,
       }),
     );
 
@@ -38,7 +39,33 @@ describe("auth store", () => {
     expect(store.status).toBe("authed");
     expect(store.user?.userId).toBe("01a03367-0000-7000-8000-00000000aaaa");
     expect(store.user?.username).toBe("alice");
+    expect(store.user?.uid).toBe(100023);
     expect(localStorage.getItem("jiuyue.refresh")).toBe("r1");
+  });
+
+  it("register stores the freshly-assigned uid in the user profile", async () => {
+    fetchMock.mockResolvedValue(
+      jsonResponse(201, {
+        access_token: "a-reg",
+        refresh_token: "r-reg",
+        expires_in: 900,
+        user_id: "01a03367-0000-7000-8000-00000000bbbb",
+        username: "newbie",
+        uid: 100456,
+      }),
+    );
+
+    const store = useAuthStore();
+    await store.register({
+      channel: "email",
+      target: "new@example.com",
+      code: "123456",
+      username: "newbie",
+      password: "password123",
+    });
+
+    expect(store.user?.uid).toBe(100456);
+    expect(localStorage.getItem("jiuyue.user")).toContain("100456");
   });
 
   it("surfaces invalid_credentials and returns to anon when login fails", async () => {
@@ -80,6 +107,28 @@ describe("auth store", () => {
     expect(store.status).toBe("authed");
   });
 
+  it("restores a pre-UID persisted profile with uid 0 (backfilled next login)", async () => {
+    // Profile written before the UID field existed — must not break boot.
+    localStorage.setItem(
+      "jiuyue.user",
+      JSON.stringify({ userId: "u-old", username: "oldbie" }),
+    );
+    localStorage.setItem("jiuyue.refresh", "old-refresh");
+    fetchMock.mockResolvedValue(
+      jsonResponse(200, {
+        access_token: "a3",
+        refresh_token: "r3",
+        expires_in: 900,
+      }),
+    );
+
+    const store = useAuthStore();
+    await store.ensureAccessToken();
+
+    expect(store.user).toEqual({ userId: "u-old", username: "oldbie", uid: 0 });
+    expect(store.status).toBe("authed");
+  });
+
   it("clears the local session when the stored refresh token is rejected", async () => {
     localStorage.setItem("jiuyue.refresh", "dead-token");
     fetchMock.mockResolvedValue(
@@ -105,7 +154,8 @@ describe("auth store", () => {
     const auth = useAuthStore();
     fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
       const url = String(input);
-      if (url.includes("/api/auth/ws-ticket")) return jsonResponse(200, { ticket: "t1" });
+      if (url.includes("/api/auth/ws-ticket"))
+        return jsonResponse(200, { ticket: "t1" });
       return jsonResponse(200, {
         access_token: "a1",
         refresh_token: "r1",
@@ -133,7 +183,10 @@ describe("auth store", () => {
       peerTypingUntil: null,
     });
     ws.messagesByConversation[1] = [];
-    localStorage.setItem("jiuyue.convos", JSON.stringify([{ conversationId: 1 }]));
+    localStorage.setItem(
+      "jiuyue.convos",
+      JSON.stringify([{ conversationId: 1 }]),
+    );
     localStorage.setItem("jiuyue.msgs.1", "[]");
     localStorage.setItem("jiuyue.e2ee.identity", "identity-bytes");
     friends.friends = [{ user_id: "p1", username: "bob", since: "2026" }];

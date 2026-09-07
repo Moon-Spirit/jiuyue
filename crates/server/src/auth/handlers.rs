@@ -58,6 +58,8 @@ pub struct RegisterRequest {
 #[derive(Debug, Serialize)]
 pub struct RegisterResponse {
     pub user_id: Uuid,
+    /// Stable numeric user id (QQ-style), allocated from `users_uid_seq`.
+    pub uid: i64,
     pub username: String,
     pub access_token: String,
     pub refresh_token: String,
@@ -85,6 +87,7 @@ pub struct LoginResponse {
     pub refresh_token: String,
     pub expires_in: i64,
     pub user_id: Uuid,
+    pub uid: i64,
     pub username: String,
 }
 
@@ -263,10 +266,18 @@ pub async fn register(
         password::hash_password(&req.password).map_err(AppError::internal)?;
 
     let mut tx = state.pool.begin().await.map_err(AppError::internal)?;
-    sqlx::query("INSERT INTO users (id, username, display_name, password_hash) VALUES ($1, $2, '', $3)")
+    // Allocate the stable numeric uid INSIDE the insert transaction. nextval
+    // is atomic, so concurrent registers can never collide; no DEFAULT on the
+    // column keeps allocation explicit and in this one place.
+    let uid: i64 = sqlx::query_scalar("SELECT nextval('users_uid_seq')")
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(AppError::internal)?;
+    sqlx::query("INSERT INTO users (id, username, display_name, password_hash, uid) VALUES ($1, $2, '', $3, $4)")
         .bind(user_id)
         .bind(&username)
         .bind(password_hash)
+        .bind(uid)
         .execute(&mut *tx)
         .await
         .map_err(classify_insert_error)?;
@@ -289,6 +300,7 @@ pub async fn register(
         StatusCode::CREATED,
         Json(RegisterResponse {
             user_id,
+            uid,
             username,
             access_token: session.access_token,
             refresh_token: session.refresh_token,
@@ -306,8 +318,8 @@ pub async fn login(
     let Json(req) = payload.map_err(bad_json)?;
     let identifier = req.identifier.trim();
 
-    let row: Option<(Uuid, String, String)> = sqlx::query_as(
-        "SELECT u.id, u.username, u.password_hash FROM users u \
+    let row: Option<(Uuid, i64, String, String)> = sqlx::query_as(
+        "SELECT u.id, u.uid, u.username, u.password_hash FROM users u \
          WHERE u.username = lower($1) \
             OR EXISTS (SELECT 1 FROM auth_identities ai \
                        WHERE ai.user_id = u.id AND lower(ai.value) = lower($1)) \
@@ -318,7 +330,7 @@ pub async fn login(
     .await
     .map_err(AppError::internal)?;
 
-    let (user_id, username, password_hash) = row.ok_or(AppError::InvalidCredentials)?;
+    let (user_id, uid, username, password_hash) = row.ok_or(AppError::InvalidCredentials)?;
     // Unknown identifier and wrong password collapse into the same 401 body.
     if !password::verify_password(&req.password, &password_hash) {
         return Err(AppError::InvalidCredentials);
@@ -330,6 +342,7 @@ pub async fn login(
         refresh_token: session.refresh_token,
         expires_in: session.expires_in,
         user_id,
+        uid,
         username,
     }))
 }

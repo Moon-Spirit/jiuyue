@@ -57,6 +57,8 @@ pub fn router() -> Router<AppState> {
 #[derive(Debug, Serialize)]
 pub struct FriendPeer {
     pub user_id: Uuid,
+    /// Stable numeric user id (QQ-style); mirrors the peer's `users.uid`.
+    pub uid: i64,
     pub username: String,
 }
 
@@ -72,14 +74,24 @@ fn rfc3339(value: OffsetDateTime) -> Result<String, AppError> {
     value.format(&Rfc3339).map_err(AppError::internal)
 }
 
-async fn username_of(state: &AppState, user_id: Uuid) -> Result<String, AppError> {
-    let username: Option<String> =
-        sqlx::query_scalar("SELECT username FROM users WHERE id = $1")
-            .bind(user_id)
-            .fetch_optional(&state.pool)
-            .await
-            .map_err(AppError::internal)?;
-    username.ok_or_else(|| AppError::internal(anyhow::anyhow!("user {user_id} vanished")))
+/// Resolves a user's `(username, uid)` — the identity block REST responses and
+/// live friend relays carry. The DB column is signed `bigint` but only ever
+/// holds non-negative values (sequence starts at 100000).
+async fn peer_identity_of(state: &AppState, user_id: Uuid) -> Result<(String, i64), AppError> {
+    let row: Option<(String, i64)> = sqlx::query_as("SELECT username, uid FROM users WHERE id = $1")
+        .bind(user_id)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(AppError::internal)?;
+    row.ok_or_else(|| AppError::internal(anyhow::anyhow!("user {user_id} vanished")))
+}
+
+/// Widens a DB uid into the protocol wire type (`u64`). Total by construction
+/// (uids come from `users_uid_seq` which starts at 100000), but surfaced as a
+/// guarded error rather than a panic.
+fn wire_uid(user_id: Uuid, uid: i64) -> Result<u64, AppError> {
+    u64::try_from(uid)
+        .map_err(|_| AppError::internal(anyhow::anyhow!("user {user_id} has an out-of-range uid {uid}")))
 }
 
 /// True when ANY friendship row already exists for the unordered pair.
@@ -122,13 +134,13 @@ pub async fn send_request(
     }
 
     // Usernames are public handles: plain 404 on miss (chat.rs convention).
-    let peer: Option<(Uuid, String)> =
-        sqlx::query_as("SELECT id, username FROM users WHERE username = $1 LIMIT 1")
+    let peer: Option<(Uuid, i64, String)> =
+        sqlx::query_as("SELECT id, uid, username FROM users WHERE username = $1 LIMIT 1")
             .bind(&username)
             .fetch_optional(&state.pool)
             .await
             .map_err(AppError::internal)?;
-    let Some((peer_id, peer_username)) = peer else {
+    let Some((peer_id, peer_uid, peer_username)) = peer else {
         return Err(AppError::PeerNotFound);
     };
     if peer_id == user.0 {
@@ -137,7 +149,7 @@ pub async fn send_request(
 
     // Needed for the live `friend.requested` relay (response carries only
     // the peer side).
-    let my_username = username_of(&state, user.0).await?;
+    let (my_username, my_uid) = peer_identity_of(&state, user.0).await?;
     let pair_key = friend_pair_key(user.0, peer_id);
 
     let mut tx = state.pool.begin().await.map_err(AppError::internal)?;
@@ -216,6 +228,7 @@ pub async fn send_request(
             from: UserIdentity {
                 user_id: user.0,
                 username: my_username,
+                uid: Some(wire_uid(user.0, my_uid)?),
             },
         }),
     );
@@ -227,6 +240,7 @@ pub async fn send_request(
             request_id,
             to: FriendPeer {
                 user_id: peer_id,
+                uid: peer_uid,
                 username: peer_username,
             },
         }),
@@ -261,10 +275,10 @@ pub async fn list_requests(
     State(state): State<AppState>,
     user: AuthUser,
 ) -> Result<Json<ListRequestsResponse>, AppError> {
-    type Row = (Uuid, Uuid, String, OffsetDateTime);
+    type Row = (Uuid, Uuid, i64, String, OffsetDateTime);
 
     let incoming_rows: Vec<Row> = sqlx::query_as(
-        "SELECT r.id, r.from_user, u.username, r.created_at \
+        "SELECT r.id, r.from_user, u.uid, u.username, r.created_at \
          FROM friend_requests r \
          JOIN users u ON u.id = r.from_user \
          WHERE r.to_user = $1 AND r.status = 'pending' \
@@ -276,7 +290,7 @@ pub async fn list_requests(
     .map_err(AppError::internal)?;
 
     let outgoing_rows: Vec<Row> = sqlx::query_as(
-        "SELECT r.id, r.to_user, u.username, r.created_at \
+        "SELECT r.id, r.to_user, u.uid, u.username, r.created_at \
          FROM friend_requests r \
          JOIN users u ON u.id = r.to_user \
          WHERE r.from_user = $1 AND r.status = 'pending' \
@@ -288,11 +302,12 @@ pub async fn list_requests(
     .map_err(AppError::internal)?;
 
     let mut incoming = Vec::with_capacity(incoming_rows.len());
-    for (request_id, peer_id, peer_username, created_at) in incoming_rows {
+    for (request_id, peer_id, peer_uid, peer_username, created_at) in incoming_rows {
         incoming.push(IncomingRequestItem {
             request_id,
             from: FriendPeer {
                 user_id: peer_id,
+                uid: peer_uid,
                 username: peer_username,
             },
             created_at: rfc3339(created_at)?,
@@ -300,11 +315,12 @@ pub async fn list_requests(
     }
 
     let mut outgoing = Vec::with_capacity(outgoing_rows.len());
-    for (request_id, peer_id, peer_username, created_at) in outgoing_rows {
+    for (request_id, peer_id, peer_uid, peer_username, created_at) in outgoing_rows {
         outgoing.push(OutgoingRequestItem {
             request_id,
             to: FriendPeer {
                 user_id: peer_id,
+                uid: peer_uid,
                 username: peer_username,
             },
             created_at: rfc3339(created_at)?,
@@ -388,8 +404,8 @@ pub async fn accept_request(
 
     // Response names the ORIGINAL SENDER (the person just befriended); the
     // wire frame tells the sender WHO accepted.
-    let sender_username = username_of(&state, from_user).await?;
-    let my_username = username_of(&state, user.0).await?;
+    let (sender_username, sender_uid) = peer_identity_of(&state, from_user).await?;
+    let (my_username, my_uid) = peer_identity_of(&state, user.0).await?;
 
     crate::ws::relay_friend_payload(
         &state,
@@ -398,6 +414,7 @@ pub async fn accept_request(
             friend: UserIdentity {
                 user_id: user.0,
                 username: my_username,
+                uid: Some(wire_uid(user.0, my_uid)?),
             },
         }),
     );
@@ -406,6 +423,7 @@ pub async fn accept_request(
     Ok(Json(AcceptFriendRequestResponse {
         friend: FriendPeer {
             user_id: from_user,
+            uid: sender_uid,
             username: sender_username,
         },
     }))
@@ -498,6 +516,8 @@ pub async fn cancel_request(
 #[derive(Debug, Serialize)]
 pub struct FriendListItem {
     pub user_id: Uuid,
+    /// Stable numeric user id (QQ-style); mirrors the friend's `users.uid`.
+    pub uid: i64,
     pub username: String,
     pub since: String,
 }
@@ -506,9 +526,9 @@ pub async fn list_friends(
     State(state): State<AppState>,
     user: AuthUser,
 ) -> Result<Json<Vec<FriendListItem>>, AppError> {
-    type Row = (Uuid, String, OffsetDateTime);
+    type Row = (Uuid, i64, String, OffsetDateTime);
     let rows: Vec<Row> = sqlx::query_as(
-        "SELECT f.friend_id, u.username, f.since \
+        "SELECT f.friend_id, u.uid, u.username, f.since \
          FROM friendships f \
          JOIN users u ON u.id = f.friend_id \
          WHERE f.user_id = $1 \
@@ -520,9 +540,10 @@ pub async fn list_friends(
     .map_err(AppError::internal)?;
 
     let mut items = Vec::with_capacity(rows.len());
-    for (user_id, username, since) in rows {
+    for (user_id, uid, username, since) in rows {
         items.push(FriendListItem {
             user_id,
+            uid,
             username,
             since: rfc3339(since)?,
         });

@@ -86,6 +86,8 @@ export interface Conversation {
   conversationId: number;
   peerUserId: string;
   peerUsername: string;
+  /** Numeric peer UID when known (enriched from listings / creation). */
+  peerUid?: number;
   lastMessagePreview: string | null;
   lastActivityAt: string;
   unread: number;
@@ -191,6 +193,7 @@ function loadPersistedConversations(): Conversation[] {
       peerTypingUntil:
         typeof c["peerTypingUntil"] === "number" ? c["peerTypingUntil"] : null,
       kind: c["kind"] === "secret" ? "secret" : "direct",
+      peerUid: typeof c["peerUid"] === "number" ? c["peerUid"] : undefined,
     }));
   } catch {
     // Corrupted cache degrades to an empty list; sync will repopulate.
@@ -514,7 +517,14 @@ export const useWsStore = defineStore("ws", {
           ) {
             existing.peerUserId = item.peer.user_id;
             existing.peerUsername = item.peer.username;
+            existing.peerUid = item.peer.uid;
             existing.kind = item.kind === "secret" ? "secret" : existing.kind;
+          } else if (
+            item.peer !== null &&
+            item.peer.uid !== undefined &&
+            existing.peerUid !== item.peer.uid
+          ) {
+            existing.peerUid = item.peer.uid;
           }
           continue;
         }
@@ -534,6 +544,7 @@ export const useWsStore = defineStore("ws", {
           maxSeq: 0,
           peerTypingUntil: null,
           kind: item.kind === "secret" ? "secret" : "direct",
+          peerUid: item.peer?.uid,
         });
       }
     },
@@ -1344,11 +1355,13 @@ export const useWsStore = defineStore("ws", {
           maxSeq: 0,
           peerTypingUntil: null,
           kind: result.kind === "secret" ? "secret" : "direct",
+          peerUid: result.peer.uid,
         };
         this.conversations.push(conversation);
       } else {
         conversation.peerUserId = result.peer.user_id;
         conversation.peerUsername = result.peer.username;
+        conversation.peerUid = result.peer.uid;
         if (kind === "secret") conversation.kind = "secret";
       }
       this.persistConversations();

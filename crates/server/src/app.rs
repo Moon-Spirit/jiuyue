@@ -2,7 +2,7 @@
 //! drive it with `tower::ServiceExt::oneshot` (HTTP) or a real listener (WS).
 
 use crate::state::AppState;
-use crate::{auth, chat, e2ee, friends, push, ws};
+use crate::{auth, chat, e2ee, friends, push, users, ws};
 use axum::routing::get;
 use axum::Router;
 
@@ -18,6 +18,7 @@ pub fn build_router(state: AppState) -> Router {
         .nest("/api/auth", auth::router())
         .nest("/api/e2ee", e2ee::router())
         .nest("/api/friends", friends::router())
+        .nest("/api/users", users::router())
         .route(
             "/api/conversations",
             get(chat::list_conversations).post(chat::create_direct),

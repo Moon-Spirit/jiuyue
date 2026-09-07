@@ -141,7 +141,7 @@ describe("ws store — M3 secret conversations", () => {
 
     const auth = useAuthStore();
     auth.accessToken = "tok";
-    auth.user = { userId: "7", username: "me" };
+    auth.user = { userId: "7", username: "me", uid: 1000007 };
     const store = useWsStore();
     await store.connect();
     const sock = lastSocket();
@@ -205,7 +205,7 @@ describe("ws store — M3 secret conversations", () => {
 
     const auth = useAuthStore();
     auth.accessToken = "tok";
-    auth.user = { userId: "7", username: "me" };
+    auth.user = { userId: "7", username: "me", uid: 1000007 };
     const store = useWsStore();
     await store.connect();
     const sock = lastSocket();
@@ -263,7 +263,7 @@ describe("ws store — M3 secret conversations", () => {
 
     const auth = useAuthStore();
     auth.accessToken = "tok";
-    auth.user = { userId: "7", username: "me" };
+    auth.user = { userId: "7", username: "me", uid: 1000007 };
     fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
       const url = String(input);
       if (url.includes("/api/auth/ws-ticket"))

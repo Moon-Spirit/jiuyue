@@ -93,7 +93,7 @@ describe("ChatView — sessions pane", () => {
   it("lists conversations by recent activity with preview, relative time and unread badge", async () => {
     const pinia = createPinia();
     setActivePinia(pinia);
-    useAuthStore().user = { userId: "7", username: "me" };
+    useAuthStore().user = { userId: "7", username: "me", uid: 1000007 };
     const ws = useWsStore();
     ws.conversations.push(
       conversation(1, {
@@ -154,7 +154,7 @@ describe("ChatView — message thread", () => {
   }> {
     const pinia = createPinia();
     setActivePinia(pinia);
-    useAuthStore().user = { userId: "7", username: "me" };
+    useAuthStore().user = { userId: "7", username: "me", uid: 1000007 };
     const ws = useWsStore();
     ws.conversations.push(conversation(1, { peerUsername: "alice" }));
     ws.messagesByConversation[1] = [
@@ -260,7 +260,7 @@ describe("ChatView — unread and composer", () => {
   }> {
     const pinia = createPinia();
     setActivePinia(pinia);
-    useAuthStore().user = { userId: "7", username: "me" };
+    useAuthStore().user = { userId: "7", username: "me", uid: 1000007 };
     const ws = useWsStore();
     ws.conversations.push(
       conversation(2, {
@@ -376,7 +376,7 @@ describe("ChatView — unread and composer", () => {
     }> {
       const pinia = createPinia();
       setActivePinia(pinia);
-      useAuthStore().user = { userId: "7", username: "me" };
+      useAuthStore().user = { userId: "7", username: "me", uid: 1000007 };
       const ws = useWsStore();
       ws.conversations.push(
         conversation(1, { peerUsername: "alice" }),
@@ -532,7 +532,7 @@ describe("ChatView — unread and composer", () => {
     it("renders the reply quote inside bubbles from server metadata", async () => {
       const pinia = createPinia();
       setActivePinia(pinia);
-      useAuthStore().user = { userId: "7", username: "me" };
+      useAuthStore().user = { userId: "7", username: "me", uid: 1000007 };
       const ws = useWsStore();
       ws.conversations.push(conversation(1, { peerUsername: "alice" }));
       ws.messagesByConversation[1] = [

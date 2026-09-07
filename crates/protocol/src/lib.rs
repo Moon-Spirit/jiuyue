@@ -22,8 +22,8 @@
 //! | `typing`           | C ⇄ S     | `{ conversation_id, state: "start"\|"stop", user_id? }` — `user_id` present only on the server relay   |
 //! | `msg.recall`       | C → S     | `{ conversation_id, message_id }`                                                                    |
 //! | `msg.recalled`     | S → C     | `{ conversation_id, message_id }`                                                                    |
-//! | `friend.requested` | S → C     | `{ request_id, from: { user_id, username } }`                                                        |
-//! | `friend.accepted`  | S → C     | `{ friend: { user_id, username } }`                                                                  |
+//! | `friend.requested` | S → C     | `{ request_id, from: { user_id, username, uid? } }`                                                              |
+//! | `friend.accepted`  | S → C     | `{ friend: { user_id, username, uid? } }`                                                                  |
 //! | `error`            | S → C     | `{ code, message, retryable }`                                                                       |
 //!
 //! Optional `msg.*` metadata fields are null-absent: when absent they are
@@ -233,9 +233,17 @@ pub struct MsgRecalled {
 }
 
 /// Minimal user identity block carried inside friend-system frames.
+///
+/// `uid` is the stable numeric user id (QQ-style). It is `Option<u64>` and
+/// null-absent so frames written by OLD servers (pre-UID) stay decodable by
+/// NEW clients and vice versa: absent `uid` defaults to `None`, and a `None`
+/// value is omitted from the wire entirely — old fixtures and byte streams
+/// keep parsing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UserIdentity {
     pub user_id: Uuid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uid: Option<u64>,
     pub username: String,
 }
 

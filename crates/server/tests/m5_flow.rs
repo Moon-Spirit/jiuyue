@@ -198,6 +198,15 @@ async fn register_user(t: &TestApp, email: &str, username: &str) -> (Uuid, Strin
     (user_id, access)
 }
 
+/// Reads a user's stable numeric uid straight from the DB (test shortcut).
+async fn uid_of(t: &TestApp, user_id: Uuid) -> i64 {
+    sqlx::query_scalar("SELECT uid FROM users WHERE id = $1")
+        .bind(user_id)
+        .fetch_one(&t._pool)
+        .await
+        .expect("uid of registered user")
+}
+
 /// Sends `POST /api/friends/requests` and returns `(request_id, status, body)`.
 async fn send_friend_request(
     t: &TestApp,
@@ -271,6 +280,7 @@ async fn friend_lifecycle_send_accept_list_unfriend() {
 
     let (a_id, a_access) = register_user(&t, "fr-alice@example.com", "fralice").await;
     let (b_id, b_access) = register_user(&t, "fr-bob@example.com", "frbob").await;
+    let (a_uid, b_uid) = (uid_of(&t, a_id).await, uid_of(&t, b_id).await);
 
     // A sends a request to B.
     let (request_id, status, body) = send_friend_request(&t, &a_access, "frbob").await;
@@ -281,6 +291,7 @@ async fn friend_lifecycle_send_accept_list_unfriend() {
         b_id.to_string(),
         "response names the resolved peer"
     );
+    assert_eq!(body["to"]["uid"], json!(b_uid), "response carries the peer's uid");
     assert_eq!(body["to"]["username"], json!("frbob"));
 
     // B's inbox shows exactly one incoming request from A.
@@ -296,6 +307,7 @@ async fn friend_lifecycle_send_accept_list_unfriend() {
         incoming[0]["from"]["user_id"].as_str().expect("from.user_id"),
         a_id.to_string()
     );
+    assert_eq!(incoming[0]["from"]["uid"], json!(a_uid), "inbox from carries uid");
     assert_eq!(incoming[0]["from"]["username"], json!("fralice"));
     assert!(incoming[0]["created_at"].is_string(), "RFC3339 created_at");
     assert!(
@@ -316,6 +328,7 @@ async fn friend_lifecycle_send_accept_list_unfriend() {
         outgoing[0]["to"]["user_id"].as_str().expect("to.user_id"),
         b_id.to_string()
     );
+    assert_eq!(outgoing[0]["to"]["uid"], json!(b_uid), "outbox to carries uid");
 
     // B accepts → response names A (the person just befriended).
     let (status, body) = send_http(
@@ -331,18 +344,20 @@ async fn friend_lifecycle_send_accept_list_unfriend() {
         body["friend"]["user_id"].as_str().expect("friend.user_id"),
         a_id.to_string()
     );
+    assert_eq!(body["friend"]["uid"], json!(a_uid), "accept friend carries uid");
     assert_eq!(body["friend"]["username"], json!("fralice"));
 
     // Both friend lists show the symmetric edge.
-    for (access, peer_id, peer_username) in [
-        (&a_access, b_id, "frbob"),
-        (&b_access, a_id, "fralice"),
+    for (access, peer_id, peer_uid, peer_username) in [
+        (&a_access, b_id, b_uid, "frbob"),
+        (&b_access, a_id, a_uid, "fralice"),
     ] {
         let (status, body) = send_http(&t.app, "GET", "/api/friends", Some(access), None).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         let friends = body.as_array().expect("friend list array");
         assert_eq!(friends.len(), 1, "{body}");
         assert_eq!(friends[0]["user_id"].as_str().expect("user_id"), peer_id.to_string());
+        assert_eq!(friends[0]["uid"], json!(peer_uid), "friend list item carries uid");
         assert_eq!(friends[0]["username"], json!(peer_username));
         assert!(friends[0]["since"].is_string(), "RFC3339 since");
     }
@@ -608,6 +623,9 @@ async fn friend_wire_frames_reach_live_sockets_only() {
     let (a_id, a_access) = register_user(&t, "wire-alice@example.com", "wirealice").await;
     let (b_id, b_access) = register_user(&t, "wire-bob@example.com", "wirebob").await;
 
+    // The relay payloads must carry each user's stable numeric uid.
+    let (a_uid, b_uid) = (uid_of(&t, a_id).await, uid_of(&t, b_id).await);
+
     let mut ws_a = ws_connect(&t, &a_access).await;
     let mut ws_b = ws_connect(&t, &b_access).await;
 
@@ -618,11 +636,12 @@ async fn friend_wire_frames_reach_live_sockets_only() {
     match ws_next_frame(&mut ws_b).await.payload {
         Payload::FriendRequested(FriendRequested {
             request_id,
-            from: UserIdentity { user_id, username },
+            from: UserIdentity { user_id, uid, username },
         }) => {
             assert_eq!(request_id, rid);
             assert_eq!(user_id, a_id, "relay stamps the authenticated sender");
             assert_eq!(username, "wirealice");
+            assert_eq!(uid, Some(a_uid as u64), "relay carries the sender's stable numeric uid");
         }
         other => panic!("expected friend.requested on recipient socket, got {other:?}"),
     }
@@ -639,10 +658,11 @@ async fn friend_wire_frames_reach_live_sockets_only() {
     assert_eq!(status, StatusCode::OK, "{body}");
     match ws_next_frame(&mut ws_a).await.payload {
         Payload::FriendAccepted(FriendAccepted {
-            friend: UserIdentity { user_id, username },
+            friend: UserIdentity { user_id, uid, username },
         }) => {
             assert_eq!(user_id, b_id, "the frame names WHO accepted");
             assert_eq!(username, "wirebob");
+            assert_eq!(uid, Some(b_uid as u64), "relay carries the accepter's stable numeric uid");
         }
         other => panic!("expected friend.accepted on sender socket, got {other:?}"),
     }
@@ -652,4 +672,229 @@ async fn friend_wire_frames_reach_live_sockets_only() {
     assert!(extra_a.is_none(), "sender socket must stay silent, got {extra_a:?}");
     let extra_b = ws_next_text(&mut ws_b, SILENCE_PROBE).await;
     assert!(extra_b.is_none(), "recipient socket must stay silent, got {extra_b:?}");
+}
+
+// ---------------------------------------------------------------------------
+// User directory: GET /api/users/search?q=<query>
+// ---------------------------------------------------------------------------
+
+/// Registers a user and returns `(id, access, uid)` (uid read from the DB).
+async fn register_full(t: &TestApp, email: &str, username: &str) -> (Uuid, String, i64) {
+    let (user_id, access) = register_user(t, email, username).await;
+    let uid = uid_of(t, user_id).await;
+    (user_id, access, uid)
+}
+
+#[tokio::test]
+async fn user_search_finds_by_exact_uid_and_uid_prefix() {
+    let _guard = GATE.lock().await;
+    let t = test_app().await;
+
+    // Sequential registration ⇒ deterministic uids (100000, 100001, 100002)
+    // because each test TRUNCATEs users RESTART IDENTITY, which also resets
+    // the OWNED-BY users_uid_seq back to its 100000 start.
+    let (_me_id, _me_access, my_uid) = register_full(&t, "srch-me@example.com", "srchme").await;
+    let (_a_id, a_access, a_uid) = register_full(&t, "srch-a@example.com", "srcha").await;
+    let (b_id, _b_access, b_uid) = register_full(&t, "srch-b@example.com", "srchb").await;
+    assert_eq!((my_uid, a_uid, b_uid), (100_000, 100_001, 100_002));
+
+    // Exact uid hit returns that single user.
+    let (status, body) = send_http(
+        &t.app,
+        "GET",
+        &format!("/api/users/search?q={b_uid}"),
+        Some(&a_access),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let hits = body.as_array().expect("array body");
+    assert_eq!(hits.len(), 1, "{body}");
+    assert_eq!(hits[0]["user_id"], json!(b_id.to_string()));
+    assert_eq!(hits[0]["uid"], json!(b_uid));
+    assert_eq!(hits[0]["username"], "srchb");
+
+    // Prefix search from A (uid 100001, excluded as self): "10000" exact-matches
+    // ME (uid 100000) — rank 0 — and prefix-matches B (100002) — rank 1. The
+    // exact uid must rank first and A's own uid must be absent.
+    let (status, body) = send_http(
+        &t.app,
+        "GET",
+        "/api/users/search?q=10000",
+        Some(&a_access),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let hits = body.as_array().expect("array body");
+    assert_eq!(hits.len(), 2, "exact match + prefix match, self excluded: {body}");
+    assert_eq!(hits[0]["uid"], json!(my_uid), "exact uid ranks first");
+    assert_eq!(hits[0]["username"], "srchme");
+    assert_eq!(hits[1]["uid"], json!(b_uid), "then prefix matches by uid order");
+    assert_eq!(hits[1]["username"], "srchb");
+    assert!(
+        hits.iter().all(|h| h["user_id"].as_str().is_some()),
+        "every hit carries user_id"
+    );
+
+    // Searching your own uid yields nothing (self always excluded).
+    let (status, body) = send_http(
+        &t.app,
+        "GET",
+        &format!("/api/users/search?q={a_uid}"),
+        Some(&a_access),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body.as_array().expect("array body").len(), 0, "{body}");
+}
+
+#[tokio::test]
+async fn user_search_finds_by_username_exact_and_prefix() {
+    let _guard = GATE.lock().await;
+    let t = test_app().await;
+
+    let (_me_id, me_access, _) = register_full(&t, "usr-me@example.com", "usrme").await;
+    let (a_id, _a_access, a_uid) = register_full(&t, "usr-a@example.com", "usrone").await;
+    let (_b_id, _b_access, b_uid) = register_full(&t, "usr-b@example.com", "usrtwo").await;
+
+    // Exact username match is the only hit.
+    let (status, body) = send_http(
+        &t.app,
+        "GET",
+        "/api/users/search?q=usrone",
+        Some(&me_access),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let hits = body.as_array().expect("array body");
+    assert_eq!(hits.len(), 1, "{body}");
+    assert_eq!(hits[0]["user_id"], json!(a_id.to_string()));
+    assert_eq!(hits[0]["uid"], json!(a_uid));
+    assert_eq!(hits[0]["username"], "usrone");
+
+    // Prefix "usr" matches usrone + usrtwo (but NOT usrme — self excluded).
+    let (status, body) = send_http(
+        &t.app,
+        "GET",
+        "/api/users/search?q=usr",
+        Some(&me_access),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let hits = body.as_array().expect("array body");
+    assert_eq!(hits.len(), 2, "self must be excluded: {body}");
+    let names: Vec<&str> = hits
+        .iter()
+        .map(|h| h["username"].as_str().expect("username"))
+        .collect();
+    assert_eq!(names, vec!["usrone", "usrtwo"]); // exact-first then uid order
+    assert_eq!(hits[1]["uid"], json!(b_uid));
+}
+
+#[tokio::test]
+async fn user_search_disambiguates_numeric_usernames_from_uids() {
+    let _guard = GATE.lock().await;
+    let t = test_app().await;
+
+    // "12345" is a legal username AND would be a plausible uid prefix. The
+    // numeric branch must match by uid-exact / uid-prefix AND by a username
+    // literally equal to the digits — never merely by username prefix.
+    let (_me_id, me_access, _my_uid) = register_full(&t, "num-me@example.com", "12345").await;
+    let (other_id, _other_access, other_uid) =
+        register_full(&t, "num-other@example.com", "numother").await;
+    assert_eq!(other_uid, 100_001);
+
+    // Searching the digits "1234" (a prefix of the caller's own numeric
+    // username, but of nobody's uid here) returns nothing: username PREFIX
+    // matches never fire on the numeric branch — only equality does.
+    let (status, body) = send_http(
+        &t.app,
+        "GET",
+        "/api/users/search?q=1234",
+        Some(&me_access),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body.as_array().expect("array body").len(), 0, "{body}");
+
+    // The peer's uid ("100001") finds only the peer — never the caller whose
+    // numeric username differs from it.
+    let (status, body) = send_http(
+        &t.app,
+        "GET",
+        "/api/users/search?q=100001",
+        Some(&me_access),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let hits = body.as_array().expect("array body");
+    assert_eq!(hits.len(), 1, "{body}");
+    assert_eq!(hits[0]["user_id"], json!(other_id.to_string()));
+    assert_eq!(hits[0]["username"], "numother");
+
+    // Searching the caller's own uid returns nothing (self excluded).
+    let (status, body) = send_http(
+        &t.app,
+        "GET",
+        "/api/users/search?q=100000",
+        Some(&me_access),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body.as_array().expect("array body").len(), 0, "self uid must be excluded");
+}
+
+#[tokio::test]
+async fn user_search_bearer_required_and_empty_q_is_422() {
+    let _guard = GATE.lock().await;
+    let t = test_app().await;
+
+    let (_me_id, me_access, _my_uid) = register_full(&t, "gate-me@example.com", "gateme").await;
+
+    // Bearer required: anonymous gets the standard 401.
+    let (status, body) = send_http(&t.app, "GET", "/api/users/search?q=gate", None, None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+
+    // Whitespace-only q → 422 validation_error.
+    let (status, body) = send_http(
+        &t.app,
+        "GET",
+        "/api/users/search?q=%20%20",
+        Some(&me_access),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(error_code(&body), "validation_error");
+
+    // Missing q entirely → 422 validation_error.
+    let (status, body) = send_http(
+        &t.app,
+        "GET",
+        "/api/users/search",
+        Some(&me_access),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(error_code(&body), "validation_error");
+
+    // Unknown query → 200 [] (never 404).
+    let (status, body) = send_http(
+        &t.app,
+        "GET",
+        "/api/users/search?q=nosuchuser",
+        Some(&me_access),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body.as_array().expect("array body").len(), 0, "{body}");
 }

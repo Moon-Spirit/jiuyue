@@ -77,7 +77,7 @@ beforeEach(() => {
   });
   const auth = useAuthStore();
   auth.accessToken = "test-token";
-  auth.user = { userId: "me-1", username: "me" };
+  auth.user = { userId: "me-1", username: "me", uid: 1000007 };
 });
 
 afterEach(() => {

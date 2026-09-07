@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, ref } from "vue";
+import { onMounted, onUnmounted, ref } from "vue";
 import { useI18n } from "vue-i18n";
 import { useRoute, useRouter } from "vue-router";
 import AppShell from "../components/layout/AppShell.vue";
@@ -7,9 +7,12 @@ import LanguageToggle from "../components/LanguageToggle.vue";
 import ThemeToggle from "../components/ThemeToggle.vue";
 import { friendApiErrorMessage } from "../lib/api/friends";
 import type { Friend, IncomingFriendRequest } from "../lib/api/friends";
+import type { UserSearchResult } from "../lib/api/users";
 import { useAuthStore } from "../stores/auth";
 import { useFriendsStore } from "../stores/friends";
 import { useWsStore } from "../stores/ws";
+
+const SEARCH_DEBOUNCE_MS = 400;
 
 const { t } = useI18n();
 const route = useRoute();
@@ -18,9 +21,14 @@ const auth = useAuthStore();
 const ws = useWsStore();
 const friends = useFriendsStore();
 
-const newFriendUsername = ref("");
-const sendingRequest = ref(false);
-const requestError = ref("");
+const searchQuery = ref("");
+const searching = ref(false);
+const searchError = ref("");
+/** Whether the last search ran (distinguishes "untouched" from "no hits"). */
+const searchDone = ref(false);
+const searchResults = ref<UserSearchResult[]>([]);
+/** uid of the result whose 添加 request is in flight. */
+const sendingUid = ref<number | null>(null);
 /** Incoming request currently being accepted/declined (disables its row). */
 const busyRequestId = ref<string | null>(null);
 /**
@@ -31,6 +39,8 @@ const pendingUnfriendId = ref<string | null>(null);
 /** Username whose 发消息 navigation is in flight. */
 const messagingUsername = ref<string | null>(null);
 
+let searchTimer: number | null = null;
+
 onMounted(() => {
   // Same pattern as ChatView: guards make this auth-only; connecting here
   // keeps friend badges live even when the user lands directly on /contacts.
@@ -40,6 +50,10 @@ onMounted(() => {
   }
 });
 
+onUnmounted(() => {
+  if (searchTimer !== null) window.clearTimeout(searchTimer);
+});
+
 async function logout(): Promise<void> {
   ws.dispose();
   auth.logout();
@@ -47,21 +61,79 @@ async function logout(): Promise<void> {
 }
 
 // ---------------------------------------------------------------------
-// Add friend
+// Search by UID / username → result card → send request
 // ---------------------------------------------------------------------
 
-async function submitFriendRequest(): Promise<void> {
-  const username = newFriendUsername.value.trim();
-  if (username.length === 0 || sendingRequest.value) return;
-  sendingRequest.value = true;
-  requestError.value = "";
+function initialOf(username: string): string {
+  const first = username.trim().charAt(0);
+  return first.length === 0 ? "?" : first.toUpperCase();
+}
+
+function cancelPendingSearch(): void {
+  if (searchTimer !== null) {
+    window.clearTimeout(searchTimer);
+    searchTimer = null;
+  }
+}
+
+function onSearchInput(): void {
+  // Debounced search: typing settles before a request goes out.
+  cancelPendingSearch();
+  searchTimer = window.setTimeout(() => {
+    searchTimer = null;
+    void runSearch();
+  }, SEARCH_DEBOUNCE_MS);
+}
+
+async function runSearch(): Promise<void> {
+  cancelPendingSearch();
+  const query = searchQuery.value.trim();
+  if (query.length === 0) {
+    searchResults.value = [];
+    searchDone.value = false;
+    searchError.value = "";
+    return;
+  }
+  if (searching.value) return;
+  searching.value = true;
+  searchError.value = "";
   try {
-    await friends.sendRequest(username);
-    newFriendUsername.value = "";
+    searchResults.value = await friends.search(query);
+    searchDone.value = true;
   } catch (error) {
-    requestError.value = friendApiErrorMessage(error, (key) => t(key));
+    searchResults.value = [];
+    searchDone.value = true;
+    searchError.value = friendApiErrorMessage(error, (key) => t(key));
   } finally {
-    sendingRequest.value = false;
+    searching.value = false;
+  }
+}
+
+/** Search hit already an established friend → row renders 已添加. */
+function isFriendResult(user: UserSearchResult): boolean {
+  return friends.friends.some(
+    (f) => f.user_id === user.user_id || f.uid === user.uid,
+  );
+}
+
+/** Search hit with an outgoing request already pending → row renders 已发送. */
+function isPendingResult(user: UserSearchResult): boolean {
+  return friends.outgoing.some(
+    (r) => r.to.user_id === user.user_id || r.to.username === user.username,
+  );
+}
+
+async function sendRequestTo(user: UserSearchResult): Promise<void> {
+  if (sendingUid.value !== null) return;
+  sendingUid.value = user.uid;
+  searchError.value = "";
+  try {
+    // username-add remains the wire contract; UID search only locates the user.
+    await friends.sendRequest(user.username);
+  } catch (error) {
+    searchError.value = friendApiErrorMessage(error, (key) => t(key));
+  } finally {
+    sendingUid.value = null;
   }
 }
 
@@ -93,11 +165,6 @@ async function declineRequest(request: IncomingFriendRequest): Promise<void> {
 // Friend list actions
 // ---------------------------------------------------------------------
 
-function initialOf(username: string): string {
-  const first = username.trim().charAt(0);
-  return first.length === 0 ? "?" : first.toUpperCase();
-}
-
 /**
  * 发消息: create/open a direct conversation with the friend through the ws
  * store (which also selects it as the active conversation), then jump to
@@ -110,7 +177,7 @@ async function messageFriend(friend: Friend): Promise<void> {
     await ws.createOrOpenConversation(friend.username);
     await router.push("/chat");
   } catch (error) {
-    requestError.value = friendApiErrorMessage(error, (key) => t(key));
+    searchError.value = friendApiErrorMessage(error, (key) => t(key));
   } finally {
     messagingUsername.value = null;
   }
@@ -194,38 +261,104 @@ async function confirmUnfriend(friend: Friend): Promise<void> {
           {{ t("contacts.title") }}
         </h2>
 
-        <!-- Add friend row -->
-        <form
-          class="flex items-center gap-2 pb-2"
-          @submit.prevent="submitFriendRequest()"
-        >
-          <input
-            v-model="newFriendUsername"
-            type="text"
-            data-testid="add-friend-input"
-            :placeholder="t('contacts.addPlaceholder')"
-            class="min-w-0 flex-1 rounded-lg border border-neutral-300 bg-transparent px-2 py-1.5 text-sm outline-none focus:border-indigo-500 dark:border-neutral-700"
-          />
-          <button
-            type="submit"
-            data-testid="add-friend-submit"
-            :disabled="sendingRequest || newFriendUsername.trim().length === 0"
-            class="shrink-0 rounded-lg bg-indigo-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-indigo-500 disabled:cursor-not-allowed disabled:opacity-50"
+        <!-- Search by UID or username -->
+        <div class="pb-2">
+          <div class="relative">
+            <input
+              v-model="searchQuery"
+              type="search"
+              data-testid="user-search-input"
+              :placeholder="t('contacts.searchPlaceholder')"
+              class="w-full rounded-lg border border-neutral-300 bg-transparent px-2 py-1.5 pr-8 text-sm outline-none focus:border-indigo-500 dark:border-neutral-700"
+              @input="onSearchInput()"
+              @keydown.enter.prevent="runSearch()"
+            />
+            <span
+              v-if="searching"
+              class="absolute right-2 top-1/2 -translate-y-1/2 animate-pulse text-xs text-neutral-400"
+              data-testid="user-search-spinner"
+              >…</span
+            >
+          </div>
+          <p
+            v-if="searchError.length > 0"
+            class="px-1 pt-2 text-xs text-red-500"
+            data-testid="search-error"
           >
-            {{
-              sendingRequest
-                ? t("contacts.addSubmitting")
-                : t("contacts.addSubmit")
-            }}
-          </button>
-        </form>
-        <p
-          v-if="requestError.length > 0"
-          class="px-1 pb-2 text-xs text-red-500"
-          data-testid="add-friend-error"
-        >
-          {{ requestError }}
-        </p>
+            {{ searchError }}
+          </p>
+
+          <!-- Search result cards -->
+          <div
+            v-if="searchDone && searchQuery.trim().length > 0"
+            class="pt-1"
+            data-testid="search-results"
+          >
+            <p
+              v-if="searchResults.length === 0"
+              class="px-1 py-2 text-xs text-neutral-400 dark:text-neutral-500"
+              data-testid="search-empty"
+            >
+              {{ t("contacts.searchEmpty") }}
+            </p>
+            <ul v-else class="space-y-1">
+              <li
+                v-for="user in searchResults"
+                :key="user.user_id"
+                data-testid="search-result-item"
+                :data-user-id="user.user_id"
+                class="flex items-center gap-2 rounded-lg p-2 hover:bg-neutral-100 dark:hover:bg-neutral-800"
+              >
+                <span
+                  class="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-indigo-100 text-xs font-semibold text-indigo-700 dark:bg-indigo-900 dark:text-indigo-200"
+                  data-testid="search-result-avatar"
+                >
+                  {{ initialOf(user.username) }}
+                </span>
+                <span class="min-w-0 flex-1">
+                  <span
+                    class="block truncate text-sm font-medium"
+                    data-testid="search-result-name"
+                    >{{ user.username }}</span
+                  >
+                  <span
+                    class="block font-mono text-[11px] text-neutral-400 dark:text-neutral-500"
+                    data-testid="search-result-uid"
+                    >{{ t("contacts.uidLabel") }}: {{ user.uid }}</span
+                  >
+                </span>
+                <button
+                  v-if="isFriendResult(user)"
+                  type="button"
+                  disabled
+                  data-testid="search-result-already-friend"
+                  class="shrink-0 cursor-not-allowed rounded-lg bg-neutral-200 px-2 py-1 text-[11px] font-medium text-neutral-500 dark:bg-neutral-800 dark:text-neutral-400"
+                >
+                  {{ t("contacts.alreadyFriend") }}
+                </button>
+                <button
+                  v-else-if="isPendingResult(user)"
+                  type="button"
+                  disabled
+                  data-testid="search-result-sent"
+                  class="shrink-0 cursor-not-allowed rounded-lg bg-neutral-200 px-2 py-1 text-[11px] font-medium text-neutral-500 dark:bg-neutral-800 dark:text-neutral-400"
+                >
+                  {{ t("contacts.requestSent") }}
+                </button>
+                <button
+                  v-else
+                  type="button"
+                  data-testid="search-result-add"
+                  :disabled="sendingUid !== null"
+                  class="shrink-0 rounded-lg bg-indigo-600 px-2 py-1 text-[11px] font-medium text-white hover:bg-indigo-500 disabled:cursor-not-allowed disabled:opacity-50"
+                  @click="sendRequestTo(user)"
+                >
+                  {{ t("contacts.addFriend") }}
+                </button>
+              </li>
+            </ul>
+          </div>
+        </div>
 
         <!-- Incoming friend requests -->
         <div v-if="friends.incoming.length > 0" class="pb-2">
@@ -295,11 +428,18 @@ async function confirmUnfriend(friend: Friend): Promise<void> {
             >
               {{ initialOf(friend.username) }}
             </span>
-            <span
-              class="min-w-0 flex-1 truncate text-sm font-medium"
-              data-testid="friend-name"
-            >
-              {{ friend.username }}
+            <span class="min-w-0 flex-1">
+              <span
+                class="block truncate text-sm font-medium"
+                data-testid="friend-name"
+                >{{ friend.username }}</span
+              >
+              <span
+                v-if="typeof friend.uid === 'number' && friend.uid > 0"
+                class="block font-mono text-[11px] text-neutral-400 dark:text-neutral-500"
+                data-testid="friend-uid"
+                >{{ t("contacts.uidLabel") }}: {{ friend.uid }}</span
+              >
             </span>
             <span class="flex shrink-0 items-center gap-1">
               <button
@@ -333,7 +473,7 @@ async function confirmUnfriend(friend: Friend): Promise<void> {
           </li>
         </ul>
         <p
-          v-else
+          v-else-if="friends.loaded"
           class="px-1 pt-2 text-xs text-neutral-400 dark:text-neutral-500"
           data-testid="friends-empty"
         >

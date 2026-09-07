@@ -155,6 +155,8 @@ export interface E2eeMsg {
 export interface FriendUserRef {
   user_id: string;
   username: string;
+  /** Numeric user identifier; newer servers always send it, older ones omit. */
+  uid?: number;
 }
 
 /** Server → client: a peer sent me a friend request. */
@@ -387,7 +389,11 @@ export function isE2eeMsg(d: unknown): d is E2eeMsg {
 }
 
 function isFriendUserRef(v: unknown): v is FriendUserRef {
-  return isRecord(v) && hasString(v, "user_id") && hasString(v, "username");
+  if (!isRecord(v) || !hasString(v, "user_id") || !hasString(v, "username"))
+    return false;
+  // uid is optional on the wire (older servers omit it); when present it
+  // must be a number.
+  return v["uid"] === undefined || hasInt(v, "uid");
 }
 
 export function isFriendRequested(d: unknown): d is FriendRequested {

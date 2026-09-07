@@ -15,11 +15,15 @@ export interface TokenPair {
 export interface LoginResult extends TokenPair {
   user_id: string;
   username: string;
+  /** Stable numeric user identifier (QQ-style), assigned at registration. */
+  uid: number;
 }
 
 export interface RegisterResult extends TokenPair {
   user_id: string;
   username: string;
+  /** Stable numeric user identifier (QQ-style), assigned at registration. */
+  uid: number;
 }
 
 export interface RegisterInput {

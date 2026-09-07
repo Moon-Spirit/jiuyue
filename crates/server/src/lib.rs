@@ -14,6 +14,7 @@ pub mod error;
 pub mod friends;
 pub mod push;
 pub mod state;
+pub mod users;
 pub mod ws;
 
 pub use app::build_router;

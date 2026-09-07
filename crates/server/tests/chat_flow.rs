@@ -202,6 +202,15 @@ async fn register_user(t: &TestApp, email: &str, username: &str) -> (Uuid, Strin
     (user_id, access)
 }
 
+/// Reads a user's stable numeric uid straight from the DB (test shortcut).
+async fn uid_of(t: &TestApp, user_id: Uuid) -> i64 {
+    sqlx::query_scalar("SELECT uid FROM users WHERE id = $1")
+        .bind(user_id)
+        .fetch_one(&t.pool)
+        .await
+        .expect("uid of registered user")
+}
+
 async fn mint_ticket(t: &TestApp, access: &str) -> String {
     let (status, body) = send_http(&t.app, "POST", "/api/auth/ws-ticket", Some(access), None).await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -279,6 +288,7 @@ async fn happy_path_direct_message_delivers_ack_and_live_msg_new() {
 
     let (a_id, a_access) = register_user(&t, "ada@example.com", "ada").await;
     let (b_id, b_access) = register_user(&t, "ben@example.com", "ben").await;
+    let (a_uid, b_uid) = (uid_of(&t, a_id).await, uid_of(&t, b_id).await);
 
     // A creates the direct conversation with B.
     let conv = create_conversation(&t, &a_access, "ben").await;
@@ -286,6 +296,7 @@ async fn happy_path_direct_message_delivers_ack_and_live_msg_new() {
     assert!(conversation_id > 0);
     assert_eq!(conv["created"], json!(true));
     assert_eq!(conv["peer"]["user_id"], json!(b_id.to_string()));
+    assert_eq!(conv["peer"]["uid"], json!(b_uid), "create response carries the peer's uid");
     assert_eq!(conv["peer"]["username"], json!("ben"));
 
     // B's create-or-get lands on the same row, flagged created=false.
@@ -293,6 +304,7 @@ async fn happy_path_direct_message_delivers_ack_and_live_msg_new() {
     assert_eq!(conv_again["conversation_id"], json!(conversation_id));
     assert_eq!(conv_again["created"], json!(false));
     assert_eq!(conv_again["peer"]["user_id"], json!(a_id.to_string()));
+    assert_eq!(conv_again["peer"]["uid"], json!(a_uid), "create-or-get carries the peer's uid");
 
     let mut ws_a = ws_connect(&t, &a_access).await;
     let mut ws_b = ws_connect(&t, &b_access).await;
@@ -702,7 +714,8 @@ async fn unknown_frame_type_is_answered_without_closing() {
 async fn conversation_list_returns_memberships_with_peer_info() {
     let t = test_app().await;
     let (_a_id, a_access) = register_user(&t, "list-a@example.com", "lista").await;
-    let (_b_id, b_access) = register_user(&t, "list-b@example.com", "listb").await;
+    let (b_id, b_access) = register_user(&t, "list-b@example.com", "listb").await;
+    let b_uid = uid_of(&t, b_id).await;
     let conv = create_conversation(&t, &a_access, "listb").await;
 
     // Creator sees the conversation with peer info pointing at listb.
@@ -713,6 +726,7 @@ async fn conversation_list_returns_memberships_with_peer_info() {
     assert_eq!(items[0]["conversation_id"], conv["conversation_id"]);
     assert_eq!(items[0]["kind"], "direct");
     assert_eq!(items[0]["peer"]["username"], "listb");
+    assert_eq!(items[0]["peer"]["uid"], json!(b_uid), "list peer block carries uid");
     assert_eq!(items[0]["last_seq"], 0);
     assert_eq!(items[0]["last_delivered_seq"], 0);
 
