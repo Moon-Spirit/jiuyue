@@ -60,6 +60,25 @@ pub struct FriendPeer {
     /// Stable numeric user id (QQ-style); mirrors the peer's `users.uid`.
     pub uid: i64,
     pub username: String,
+    /// Effective display handle (stored display_name, or username when empty).
+    pub display_name: String,
+    /// Curated avatar emoji (possibly `""`).
+    pub avatar: String,
+}
+
+impl FriendPeer {
+    /// Builds a peer block from a DB row, resolving the display-name fallback
+    /// server-side (`empty display_name` renders as `username`).
+    fn from_row(user_id: Uuid, uid: i64, username: String, display_name: String, avatar: String) -> Self {
+        let effective = crate::profile::effective_display_name(&display_name, &username);
+        Self {
+            user_id,
+            uid,
+            username,
+            display_name: effective,
+            avatar,
+        }
+    }
 }
 
 /// Lexicographically sorted `"uuidA:uuidB"` — identical from both sides so
@@ -74,15 +93,19 @@ fn rfc3339(value: OffsetDateTime) -> Result<String, AppError> {
     value.format(&Rfc3339).map_err(AppError::internal)
 }
 
-/// Resolves a user's `(username, uid)` — the identity block REST responses and
-/// live friend relays carry. The DB column is signed `bigint` but only ever
+/// Resolves a user's `(username, uid, display_name, avatar)` — the identity
+/// block REST responses carry. The DB column is signed `bigint` but only ever
 /// holds non-negative values (sequence starts at 100000).
-async fn peer_identity_of(state: &AppState, user_id: Uuid) -> Result<(String, i64), AppError> {
-    let row: Option<(String, i64)> = sqlx::query_as("SELECT username, uid FROM users WHERE id = $1")
-        .bind(user_id)
-        .fetch_optional(&state.pool)
-        .await
-        .map_err(AppError::internal)?;
+async fn peer_identity_of(
+    state: &AppState,
+    user_id: Uuid,
+) -> Result<(String, i64, String, String), AppError> {
+    let row: Option<(String, i64, String, String)> =
+        sqlx::query_as("SELECT username, uid, display_name, avatar FROM users WHERE id = $1")
+            .bind(user_id)
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(AppError::internal)?;
     row.ok_or_else(|| AppError::internal(anyhow::anyhow!("user {user_id} vanished")))
 }
 
@@ -134,13 +157,14 @@ pub async fn send_request(
     }
 
     // Usernames are public handles: plain 404 on miss (chat.rs convention).
-    let peer: Option<(Uuid, i64, String)> =
-        sqlx::query_as("SELECT id, uid, username FROM users WHERE username = $1 LIMIT 1")
-            .bind(&username)
-            .fetch_optional(&state.pool)
-            .await
-            .map_err(AppError::internal)?;
-    let Some((peer_id, peer_uid, peer_username)) = peer else {
+    let peer: Option<(Uuid, i64, String, String, String)> = sqlx::query_as(
+        "SELECT id, uid, username, display_name, avatar FROM users WHERE username = $1 LIMIT 1",
+    )
+    .bind(&username)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(AppError::internal)?;
+    let Some((peer_id, peer_uid, peer_username, peer_display, peer_avatar)) = peer else {
         return Err(AppError::PeerNotFound);
     };
     if peer_id == user.0 {
@@ -149,7 +173,7 @@ pub async fn send_request(
 
     // Needed for the live `friend.requested` relay (response carries only
     // the peer side).
-    let (my_username, my_uid) = peer_identity_of(&state, user.0).await?;
+    let (my_username, my_uid, _, _) = peer_identity_of(&state, user.0).await?;
     let pair_key = friend_pair_key(user.0, peer_id);
 
     let mut tx = state.pool.begin().await.map_err(AppError::internal)?;
@@ -238,11 +262,13 @@ pub async fn send_request(
         StatusCode::CREATED,
         Json(SendFriendRequestResponse {
             request_id,
-            to: FriendPeer {
-                user_id: peer_id,
-                uid: peer_uid,
-                username: peer_username,
-            },
+            to: FriendPeer::from_row(
+                peer_id,
+                peer_uid,
+                peer_username,
+                peer_display,
+                peer_avatar,
+            ),
         }),
     ))
 }
@@ -275,10 +301,10 @@ pub async fn list_requests(
     State(state): State<AppState>,
     user: AuthUser,
 ) -> Result<Json<ListRequestsResponse>, AppError> {
-    type Row = (Uuid, Uuid, i64, String, OffsetDateTime);
+    type Row = (Uuid, Uuid, i64, String, String, String, OffsetDateTime);
 
     let incoming_rows: Vec<Row> = sqlx::query_as(
-        "SELECT r.id, r.from_user, u.uid, u.username, r.created_at \
+        "SELECT r.id, r.from_user, u.uid, u.username, u.display_name, u.avatar, r.created_at \
          FROM friend_requests r \
          JOIN users u ON u.id = r.from_user \
          WHERE r.to_user = $1 AND r.status = 'pending' \
@@ -290,7 +316,7 @@ pub async fn list_requests(
     .map_err(AppError::internal)?;
 
     let outgoing_rows: Vec<Row> = sqlx::query_as(
-        "SELECT r.id, r.to_user, u.uid, u.username, r.created_at \
+        "SELECT r.id, r.to_user, u.uid, u.username, u.display_name, u.avatar, r.created_at \
          FROM friend_requests r \
          JOIN users u ON u.id = r.to_user \
          WHERE r.from_user = $1 AND r.status = 'pending' \
@@ -302,27 +328,35 @@ pub async fn list_requests(
     .map_err(AppError::internal)?;
 
     let mut incoming = Vec::with_capacity(incoming_rows.len());
-    for (request_id, peer_id, peer_uid, peer_username, created_at) in incoming_rows {
+    for (request_id, peer_id, peer_uid, peer_username, peer_display, peer_avatar, created_at) in
+        incoming_rows
+    {
         incoming.push(IncomingRequestItem {
             request_id,
-            from: FriendPeer {
-                user_id: peer_id,
-                uid: peer_uid,
-                username: peer_username,
-            },
+            from: FriendPeer::from_row(
+                peer_id,
+                peer_uid,
+                peer_username,
+                peer_display,
+                peer_avatar,
+            ),
             created_at: rfc3339(created_at)?,
         });
     }
 
     let mut outgoing = Vec::with_capacity(outgoing_rows.len());
-    for (request_id, peer_id, peer_uid, peer_username, created_at) in outgoing_rows {
+    for (request_id, peer_id, peer_uid, peer_username, peer_display, peer_avatar, created_at) in
+        outgoing_rows
+    {
         outgoing.push(OutgoingRequestItem {
             request_id,
-            to: FriendPeer {
-                user_id: peer_id,
-                uid: peer_uid,
-                username: peer_username,
-            },
+            to: FriendPeer::from_row(
+                peer_id,
+                peer_uid,
+                peer_username,
+                peer_display,
+                peer_avatar,
+            ),
             created_at: rfc3339(created_at)?,
         });
     }
@@ -404,8 +438,9 @@ pub async fn accept_request(
 
     // Response names the ORIGINAL SENDER (the person just befriended); the
     // wire frame tells the sender WHO accepted.
-    let (sender_username, sender_uid) = peer_identity_of(&state, from_user).await?;
-    let (my_username, my_uid) = peer_identity_of(&state, user.0).await?;
+    let (sender_username, sender_uid, sender_display, sender_avatar) =
+        peer_identity_of(&state, from_user).await?;
+    let (my_username, my_uid, _, _) = peer_identity_of(&state, user.0).await?;
 
     crate::ws::relay_friend_payload(
         &state,
@@ -421,11 +456,13 @@ pub async fn accept_request(
 
     tracing::info!(%request_id, accepter = %user.0, sender = %from_user, "friend request accepted");
     Ok(Json(AcceptFriendRequestResponse {
-        friend: FriendPeer {
-            user_id: from_user,
-            uid: sender_uid,
-            username: sender_username,
-        },
+        friend: FriendPeer::from_row(
+            from_user,
+            sender_uid,
+            sender_username,
+            sender_display,
+            sender_avatar,
+        ),
     }))
 }
 
@@ -519,6 +556,10 @@ pub struct FriendListItem {
     /// Stable numeric user id (QQ-style); mirrors the friend's `users.uid`.
     pub uid: i64,
     pub username: String,
+    /// Effective display handle (stored display_name, or username when empty).
+    pub display_name: String,
+    /// Curated avatar emoji (possibly `""`).
+    pub avatar: String,
     pub since: String,
 }
 
@@ -526,9 +567,9 @@ pub async fn list_friends(
     State(state): State<AppState>,
     user: AuthUser,
 ) -> Result<Json<Vec<FriendListItem>>, AppError> {
-    type Row = (Uuid, i64, String, OffsetDateTime);
+    type Row = (Uuid, i64, String, String, String, OffsetDateTime);
     let rows: Vec<Row> = sqlx::query_as(
-        "SELECT f.friend_id, u.uid, u.username, f.since \
+        "SELECT f.friend_id, u.uid, u.username, u.display_name, u.avatar, f.since \
          FROM friendships f \
          JOIN users u ON u.id = f.friend_id \
          WHERE f.user_id = $1 \
@@ -540,11 +581,13 @@ pub async fn list_friends(
     .map_err(AppError::internal)?;
 
     let mut items = Vec::with_capacity(rows.len());
-    for (user_id, uid, username, since) in rows {
+    for (user_id, uid, username, display_name, avatar, since) in rows {
         items.push(FriendListItem {
             user_id,
             uid,
-            username,
+            username: username.clone(),
+            display_name: crate::profile::effective_display_name(&display_name, &username),
+            avatar,
             since: rfc3339(since)?,
         });
     }

@@ -8,6 +8,10 @@ export interface ConversationPeer {
   username: string;
   /** Numeric user identifier (QQ-style); present on newer server responses. */
   uid?: number;
+  /** Curated label; additive field (older servers omit it). */
+  display_name?: string;
+  /** Curated emoji avatar; additive field (older servers omit it). */
+  avatar?: string | null;
 }
 
 /** Conversation kind: plain direct chat or end-to-end encrypted secret chat. */

@@ -4,10 +4,15 @@
 //! machine, and recall-window policy. Database/Redis adapters live in the
 //! server crate; this crate must stay free of sqlx/redis dependencies.
 
+mod progress;
 mod recall;
 mod seq;
 mod state_machine;
 
+pub use progress::{
+    level_from_xp, title_for_level, total_xp_for, xp_for_level, DAILY_LOGIN_XP, MSG_XP_CHAR_BLOCK,
+    MSG_XP_DAILY_CAP, MSG_XP_PER_BLOCK,
+};
 pub use recall::{RecallError, RecallPolicy};
 pub use seq::{InMemorySeqAllocator, SeqAllocator};
 pub use state_machine::{MessageStateMachine, MessageStatus, TransitionEvent};

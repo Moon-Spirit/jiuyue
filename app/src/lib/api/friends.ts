@@ -9,6 +9,10 @@ export interface FriendUser {
   username: string;
   /** Numeric user identifier (QQ-style). Present on newer server responses. */
   uid?: number;
+  /** Curated label; additive field (older servers omit it). */
+  display_name?: string;
+  /** Curated emoji avatar; additive field (older servers omit it). */
+  avatar?: string | null;
 }
 
 /** POST /api/friends/requests → 201 { request_id, to } */
@@ -51,6 +55,10 @@ export interface Friend {
   uid?: number;
   /** RFC 3339 timestamp of when the friendship was established. */
   since: string;
+  /** Curated label; additive field (older servers omit it). */
+  display_name?: string;
+  /** Curated emoji avatar; additive field (older servers omit it). */
+  avatar?: string | null;
 }
 
 /**

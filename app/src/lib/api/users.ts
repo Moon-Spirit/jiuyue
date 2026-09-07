@@ -6,6 +6,10 @@ export interface UserSearchResult {
   username: string;
   /** Stable numeric user identifier (QQ-style); search surfaces it. */
   uid: number;
+  /** Curated label; additive field (older servers omit it). */
+  display_name?: string;
+  /** Curated emoji avatar; additive field (older servers omit it). */
+  avatar?: string | null;
 }
 
 /**

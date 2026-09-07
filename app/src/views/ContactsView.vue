@@ -3,13 +3,16 @@ import { onMounted, onUnmounted, ref } from "vue";
 import { useI18n } from "vue-i18n";
 import { useRoute, useRouter } from "vue-router";
 import AppShell from "../components/layout/AppShell.vue";
+import Avatar from "../components/Avatar.vue";
 import LanguageToggle from "../components/LanguageToggle.vue";
 import ThemeToggle from "../components/ThemeToggle.vue";
 import { friendApiErrorMessage } from "../lib/api/friends";
 import type { Friend, IncomingFriendRequest } from "../lib/api/friends";
 import type { UserSearchResult } from "../lib/api/users";
+import { displayNameOf } from "../lib/identity";
 import { useAuthStore } from "../stores/auth";
 import { useFriendsStore } from "../stores/friends";
+import { useProfileStore } from "../stores/profile";
 import { useWsStore } from "../stores/ws";
 
 const SEARCH_DEBOUNCE_MS = 400;
@@ -20,6 +23,7 @@ const router = useRouter();
 const auth = useAuthStore();
 const ws = useWsStore();
 const friends = useFriendsStore();
+const profile = useProfileStore();
 
 const searchQuery = ref("");
 const searching = ref(false);
@@ -45,6 +49,7 @@ onMounted(() => {
   // Same pattern as ChatView: guards make this auth-only; connecting here
   // keeps friend badges live even when the user lands directly on /contacts.
   if (auth.status === "authed") {
+    profile.ensureLoaded();
     void ws.connect();
     void friends.loadAll();
   }
@@ -64,9 +69,21 @@ async function logout(): Promise<void> {
 // Search by UID / username → result card → send request
 // ---------------------------------------------------------------------
 
-function initialOf(username: string): string {
-  const first = username.trim().charAt(0);
-  return first.length === 0 ? "?" : first.toUpperCase();
+/** Open the public profile of a user (seed transient peer state first). */
+function openUserProfile(user: {
+  user_id: string;
+  username: string;
+  uid?: number;
+  display_name?: string;
+  avatar?: string | null;
+}): void {
+  profile.seedPeer(user.user_id, {
+    username: user.username,
+    uid: user.uid ?? 0,
+    displayName: user.display_name ?? "",
+    avatar: user.avatar ?? null,
+  });
+  void router.push(`/profile/${encodeURIComponent(user.user_id)}`);
 }
 
 function cancelPendingSearch(): void {
@@ -203,13 +220,26 @@ async function confirmUnfriend(friend: Friend): Promise<void> {
         <span class="text-sm font-bold tracking-tight lg:text-[11px]">{{
           t("app.name")
         }}</span>
-        <span
-          class="ml-auto min-w-0 truncate text-xs text-neutral-500 lg:ml-0 lg:max-w-full lg:text-center dark:text-neutral-400"
-          data-testid="nav-username"
-          :title="auth.user?.username ?? t('nav.anonymous')"
+        <button
+          type="button"
+          class="ml-auto flex items-center gap-1.5 rounded-full p-0.5 hover:bg-neutral-100 dark:hover:bg-neutral-800 lg:ml-0 lg:flex-col lg:gap-0.5 lg:p-1"
+          data-testid="nav-self"
+          :title="t('nav.profile')"
+          @click="router.push('/profile')"
         >
-          {{ auth.user?.username ?? t("nav.anonymous") }}
-        </span>
+          <Avatar
+            :username="auth.user?.username ?? ''"
+            :display-name="auth.user?.displayName"
+            :avatar="auth.user?.avatar"
+            :size="28"
+          />
+          <span
+            class="max-w-[6rem] truncate text-[10px] text-neutral-500 dark:text-neutral-400"
+            data-testid="nav-username"
+          >
+            {{ auth.user?.username ?? t("nav.anonymous") }}
+          </span>
+        </button>
         <router-link
           to="/chat"
           data-testid="nav-chat"
@@ -309,17 +339,19 @@ async function confirmUnfriend(friend: Friend): Promise<void> {
                 :data-user-id="user.user_id"
                 class="flex items-center gap-2 rounded-lg p-2 hover:bg-neutral-100 dark:hover:bg-neutral-800"
               >
-                <span
-                  class="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-indigo-100 text-xs font-semibold text-indigo-700 dark:bg-indigo-900 dark:text-indigo-200"
+                <Avatar
+                  :username="user.username"
+                  :display-name="user.display_name"
+                  :avatar="user.avatar"
+                  :size="32"
                   data-testid="search-result-avatar"
-                >
-                  {{ initialOf(user.username) }}
-                </span>
+                  @click="openUserProfile(user)"
+                />
                 <span class="min-w-0 flex-1">
                   <span
                     class="block truncate text-sm font-medium"
                     data-testid="search-result-name"
-                    >{{ user.username }}</span
+                    >{{ displayNameOf(user) }}</span
                   >
                   <span
                     class="block font-mono text-[11px] text-neutral-400 dark:text-neutral-500"
@@ -375,17 +407,19 @@ async function confirmUnfriend(friend: Friend): Promise<void> {
               data-testid="incoming-item"
               class="flex items-center gap-2 rounded-lg p-2 hover:bg-neutral-100 dark:hover:bg-neutral-800"
             >
-              <span
-                class="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-indigo-100 text-xs font-semibold text-indigo-700 dark:bg-indigo-900 dark:text-indigo-200"
+              <Avatar
+                :username="request.from.username"
+                :display-name="request.from.display_name"
+                :avatar="request.from.avatar"
+                :size="32"
                 data-testid="incoming-avatar"
-              >
-                {{ initialOf(request.from.username) }}
-              </span>
+                @click="openUserProfile(request.from)"
+              />
               <span
                 class="min-w-0 flex-1 truncate text-sm font-medium"
                 data-testid="incoming-name"
               >
-                {{ request.from.username }}
+                {{ displayNameOf(request.from) }}
               </span>
               <button
                 type="button"
@@ -422,17 +456,19 @@ async function confirmUnfriend(friend: Friend): Promise<void> {
             :data-user-id="friend.user_id"
             class="group flex items-center gap-3 rounded-lg p-2 hover:bg-neutral-100 dark:hover:bg-neutral-800"
           >
-            <span
-              class="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-indigo-100 text-sm font-semibold text-indigo-700 dark:bg-indigo-900 dark:text-indigo-200"
+            <Avatar
+              :username="friend.username"
+              :display-name="friend.display_name"
+              :avatar="friend.avatar"
+              :size="36"
               data-testid="friend-avatar"
-            >
-              {{ initialOf(friend.username) }}
-            </span>
+              @click="openUserProfile(friend)"
+            />
             <span class="min-w-0 flex-1">
               <span
                 class="block truncate text-sm font-medium"
                 data-testid="friend-name"
-                >{{ friend.username }}</span
+                >{{ displayNameOf(friend) }}</span
               >
               <span
                 v-if="typeof friend.uid === 'number' && friend.uid > 0"

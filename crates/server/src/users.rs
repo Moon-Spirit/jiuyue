@@ -24,10 +24,11 @@
 
 use crate::auth::extract::AuthUser;
 use crate::error::AppError;
+use crate::profile::{get_profile, update_profile};
 use crate::state::AppState;
 use axum::extract::rejection::QueryRejection;
 use axum::extract::{Query, State};
-use axum::routing::get;
+use axum::routing::{get, patch};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -36,7 +37,12 @@ use uuid::Uuid;
 const SEARCH_LIMIT: i64 = 10;
 
 pub fn router() -> Router<AppState> {
-    Router::new().route("/search", get(search))
+    Router::new()
+        .route("/search", get(search))
+        // M7: self-only profile edit + any-user profile fetch. A single GET
+        // route serves self and others alike (`/profile/{user_id}`).
+        .route("/profile", patch(update_profile))
+        .route("/profile/{user_id}", get(get_profile))
 }
 
 #[derive(Debug, Deserialize)]
@@ -45,11 +51,15 @@ pub struct SearchQuery {
 }
 
 /// One search hit. `uid` is the stable numeric user id (QQ-style).
+/// `display_name` is the effective handle (falls back to `username` server-
+/// side); `avatar` is the raw curated emoji (possibly `""`).
 #[derive(Debug, Serialize)]
 pub struct SearchResultItem {
     pub user_id: Uuid,
     pub username: String,
     pub uid: i64,
+    pub display_name: String,
+    pub avatar: String,
 }
 
 /// `GET /api/users/search?q=<query>` — Bearer-gated user lookup by uid or
@@ -86,9 +96,9 @@ async fn search_numeric(
     q: &str,
 ) -> Result<Vec<SearchResultItem>, AppError> {
     let prefix = format!("{q}%");
-    type Row = (Uuid, String, i64, i32);
+    type Row = (Uuid, String, i64, String, String, i32);
     let rows: Vec<Row> = sqlx::query_as(
-        "SELECT id, username, uid, \
+        "SELECT id, username, uid, display_name, avatar, \
                 CASE \
                     WHEN uid::text = $1 THEN 0 \
                     WHEN uid::text LIKE $2 THEN 1 \
@@ -110,10 +120,12 @@ async fn search_numeric(
 
     Ok(rows
         .into_iter()
-        .map(|(user_id, username, uid, _rank)| SearchResultItem {
+        .map(|(user_id, username, uid, display_name, avatar, _rank)| SearchResultItem {
             user_id,
-            username,
+            username: username.clone(),
             uid,
+            display_name: crate::profile::effective_display_name(&display_name, &username),
+            avatar,
         })
         .collect())
 }
@@ -126,9 +138,9 @@ async fn search_by_username(
 ) -> Result<Vec<SearchResultItem>, AppError> {
     let lowered = q.to_lowercase();
     let prefix = format!("{lowered}%");
-    type Row = (Uuid, String, i64, i32);
+    type Row = (Uuid, String, i64, String, String, i32);
     let rows: Vec<Row> = sqlx::query_as(
-        "SELECT id, username, uid, \
+        "SELECT id, username, uid, display_name, avatar, \
                 CASE \
                     WHEN username = $1 THEN 0 \
                     ELSE 1 \
@@ -149,10 +161,12 @@ async fn search_by_username(
 
     Ok(rows
         .into_iter()
-        .map(|(user_id, username, uid, _rank)| SearchResultItem {
+        .map(|(user_id, username, uid, display_name, avatar, _rank)| SearchResultItem {
             user_id,
-            username,
+            username: username.clone(),
             uid,
+            display_name: crate::profile::effective_display_name(&display_name, &username),
+            avatar,
         })
         .collect())
 }

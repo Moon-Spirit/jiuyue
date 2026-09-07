@@ -36,6 +36,18 @@ export const router = createRouter({
       component: () => import("../views/ContactsView.vue"),
       meta: { requiresAuth: true },
     },
+    {
+      path: "/profile",
+      name: "profile",
+      component: () => import("../views/ProfileView.vue"),
+      meta: { requiresAuth: true },
+    },
+    {
+      path: "/profile/:userId",
+      name: "profile-peer",
+      component: () => import("../views/ProfileView.vue"),
+      meta: { requiresAuth: true },
+    },
     { path: "/:pathMatch(.*)*", redirect: "/" },
   ],
 });

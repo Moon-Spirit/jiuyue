@@ -130,6 +130,17 @@ pub async fn ws_handler(
         Ok(device_id) => device_id,
         Err(err) => return AppError::internal(err).into_response(),
     };
+    // M7 XP economy: the first WS connection of a UTC day completes the
+    // "daily login" — grant the +20 bonus once per UTC day. Fire-and-forget
+    // and best-effort: an XP outage must never block the connection upgrade.
+    {
+        let pool = state.pool.clone();
+        tokio::spawn(async move {
+            if let Err(err) = crate::profile::grant_daily_login_bonus(&pool, user_id).await {
+                tracing::warn!(%user_id, error = %format!("{err:#}"), "daily login bonus failed");
+            }
+        });
+    }
     tracing::info!(%user_id, %device_id, platform = %platform, "websocket connected");
     ws.on_upgrade(move |socket| run_connection(state, socket, user_id, device_id))
 }
@@ -398,6 +409,13 @@ async fn handle_frame(
                 let _ = out_tx.send(serialize_frame(&ack)).await;
                 if !outcome.duplicate {
                     fanout_msg_new(state, sender_id, sender_device_id, &send.body, &outcome).await;
+                    // M7 XP economy: fresh sends earn +10 XP per full 100
+                    // characters (daily cap 200; secret chats excluded inside
+                    // the award fn). The character COUNT is the only thing
+                    // that leaves this frame — never the body. Best-effort
+                    // post-commit spawn: an XP outage must never fail the
+                    // already-acked send path.
+                    spawn_message_xp(state, sender_id, send.conversation_id, &send.body);
                 }
                 Flow::Continue
             }
@@ -1248,6 +1266,28 @@ fn spawn_touch_device_last_seen(state: &AppState, device_id: Uuid) {
             .await
         {
             tracing::warn!(%device_id, error = %err, "device last_seen_at touch failed");
+        }
+    });
+}
+
+/// Fire-and-forget messaging-XP award (M7). Spawned AFTER the send committed
+/// and acked, so any failure here degrades to a logged no-op — the send path
+/// is never held hostage by the XP ledger. Only the character COUNT is passed
+/// (never the body); secret-chat messages earn 0 inside the award fn.
+fn spawn_message_xp(state: &AppState, sender_id: Uuid, conversation_id: i64, body: &str) {
+    let pool = state.pool.clone();
+    let char_count = body.chars().count();
+    tokio::spawn(async move {
+        let result =
+            crate::profile::award_message_xp_for_chars(&pool, sender_id, conversation_id, char_count)
+                .await;
+        if let Err(err) = result {
+            tracing::warn!(
+                %sender_id,
+                %conversation_id,
+                error = %format!("{err:#}"),
+                "message xp award failed"
+            );
         }
     });
 }

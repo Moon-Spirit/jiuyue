@@ -88,6 +88,17 @@ export interface Conversation {
   peerUsername: string;
   /** Numeric peer UID when known (enriched from listings / creation). */
   peerUid?: number;
+  /**
+   * Curated peer label (display_name ?? username); populated from listings /
+   * creation, empty when the conversation is still a skeleton. Never sent to
+   * the server — pure local presentation state.
+   */
+  peerDisplayName?: string;
+  /**
+   * Curated peer avatar emoji; populated from listings / creation.
+   * Pure local presentation state (never on the wire).
+   */
+  peerAvatar?: string | null;
   lastMessagePreview: string | null;
   lastActivityAt: string;
   unread: number;
@@ -170,6 +181,21 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
 
+/** Curated label from a server peer object, falling back to the username. */
+function displayNameOf(peer: {
+  username: string;
+  display_name?: string | null;
+}): string {
+  const display = peer.display_name?.trim() ?? "";
+  return display.length > 0 ? display : peer.username;
+}
+
+/** Avatar emoji from a server peer object (or null when unset/unknown). */
+function avatarOf(peer: { avatar?: string | null }): string | null {
+  const avatar = peer.avatar?.trim() ?? "";
+  return avatar.length > 0 ? avatar : null;
+}
+
 function loadPersistedConversations(): Conversation[] {
   try {
     const raw = localStorage.getItem(CONVOS_KEY);
@@ -194,6 +220,16 @@ function loadPersistedConversations(): Conversation[] {
         typeof c["peerTypingUntil"] === "number" ? c["peerTypingUntil"] : null,
       kind: c["kind"] === "secret" ? "secret" : "direct",
       peerUid: typeof c["peerUid"] === "number" ? c["peerUid"] : undefined,
+      peerDisplayName:
+        typeof c["peerDisplayName"] === "string" &&
+        String(c["peerDisplayName"]).length > 0
+          ? String(c["peerDisplayName"])
+          : undefined,
+      peerAvatar:
+        typeof c["peerAvatar"] === "string" &&
+        String(c["peerAvatar"]).length > 0
+          ? String(c["peerAvatar"])
+          : null,
     }));
   } catch {
     // Corrupted cache degrades to an empty list; sync will repopulate.
@@ -519,6 +555,9 @@ export const useWsStore = defineStore("ws", {
             existing.peerUsername = item.peer.username;
             existing.peerUid = item.peer.uid;
             existing.kind = item.kind === "secret" ? "secret" : existing.kind;
+            // Skeleton enrichment also picks up the new display fields.
+            existing.peerDisplayName = displayNameOf(item.peer);
+            existing.peerAvatar = avatarOf(item.peer);
           } else if (
             item.peer !== null &&
             item.peer.uid !== undefined &&
@@ -545,6 +584,9 @@ export const useWsStore = defineStore("ws", {
           peerTypingUntil: null,
           kind: item.kind === "secret" ? "secret" : "direct",
           peerUid: item.peer?.uid,
+          peerDisplayName:
+            item.peer !== null ? displayNameOf(item.peer) : undefined,
+          peerAvatar: item.peer !== null ? avatarOf(item.peer) : null,
         });
       }
     },
@@ -1356,12 +1398,16 @@ export const useWsStore = defineStore("ws", {
           peerTypingUntil: null,
           kind: result.kind === "secret" ? "secret" : "direct",
           peerUid: result.peer.uid,
+          peerDisplayName: displayNameOf(result.peer),
+          peerAvatar: avatarOf(result.peer),
         };
         this.conversations.push(conversation);
       } else {
         conversation.peerUserId = result.peer.user_id;
         conversation.peerUsername = result.peer.username;
         conversation.peerUid = result.peer.uid;
+        conversation.peerDisplayName = displayNameOf(result.peer);
+        conversation.peerAvatar = avatarOf(result.peer);
         if (kind === "secret") conversation.kind = "secret";
       }
       this.persistConversations();

@@ -3,12 +3,14 @@ import { computed, nextTick, onMounted, ref, watch } from "vue";
 import { useI18n } from "vue-i18n";
 import { useRoute, useRouter } from "vue-router";
 import AppShell from "../components/layout/AppShell.vue";
+import Avatar from "../components/Avatar.vue";
 import LanguageToggle from "../components/LanguageToggle.vue";
 import ThemeToggle from "../components/ThemeToggle.vue";
 import { apiErrorMessage } from "../lib/api/messages";
 import * as olm from "../lib/crypto/olm-lite";
 import { useAuthStore } from "../stores/auth";
 import { useFriendsStore } from "../stores/friends";
+import { useProfileStore } from "../stores/profile";
 import { RECALL_WINDOW_MS, useWsStore } from "../stores/ws";
 import type { ChatMessage, Conversation } from "../stores/ws";
 
@@ -18,6 +20,7 @@ const route = useRoute();
 const auth = useAuthStore();
 const ws = useWsStore();
 const friends = useFriendsStore();
+const profile = useProfileStore();
 
 const PREVIEW_MAX_CHARS = 40;
 
@@ -35,7 +38,10 @@ const messagesEndRef = ref<HTMLElement | null>(null);
 onMounted(() => {
   // Router guards ensure /chat is only reachable while authed; connecting
   // here keeps tests (anon auth) free of network side effects.
-  if (auth.status === "authed") void ws.connect();
+  if (auth.status === "authed") {
+    profile.ensureLoaded();
+    void ws.connect();
+  }
 });
 
 watch(
@@ -57,11 +63,6 @@ async function logout(): Promise<void> {
 // Sessions pane
 // ---------------------------------------------------------------------
 
-function initialOf(username: string): string {
-  const first = username.trim().charAt(0);
-  return first.length === 0 ? "?" : first.toUpperCase();
-}
-
 /** Peer messages label with the peer's name; falls back to the raw id. */
 function senderLabel(message: { senderId: string }): string {
   const conv = ws.activeConversation;
@@ -70,15 +71,35 @@ function senderLabel(message: { senderId: string }): string {
     message.senderId === conv.peerUserId &&
     conv.peerUsername.length > 0
   ) {
-    return conv.peerUsername;
+    return peerLabel(conv);
   }
   return message.senderId;
 }
 
-function displayName(conversation: Conversation): string {
+/** Best display label for a conversation's peer (display name when known). */
+function peerLabel(conversation: Conversation): string {
+  if (conversation.peerDisplayName?.trim().length) {
+    return conversation.peerDisplayName;
+  }
   return conversation.peerUsername.length > 0
     ? conversation.peerUsername
     : t("chat.peerUnknown");
+}
+
+/** Navigate to a peer's profile, seeding the transient view from the row. */
+function openPeerProfile(conversation: Conversation): void {
+  profile.seedPeer(conversation.peerUserId, {
+    username: conversation.peerUsername,
+    uid: conversation.peerUid,
+    displayName: conversation.peerDisplayName,
+    avatar: conversation.peerAvatar ?? null,
+  });
+  void router.push(`/profile/${encodeURIComponent(conversation.peerUserId)}`);
+}
+
+/** Navigate to my own profile (nav avatar). */
+function openSelfProfile(): void {
+  void router.push("/profile");
 }
 
 function truncatePreview(body: string | null): string {
@@ -309,13 +330,26 @@ function onComposerBlur(): void {
         <span class="text-sm font-bold tracking-tight lg:text-[11px]">{{
           t("app.name")
         }}</span>
-        <span
-          class="ml-auto min-w-0 truncate text-xs text-neutral-500 lg:ml-0 lg:max-w-full lg:text-center dark:text-neutral-400"
-          data-testid="nav-username"
-          :title="auth.user?.username ?? t('nav.anonymous')"
+        <button
+          type="button"
+          class="ml-auto flex items-center gap-1.5 rounded-full p-0.5 hover:bg-neutral-100 dark:hover:bg-neutral-800 lg:ml-0 lg:flex-col lg:gap-0.5 lg:p-1"
+          data-testid="nav-self"
+          :title="t('nav.profile')"
+          @click="openSelfProfile()"
         >
-          {{ auth.user?.username ?? t("nav.anonymous") }}
-        </span>
+          <Avatar
+            :username="auth.user?.username ?? ''"
+            :display-name="auth.user?.displayName"
+            :avatar="auth.user?.avatar"
+            :size="28"
+          />
+          <span
+            class="max-w-[6rem] truncate text-[10px] text-neutral-500 dark:text-neutral-400"
+            data-testid="nav-username"
+          >
+            {{ auth.user?.username ?? t("nav.anonymous") }}
+          </span>
+        </button>
         <ThemeToggle />
         <LanguageToggle />
         <router-link
@@ -441,12 +475,15 @@ function onComposerBlur(): void {
             }"
             @click="openConversation(conversation.conversationId)"
           >
-            <span
-              class="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-indigo-100 text-sm font-semibold text-indigo-700 dark:bg-indigo-900 dark:text-indigo-200"
+            <Avatar
+              class="shrink-0"
+              :username="conversation.peerUsername"
+              :display-name="conversation.peerDisplayName"
+              :avatar="conversation.peerAvatar"
+              :size="36"
               data-testid="session-avatar"
-            >
-              {{ initialOf(conversation.peerUsername) }}
-            </span>
+              @click="openPeerProfile(conversation)"
+            />
             <span class="min-w-0 flex-1">
               <span class="flex items-baseline justify-between gap-2">
                 <span
@@ -468,7 +505,7 @@ function onComposerBlur(): void {
                     <path d="M8 11V7a4 4 0 0 1 8 0v4" />
                   </svg>
                   <span class="min-w-0 truncate" data-testid="session-name">{{
-                    displayName(conversation)
+                    peerLabel(conversation)
                   }}</span>
                 </span>
                 <span
@@ -562,13 +599,17 @@ function onComposerBlur(): void {
         <header
           class="flex shrink-0 items-center gap-2 border-b border-neutral-200 px-4 py-2 dark:border-neutral-800"
         >
-          <span
-            class="flex h-8 w-8 items-center justify-center rounded-full bg-indigo-100 text-xs font-semibold text-indigo-700 dark:bg-indigo-900 dark:text-indigo-200"
-          >
-            {{ initialOf(ws.activeConversation.peerUsername) }}
-          </span>
+          <Avatar
+            class="shrink-0"
+            :username="ws.activeConversation.peerUsername"
+            :display-name="ws.activeConversation.peerDisplayName"
+            :avatar="ws.activeConversation.peerAvatar"
+            :size="32"
+            data-testid="thread-avatar"
+            @click="openPeerProfile(ws.activeConversation)"
+          />
           <span class="text-sm font-semibold" data-testid="thread-title">
-            {{ displayName(ws.activeConversation) }}
+            {{ peerLabel(ws.activeConversation) }}
           </span>
           <svg
             v-if="ws.activeConversation.kind === 'secret'"
@@ -855,12 +896,16 @@ function onComposerBlur(): void {
                 :data-conversation-id="conversation.conversationId"
                 @click="confirmForward(conversation.conversationId)"
               >
-                <span
-                  class="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-indigo-100 text-xs font-semibold text-indigo-700 dark:bg-indigo-900 dark:text-indigo-200"
-                >
-                  {{ initialOf(conversation.peerUsername) }}
-                </span>
-                {{ displayName(conversation) }}
+                <Avatar
+                  class="shrink-0"
+                  :username="conversation.peerUsername"
+                  :display-name="conversation.peerDisplayName"
+                  :avatar="conversation.peerAvatar"
+                  :size="28"
+                  data-testid="forward-target-avatar"
+                  @click="confirmForward(conversation.conversationId)"
+                />
+                {{ peerLabel(conversation) }}
               </button>
             </li>
           </ul>

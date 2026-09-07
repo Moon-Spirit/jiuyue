@@ -125,8 +125,50 @@ describe("auth store", () => {
     const store = useAuthStore();
     await store.ensureAccessToken();
 
-    expect(store.user).toEqual({ userId: "u-old", username: "oldbie", uid: 0 });
+    expect(store.user).toEqual({
+      userId: "u-old",
+      username: "oldbie",
+      uid: 0,
+      displayName: "",
+      avatar: null,
+      bio: "",
+    });
     expect(store.status).toBe("authed");
+  });
+
+  it("round-trips the editable profile fields through persisted USER_KEY", async () => {
+    localStorage.setItem(
+      "jiuyue.user",
+      JSON.stringify({
+        userId: "u-r",
+        username: "roundtrip",
+        uid: 4242,
+        displayName: "Round Trip",
+        avatar: "🐳",
+        bio: "正在环游世界",
+      }),
+    );
+    localStorage.setItem("jiuyue.refresh", "old-refresh");
+    fetchMock.mockResolvedValue(
+      jsonResponse(200, {
+        access_token: "a4",
+        refresh_token: "r4",
+        expires_in: 900,
+      }),
+    );
+
+    const store = useAuthStore();
+    await store.ensureAccessToken();
+
+    expect(store.user?.displayName).toBe("Round Trip");
+    expect(store.user?.avatar).toBe("🐳");
+    expect(store.user?.bio).toBe("正在环游世界");
+
+    // A fresh store boots from the same persisted JSON and sees them again.
+    const revived = useAuthStore();
+    revived.user = null;
+    await revived.ensureAccessToken();
+    expect(revived.user).toEqual(store.user);
   });
 
   it("clears the local session when the stored refresh token is rejected", async () => {

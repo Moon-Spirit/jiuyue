@@ -23,6 +23,16 @@ export interface AuthUser {
    * successful auth round-trip refreshes it.
    */
   uid: number;
+  /**
+   * Curated display label. Not part of the login/register response — the
+   * profile GET backfills it and edits land here through the profile store.
+   * Empty string = "not fetched / never set" (never blocks boot).
+   */
+  displayName?: string;
+  /** Curated avatar emoji (or null/undefined when unset). See displayName. */
+  avatar?: string | null;
+  /** Free-text self description (≤200 chars). See displayName. */
+  bio?: string;
 }
 
 export type AuthStatus = "anon" | "authed" | "loading";
@@ -50,9 +60,27 @@ function readPersistedUser(): AuthUser | null {
       typeof username === "string"
     ) {
       // Tolerate profiles persisted before UIDs existed: uid degrades to 0
-      // and gets backfilled on the next login/register round-trip.
+      // and gets backfilled on the next login/register round-trip. The newer
+      // display fields degrade to empty/null → "not fetched / never set".
       const uid = typeof parsed["uid"] === "number" ? parsed["uid"] : 0;
-      return { userId, username, uid };
+      return {
+        userId,
+        username,
+        uid,
+        displayName:
+          typeof parsed["displayName"] === "string" &&
+          parsed["displayName"].length > 0
+            ? parsed["displayName"]
+            : "",
+        avatar:
+          typeof parsed["avatar"] === "string" && parsed["avatar"].length > 0
+            ? parsed["avatar"]
+            : null,
+        bio:
+          typeof parsed["bio"] === "string" && parsed["bio"].length > 0
+            ? parsed["bio"]
+            : "",
+      };
     }
     return null;
   } catch {

@@ -33,6 +33,10 @@ pub struct PeerInfo {
     /// Stable numeric user id (QQ-style); mirrors the peer's `users.uid`.
     pub uid: i64,
     pub username: String,
+    /// Effective display handle (stored display_name, or username when empty).
+    pub display_name: String,
+    /// Curated avatar emoji (possibly `""`).
+    pub avatar: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -59,15 +63,15 @@ pub async fn create_direct(
     }
     let kind = normalize_kind(req.kind.as_deref()).map_err(AppError::BadRequest)?;
 
-    let peer: Option<(Uuid, i64, String)> =
-        sqlx::query_as("SELECT id, uid, username FROM users WHERE username = $1 LIMIT 1")
+    let peer: Option<(Uuid, i64, String, String, String)> =
+        sqlx::query_as("SELECT id, uid, username, display_name, avatar FROM users WHERE username = $1 LIMIT 1")
             .bind(&peer_username)
             .fetch_optional(&state.pool)
             .await
             .map_err(AppError::internal)?;
     // Unknown peer is a plain 404 with a machine code (no existence games
     // needed here: usernames are public handles, not secrets).
-    let Some((peer_id, peer_uid, peer_username)) = peer else {
+    let Some((peer_id, peer_uid, peer_username, peer_display, peer_avatar)) = peer else {
         return Err(AppError::PeerNotFound);
     };
     if peer_id == user.0 {
@@ -132,7 +136,9 @@ pub async fn create_direct(
             peer: PeerInfo {
                 user_id: peer_id,
                 uid: peer_uid,
-                username: peer_username,
+                username: peer_username.clone(),
+                display_name: crate::profile::effective_display_name(&peer_display, &peer_username),
+                avatar: peer_avatar,
             },
         }),
     ))
@@ -206,7 +212,17 @@ pub async fn list_conversations(
     State(state): State<AppState>,
     user: AuthUser,
 ) -> Result<Json<Vec<ConversationListItem>>, AppError> {
-    type ConvRow = (i64, String, i64, i64, Option<Uuid>, Option<i64>, Option<String>);
+    type ConvRow = (
+        i64,
+        String,
+        i64,
+        i64,
+        Option<Uuid>,
+        Option<i64>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    );
     let rows: Vec<ConvRow> = sqlx::query_as(
         r#"
         SELECT c.id,
@@ -215,11 +231,14 @@ pub async fn list_conversations(
                m.last_delivered_seq,
                peer.user_id,
                peer.uid,
-               peer.username
+               peer.username,
+               peer.display_name,
+               peer.avatar
         FROM conversation_members m
         JOIN conversations c ON c.id = m.conversation_id
         LEFT JOIN LATERAL (
-            SELECT cm2.user_id AS user_id, u.uid AS uid, u.username AS username
+            SELECT cm2.user_id AS user_id, u.uid AS uid, u.username AS username,
+                   u.display_name AS display_name, u.avatar AS avatar
             FROM conversation_members cm2
             JOIN users u ON u.id = cm2.user_id
             WHERE cm2.conversation_id = c.id AND cm2.user_id <> m.user_id
@@ -237,14 +256,32 @@ pub async fn list_conversations(
     let items = rows
         .into_iter()
         .map(
-            |(conversation_id, kind, last_seq, last_delivered_seq, peer_id, peer_uid, peer_username)| {
+            |(
+                conversation_id,
+                kind,
+                last_seq,
+                last_delivered_seq,
+                peer_id,
+                peer_uid,
+                peer_username,
+                peer_display,
+                peer_avatar,
+            )| {
                 ConversationListItem {
                     conversation_id,
                     kind,
-                    peer: peer_id.map(|user_id| PeerInfo {
-                        user_id,
-                        uid: peer_uid.unwrap_or_default(),
-                        username: peer_username.unwrap_or_default(),
+                    peer: peer_id.map(|user_id| {
+                        let username = peer_username.clone().unwrap_or_default();
+                        PeerInfo {
+                            user_id,
+                            uid: peer_uid.unwrap_or_default(),
+                            display_name: match (&peer_display, &peer_username) {
+                                (Some(display), Some(uname)) => crate::profile::effective_display_name(display, uname),
+                                _ => username.clone(),
+                            },
+                            username,
+                            avatar: peer_avatar.clone().unwrap_or_default(),
+                        }
                     }),
                     last_seq,
                     last_delivered_seq,

@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { mount } from "@vue/test-utils";
 import type { DOMWrapper, VueWrapper } from "@vue/test-utils";
 import { createPinia, setActivePinia } from "pinia";
@@ -62,6 +62,9 @@ async function mountView(pinia: Pinia): Promise<VueWrapper> {
     routes: [
       { path: "/login", component: { template: "<div />" } },
       { path: "/chat", component: ChatView },
+      { path: "/profile", component: { template: "<div />" } },
+      { path: "/profile/:userId", component: { template: "<div />" } },
+      { path: "/contacts", component: { template: "<div />" } },
     ],
   });
   await router.push("/chat");
@@ -70,6 +73,11 @@ async function mountView(pinia: Pinia): Promise<VueWrapper> {
   return mount(ChatView, {
     global: { plugins: [pinia, i18n, router] },
   });
+}
+
+/** Nav appears once per breakpoint; scope to the desktop rail. */
+function navPane(wrapper: VueWrapper): DOMWrapper<Element> {
+  return wrapper.find('[data-testid="shell-nav-desktop"]');
 }
 
 /**
@@ -367,6 +375,87 @@ describe("ChatView — unread and composer", () => {
     const items = mainPane(wrapper).findAll('[data-testid="message-item"]');
     expect(items).toHaveLength(3);
     expect(items.at(-1)?.text()).toContain("发送中");
+  });
+
+  describe("ChatView — profile entry points", () => {
+    it("renders the self avatar in the nav and routes to /profile on click", async () => {
+      const pinia = createPinia();
+      setActivePinia(pinia);
+      useAuthStore().user = {
+        userId: "7",
+        username: "me",
+        uid: 1000007,
+        displayName: "Me Myself",
+        avatar: "🐼",
+      };
+      const wrapper = await mountView(pinia);
+
+      const selfButton = navPane(wrapper).find('[data-testid="nav-self"]');
+      expect(selfButton.exists()).toBe(true);
+      // Avatar prefers the emoji when set.
+      expect(selfButton.find('[data-testid="avatar-emoji"]').text()).toBe("🐼");
+      // Label under the avatar shows the username.
+      expect(selfButton.find('[data-testid="nav-username"]').text()).toBe("me");
+
+      await selfButton.trigger("click");
+      await vi.waitFor(() => {
+        expect(wrapper.vm.$route.path).toBe("/profile");
+      });
+    });
+
+    it("session-row avatar navigates to the peer profile without opening the chat", async () => {
+      const pinia = createPinia();
+      setActivePinia(pinia);
+      useAuthStore().user = { userId: "7", username: "me", uid: 1000007 };
+      const ws = useWsStore();
+      ws.conversations.push(
+        conversation(1, {
+          peerUserId: "peer-1",
+          peerUsername: "alice",
+          peerDisplayName: "Alice",
+          peerAvatar: "🦊",
+          lastActivityAt: isoAt(-MINUTE),
+        }),
+      );
+      const wrapper = await mountView(pinia);
+
+      const row = sessionsPane(wrapper).find('[data-testid="session-item"]');
+      // Rendered name prefers the peer display name.
+      expect(row.find('[data-testid="session-name"]').text()).toBe("Alice");
+      const avatar = row.find('[data-testid="session-avatar"]');
+      expect(avatar.find('[data-testid="avatar-emoji"]').text()).toBe("🦊");
+
+      // Avatar click: navigate to the peer's profile, conversation stays closed.
+      await avatar.trigger("click");
+      await vi.waitFor(() => {
+        expect(wrapper.vm.$route.path).toBe("/profile/peer-1");
+      });
+      expect(ws.activeConversationId).toBeNull();
+
+      // Row click (outside the avatar) still opens the conversation.
+      await row.trigger("click");
+      expect(ws.activeConversationId).toBe(1);
+    });
+
+    it("falls back to the username initial circle when the peer has no avatar", async () => {
+      const pinia = createPinia();
+      setActivePinia(pinia);
+      useAuthStore().user = { userId: "7", username: "me", uid: 1000007 };
+      const ws = useWsStore();
+      ws.conversations.push(
+        conversation(1, {
+          peerUserId: "peer-2",
+          peerUsername: "bob",
+          lastActivityAt: isoAt(-MINUTE),
+        }),
+      );
+      const wrapper = await mountView(pinia);
+
+      const avatar = sessionsPane(wrapper).find(
+        '[data-testid="session-avatar"]',
+      );
+      expect(avatar.find('[data-testid="avatar-initial"]').text()).toBe("B");
+    });
   });
 
   describe("ChatView — M2 message experience", () => {
