@@ -133,7 +133,18 @@ const en: MessageSchema = {
     mediaUploadFailed: "Upload failed, please retry",
     previewImage: "[Image]",
     previewVideo: "[Video]",
+    previewAudio: "[Voice]",
     lightboxClose: "Close",
+    forwardedFrom: "Forwarded from {username}",
+    voiceRecord: "Record voice message",
+    voiceStop: "Stop recording",
+    voiceCancel: "Cancel recording",
+    voiceRecording: "Recording…",
+    voicePermissionDenied:
+      "Microphone access denied. Check your browser permissions.",
+    voiceUploadFailed: "Voice message failed to send, please retry",
+    voicePlay: "Play voice message",
+    voicePause: "Pause playback",
   },
   profile: {
     title: "My profile",
@@ -184,6 +195,8 @@ const en: MessageSchema = {
     validation_error:
       "Submitted information is invalid, please check and retry",
     peer_not_found: "The other party does not exist",
+    secret_peer_not_ready:
+      "The peer hasn't enabled secret chat yet. Ask them to open the app once, then try again.",
     self_request: "You cannot add yourself as a friend",
     already_friends: "You are already friends",
     request_already_pending: "A request is already pending their response",

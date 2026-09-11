@@ -18,6 +18,8 @@ import { apiBase } from "../apiConfig";
 export const MAX_IMAGE_BYTES = 15 * 1024 * 1024;
 /** Upper bound for video (matches the backend's 413 `too_large`). */
 export const MAX_VIDEO_BYTES = 200 * 1024 * 1024;
+/** Upper bound for voice/audio (reuses the video cap). */
+export const MAX_AUDIO_BYTES = MAX_VIDEO_BYTES;
 
 export const IMAGE_MIME_TYPES: readonly string[] = [
   "image/png",
@@ -32,7 +34,14 @@ export const VIDEO_MIME_TYPES: readonly string[] = [
   "video/webm",
 ];
 
-export type MediaKind = "image" | "video";
+/** Container MIME types accepted for voice messages (browser MediaRecorder + iOS). */
+export const AUDIO_MIME_TYPES: readonly string[] = [
+  "audio/webm",
+  "audio/ogg",
+  "audio/mp4",
+];
+
+export type MediaKind = "image" | "video" | "audio";
 
 /** 201 response body from `POST /api/media`. */
 export interface MediaUploadResult {
@@ -65,14 +74,20 @@ export class MediaUploadError extends Error {
 
 /** Maps a supported MIME to its media kind, or null when unsupported. */
 export function mediaKindFor(mime: string): MediaKind | null {
-  if (IMAGE_MIME_TYPES.includes(mime)) return "image";
-  if (VIDEO_MIME_TYPES.includes(mime)) return "video";
+  // MediaRecorder reports e.g. "audio/webm;codecs=opus": compare the bare
+  // container type, not the full parameterized string.
+  const bare = mime.split(";")[0]?.trim().toLowerCase() ?? "";
+  if (IMAGE_MIME_TYPES.includes(bare)) return "image";
+  if (VIDEO_MIME_TYPES.includes(bare)) return "video";
+  if (AUDIO_MIME_TYPES.includes(bare)) return "audio";
   return null;
 }
 
 /** Per-kind size cap in bytes. */
 export function maxBytesForKind(kind: MediaKind): number {
-  return kind === "image" ? MAX_IMAGE_BYTES : MAX_VIDEO_BYTES;
+  if (kind === "image") return MAX_IMAGE_BYTES;
+  if (kind === "audio") return MAX_AUDIO_BYTES;
+  return MAX_VIDEO_BYTES;
 }
 
 export interface MediaFileCheck {

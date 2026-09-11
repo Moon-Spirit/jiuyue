@@ -1,4 +1,5 @@
 import { apiRequest, ApiError } from "./client";
+import { NoOneTimeKeysError, PeerNotReadyError } from "./e2ee";
 
 type Translate = (key: string) => string;
 
@@ -69,8 +70,19 @@ export interface ConversationListItem {
 /**
  * Maps an API failure to a localized human message using the backend's
  * machine error code; falls back to a generic message for unknown codes.
+ *
+ * The E2EE key directory raises two domain-specific failures that reach here
+ * from `setupSecretConversation`: {@link PeerNotReadyError} (the peer never
+ * published a bundle) and {@link NoOneTimeKeysError} (their key pool drained).
+ * Both get a dedicated, actionable string instead of the generic fallback.
  */
 export function apiErrorMessage(error: unknown, translate: Translate): string {
+  if (error instanceof PeerNotReadyError) {
+    return translate("errors.secret_peer_not_ready");
+  }
+  if (error instanceof NoOneTimeKeysError) {
+    return translate("errors.no_one_time_keys");
+  }
   if (!(error instanceof ApiError)) return translate("errors.unknown");
   switch (error.machine) {
     case "invalid_or_expired_code":

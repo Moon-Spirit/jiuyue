@@ -25,6 +25,7 @@ import type {
   Typing,
 } from "../lib/protocol/frames";
 import {
+  isE2eeMsg,
   parseFrame,
   ProtocolParseError,
   serializeFrame,
@@ -60,7 +61,7 @@ export type WsStatus =
 export type MessageStatus = "sending" | "delivered" | "read" | "failed";
 
 /** M8 media kind, mirrored on the wire as `MediaRef.kind`. */
-export type MediaKind = "image" | "video";
+export type MediaKind = "image" | "video" | "audio";
 
 /**
  * Local (camelCase) view of an M8 media attachment. Inbound `MediaRef`
@@ -77,6 +78,8 @@ export interface ChatMessageMedia {
   /** Natural pixel dimensions (best-effort); undefined when probe failed. */
   width?: number;
   height?: number;
+  /** Voice-message duration in ms (audio only); undefined otherwise. */
+  durationMs?: number;
 }
 
 /** Wire (`MediaRef`) → local (`ChatMessageMedia`) mapper. */
@@ -90,6 +93,7 @@ function fromMediaRef(ref: MediaRef): ChatMessageMedia {
   };
   if (ref.width !== undefined) media.width = ref.width;
   if (ref.height !== undefined) media.height = ref.height;
+  if (ref.duration_ms !== undefined) media.durationMs = ref.duration_ms;
   return media;
 }
 
@@ -104,6 +108,7 @@ function toMediaRef(media: ChatMessageMedia): MediaRef {
   };
   if (media.width !== undefined) ref.width = media.width;
   if (media.height !== undefined) ref.height = media.height;
+  if (media.durationMs !== undefined) ref.duration_ms = media.durationMs;
   return ref;
 }
 
@@ -128,6 +133,12 @@ export interface ChatMessage {
   replyToSenderId: string | null;
   replyToBodyPreview: string | null;
   forwardedFromUsername: string | null;
+  /**
+   * LOCAL-ONLY forward bookkeeping: the message_id of the source message, so
+   * retrying a failed forward can re-send it as a forward (the wire value is
+   * never echoed back by the server).
+   */
+  forwardOfMessageId?: string | null;
   /**
    * M3 secret chats: true when the ciphertext could not be decrypted
    * (missing session / tampered payload); renders a localized placeholder.
@@ -204,12 +215,6 @@ export const TYPING_SEND_THROTTLE_MS = 3_000;
 export const READ_UPDATE_DEBOUNCE_MS = 300;
 /** Sender-only recall window (mirrors the server-side RecallPolicy). */
 export const RECALL_WINDOW_MS = 120_000;
-/**
- * DECISION (forwarding): forward is a pure client-side compose of a NEW
- * normal message whose body is prefixed with this marker — zero wire or
- * schema change, visible to every receiver regardless of client.
- */
-export const FORWARD_BODY_PREFIX = "[转发] ";
 
 /**
  * Backoff schedule for reconnect attempt `n` (0-based): 500ms路2^n capped at
@@ -272,7 +277,9 @@ function loadPersistedConversations(): Conversation[] {
           ? c["lastMessagePreview"]
           : null,
       lastMessageKind:
-        c["lastMessageKind"] === "image" || c["lastMessageKind"] === "video"
+        c["lastMessageKind"] === "image" ||
+        c["lastMessageKind"] === "video" ||
+        c["lastMessageKind"] === "audio"
           ? c["lastMessageKind"]
           : undefined,
       lastActivityAt: String(c["lastActivityAt"] ?? ""),
@@ -310,7 +317,7 @@ function parsePersistedMedia(value: unknown): ChatMessageMedia | undefined {
   const fileName = value["fileName"];
   if (
     typeof mediaId !== "string" ||
-    (kind !== "image" && kind !== "video") ||
+    (kind !== "image" && kind !== "video" && kind !== "audio") ||
     typeof mime !== "string" ||
     typeof bytes !== "number" ||
     typeof fileName !== "string"
@@ -320,6 +327,8 @@ function parsePersistedMedia(value: unknown): ChatMessageMedia | undefined {
   const media: ChatMessageMedia = { mediaId, kind, mime, bytes, fileName };
   if (typeof value["width"] === "number") media.width = value["width"];
   if (typeof value["height"] === "number") media.height = value["height"];
+  if (typeof value["durationMs"] === "number")
+    media.durationMs = value["durationMs"];
   return media;
 }
 
@@ -368,6 +377,10 @@ function loadPersistedMessages(): Record<number, ChatMessage[]> {
           typeof m["forwardedFromUsername"] === "string"
             ? m["forwardedFromUsername"]
             : null,
+        forwardOfMessageId:
+          typeof m["forwardOfMessageId"] === "string"
+            ? m["forwardOfMessageId"]
+            : null,
         undecryptable: m["undecryptable"] === true,
       }));
     }
@@ -401,6 +414,8 @@ const lastSentReadSeq = new Map<number, number>();
  * avoids redundant round-trips).
  */
 let identityPublished = false;
+/** Pending one-shot retry for a failed proactive key publish (or null). */
+let identityPublishRetryTimer: ReturnType<typeof setTimeout> | null = null;
 
 /**
  * Deterministic local id for e2ee bubbles (djb2 over the ciphertext): the
@@ -575,6 +590,12 @@ export const useWsStore = defineStore("ws", {
       lastTypingSentAt = 0;
       typingActive = false;
       lastSentReadSeq.clear();
+      // Test hygiene / logout: the next connect must re-publish its identity.
+      identityPublished = false;
+      if (identityPublishRetryTimer !== null) {
+        clearTimeout(identityPublishRetryTimer);
+        identityPublishRetryTimer = null;
+      }
     },
 
     /**
@@ -586,6 +607,13 @@ export const useWsStore = defineStore("ws", {
     wipeUserData(): void {
       this.conversations = [];
       this.messagesByConversation = {};
+      // The prior account's published identity must not be assumed by the
+      // next login on this tab: clear the flag and any pending retry.
+      identityPublished = false;
+      if (identityPublishRetryTimer !== null) {
+        clearTimeout(identityPublishRetryTimer);
+        identityPublishRetryTimer = null;
+      }
       for (let i = localStorage.length - 1; i >= 0; i -= 1) {
         const key = localStorage.key(i);
         if (key === null) continue;
@@ -702,6 +730,10 @@ export const useWsStore = defineStore("ws", {
     onSocketOpen(): void {
       const ws = socket;
       if (ws === null) return;
+      // Proactive E2EE key publish: once per socket-open, best-effort. Making
+      // every user reachable for secret chat without pre-opening a thread.
+      // Never blocks the socket; retries once after a few seconds on failure.
+      void this.publishIdentityIfNeeded();
       // Bootstrap conversation discovery, then cursor-sync. Fresh sessions
       // (new browser/device) know no conversation ids locally; without the
       // server listing their sync.req would cover nothing (user story 7:
@@ -957,7 +989,14 @@ export const useWsStore = defineStore("ws", {
       // Multiple sync.res batches may arrive until complete:true; each is
       // merged idempotently and kept sorted by seq.
       for (const m of res.messages) {
-        this.ingestMessage(m);
+        // Untagged union: ciphertext entries are replayed secret-chat
+        // messages and must go through the e2ee decrypt path, NOT the
+        // plain ingest (they have no `body`).
+        if (isE2eeMsg(m)) {
+          this.handleE2eeMsg(m);
+        } else {
+          this.ingestMessage(m);
+        }
       }
     },
 
@@ -1048,6 +1087,42 @@ export const useWsStore = defineStore("ws", {
     // ------------------------------------------------------------------
 
     /**
+     * Proactive E2EE key publish: makes THIS user reachable for secret chat
+     * (the peer fetches our bundle) without either side pre-opening a thread.
+     * Best-effort and non-blocking: a failure retries once after a short
+     * delay; the socket flow never waits on it.
+     */
+    async publishIdentityIfNeeded(): Promise<void> {
+      if (identityPublished) return;
+      const auth = useAuthStore();
+      const token = await auth.ensureAccessToken();
+      if (token === null) return;
+      try {
+        await olm.publishBundle(token);
+        identityPublished = true;
+      } catch (error) {
+        console.warn("[ws] e2ee key publish failed, retrying once", error);
+        if (identityPublishRetryTimer !== null) {
+          clearTimeout(identityPublishRetryTimer);
+        }
+        identityPublishRetryTimer = setTimeout(() => {
+          identityPublishRetryTimer = null;
+          if (identityPublished) return;
+          void (async () => {
+            const retryToken = await useAuthStore().ensureAccessToken();
+            if (retryToken === null) return;
+            try {
+              await olm.publishBundle(retryToken);
+              identityPublished = true;
+            } catch (retryError) {
+              console.warn("[ws] e2ee key publish retry failed", retryError);
+            }
+          })();
+        }, 4_000);
+      }
+    },
+
+    /**
      * Ensures the device can participate in `conversationId`'s secret chat:
      * publishes this device's key bundle once per tab, then fetches the
      * peer's bundle and installs the initiator session. Throws on failure
@@ -1064,6 +1139,9 @@ export const useWsStore = defineStore("ws", {
         await olm.publishBundle(token);
         identityPublished = true;
       }
+      // Failures propagate as typed API errors (PeerNotReadyError on 404,
+      // NoOneTimeKeysError on 409); apiErrorMessage localizes them and the
+      // caller surfaces the result in `conversationError`.
       await olm.fetchPeerBundleAndEstablish(
         peerUsername,
         conversationId,
@@ -1174,6 +1252,9 @@ export const useWsStore = defineStore("ws", {
           t: "e2ee.msg",
           d: {
             conversation_id: message.conversationId,
+            // The server schema requires this idempotency key; omitting it
+            // made every secret send fail deserialization and vanish.
+            client_msg_id: message.clientMsgId,
             ciphertext,
             message_type: messageType,
           },
@@ -1227,9 +1308,19 @@ export const useWsStore = defineStore("ws", {
       conversationId: number,
       body: string,
       media?: ChatMessageMedia,
+      forward?: {
+        ofMessageId: string;
+        fromUsername: string | null;
+        /** Source body, mirrored locally so the bubble renders immediately. */
+        contentBody: string;
+        /** Source attachment, mirrored locally (never sent on the wire). */
+        contentMedia?: ChatMessageMedia;
+      },
     ): ChatMessage | null {
       const trimmed = body.trim();
-      if (trimmed.length === 0 && media === undefined) return null;
+      const isForward = forward !== undefined;
+      if (trimmed.length === 0 && media === undefined && !isForward)
+        return null;
 
       let conversation = this.conversations.find(
         (c) => c.conversationId === conversationId,
@@ -1253,6 +1344,22 @@ export const useWsStore = defineStore("ws", {
       // Secret chats relay opaque ciphertext only; a media attachment cannot
       // be end-to-end encrypted here, so refuse instead of leaking it.
       if (media !== undefined && conversation.kind === "secret") return null;
+      // Server-side forward copies plaintext/media from the source message,
+      // which is impossible over an E2EE channel — refuse rather than send an
+      // empty encrypted bubble.
+      if (isForward && conversation.kind === "secret") return null;
+
+      // Capture the composer reply context BEFORE it is cleared so the
+      // optimistic bubble shows the quote immediately (the server-confirmed
+      // metadata arrives later via ack/sync). A forward never quotes.
+      const replyContext = isForward ? null : this.replyContext;
+
+      // A forward's optimistic bubble mirrors the SOURCE content: it renders
+      // immediately and the later fanout adopts it as the SAME bubble (the
+      // orphan-match compares body + media id). The wire body stays empty and
+      // carries only forward_of_message_id — the server copies the content.
+      const localBody = forward !== undefined ? forward.contentBody : trimmed;
+      const localMedia = forward !== undefined ? forward.contentMedia : media;
 
       const message: ChatMessage = {
         clientMsgId: newClientMsgId(),
@@ -1260,31 +1367,29 @@ export const useWsStore = defineStore("ws", {
         conversationId,
         seq: null,
         senderId: this.mySenderId(),
-        body: trimmed,
-        media,
+        body: localBody,
+        media: localMedia,
         sentAt: new Date().toISOString(),
         mine: true,
         status: "sending",
         recalled: false,
-        replyToMessageId: null,
-        replyToSenderId: null,
-        replyToBodyPreview: null,
-        forwardedFromUsername: null,
+        replyToMessageId: replyContext?.messageId ?? null,
+        replyToSenderId: replyContext?.senderId ?? null,
+        replyToBodyPreview: replyContext?.bodyPreview ?? null,
+        forwardedFromUsername: forward?.fromUsername ?? null,
+        forwardOfMessageId: forward?.ofMessageId ?? null,
       };
       const messages = this.messagesByConversation[conversationId] ?? [];
       messages.push(message);
       this.sortMessages(messages);
       this.messagesByConversation[conversationId] = messages;
 
-      conversation.lastMessagePreview = trimmed;
+      conversation.lastMessagePreview = localBody;
       // Media previews render a localized placeholder from the kind (the body
       // is empty); a text send clears any previous media kind.
-      conversation.lastMessageKind = media?.kind;
+      conversation.lastMessageKind = localMedia?.kind;
       conversation.lastActivityAt = message.sentAt;
 
-      // Attach (and consume) the composer reply context. Conditional spread:
-      // a plain message must not carry a reply_to key at all.
-      const replyTo = this.replyContext?.messageId;
       this.clearReplyContext();
 
       if (conversation.kind === "secret") {
@@ -1300,10 +1405,17 @@ export const useWsStore = defineStore("ws", {
           d: {
             conversation_id: conversationId,
             client_msg_id: message.clientMsgId,
-            body: trimmed,
-            ...(media !== undefined ? { media: toMediaRef(media) } : {}),
-            ...(replyTo !== undefined && replyTo !== null
-              ? { reply_to: replyTo }
+            // A forward frame carries no body/media: the server copies the
+            // source content and echoes it back on msg.new.
+            body: isForward ? "" : trimmed,
+            ...(!isForward && media !== undefined
+              ? { media: toMediaRef(media) }
+              : {}),
+            ...(replyContext?.messageId !== undefined
+              ? { reply_to: replyContext.messageId }
+              : {}),
+            ...(isForward
+              ? { forward_of_message_id: forward.ofMessageId }
               : {}),
           },
         };
@@ -1353,15 +1465,25 @@ export const useWsStore = defineStore("ws", {
           // unrecoverable); the peer may render both copies — MVP tradeoff.
           void this.transmitSecretMessage(entry, entry.body);
         } else {
+          // Preserve forward semantics across a retry: re-send as a forward
+          // of the original source (empty body, no media — the server copies).
+          const forwardOf =
+            entry.forwardOfMessageId !== undefined &&
+            entry.forwardOfMessageId !== null
+              ? entry.forwardOfMessageId
+              : null;
           const frame: Frame = {
             v: 1,
             t: "msg.send",
             d: {
               conversation_id: entry.conversationId,
               client_msg_id: entry.clientMsgId,
-              body: entry.body,
-              ...(entry.media !== undefined
+              body: forwardOf !== null ? "" : entry.body,
+              ...(forwardOf === null && entry.media !== undefined
                 ? { media: toMediaRef(entry.media) }
+                : {}),
+              ...(forwardOf !== null
+                ? { forward_of_message_id: forwardOf }
                 : {}),
             },
           };
@@ -1457,19 +1579,37 @@ export const useWsStore = defineStore("ws", {
     },
 
     /**
-     * Forward = pure CLIENT-side compose of a NEW normal message with a
-     * "[转发] " body prefix (see FORWARD_BODY_PREFIX). Zero wire/schema
-     * change by decision; recalled sources have no content to forward.
+     * Forward = send a NORMAL msg frame carrying `forward_of_message_id`; the
+     * server copies the source's text/media/audio into the new message. The
+     * receiver learns attribution via `forwarded_from_username`.
+     *
+     * Requires a server-assigned id (unanswered optimistic bubbles have none)
+     * and a live (non-recalled) source. The optimistic badge shows the
+     * ORIGINAL sender: an already-forwarded source keeps its attribution
+     * chain, otherwise it is me (mine) or the source conversation's peer.
      */
     forwardMessage(
       toConversationId: number,
       source: ChatMessage,
     ): ChatMessage | null {
-      if (source.recalled || source.body.length === 0) return null;
-      return this.send(
-        toConversationId,
-        `${FORWARD_BODY_PREFIX}${source.body}`,
-      );
+      if (source.messageId === null || source.recalled) return null;
+      // Nothing to copy for an empty text bubble with no attachment (e.g. an
+      // undecryptable e2ee placeholder) — refuse rather than send a blank.
+      const contentMedia = source.media;
+      if (source.body.length === 0 && contentMedia === undefined) return null;
+      const fromUsername =
+        source.forwardedFromUsername ??
+        (source.mine
+          ? this.myUsername()
+          : (this.conversations.find(
+              (c) => c.conversationId === source.conversationId,
+            )?.peerUsername ?? null));
+      return this.send(toConversationId, "", undefined, {
+        ofMessageId: source.messageId,
+        fromUsername,
+        contentBody: source.body,
+        contentMedia,
+      });
     },
 
     /**
@@ -1627,6 +1767,13 @@ export const useWsStore = defineStore("ws", {
       const auth = useAuthStore();
       const userId = auth.user?.userId;
       return typeof userId === "string" && userId.length > 0 ? userId : "";
+    },
+
+    /** Current account's username (for forward attribution previews). */
+    myUsername(): string {
+      const auth = useAuthStore();
+      const username = auth.user?.username;
+      return typeof username === "string" ? username : "";
     },
 
     sortMessages(messages: ChatMessage[]): void {

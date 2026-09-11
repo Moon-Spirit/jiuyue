@@ -5,6 +5,8 @@ import authTicketReq from "../../../../crates/protocol/tests/golden/auth_ticket_
 import authTicketRes from "../../../../crates/protocol/tests/golden/auth_ticket_res.json";
 import msgSend from "../../../../crates/protocol/tests/golden/msg_send.json";
 import msgSendMedia from "../../../../crates/protocol/tests/golden/msg_send_media.json";
+import msgSendAudio from "../../../../crates/protocol/tests/golden/msg_send_audio.json";
+import msgSendForward from "../../../../crates/protocol/tests/golden/msg_send_forward.json";
 import msgAck from "../../../../crates/protocol/tests/golden/msg_ack.json";
 import msgNew from "../../../../crates/protocol/tests/golden/msg_new.json";
 import syncReq from "../../../../crates/protocol/tests/golden/sync_req.json";
@@ -22,11 +24,13 @@ import errorFrame from "../../../../crates/protocol/tests/golden/error.json";
 import unknownType from "../../../../crates/protocol/tests/golden/unknown_type.json";
 
 import {
+  isE2eeMsg,
   isFrame,
   isMediaRef,
   isMsgNew,
   isMsgSend,
   isSyncCursor,
+  isSyncRes,
   parseFrame,
   parseFrameText,
   serializeFrame,
@@ -38,6 +42,8 @@ const KNOWN_FIXTURES: [string, object][] = [
   ["auth_ticket_res", authTicketRes],
   ["msg_send", msgSend],
   ["msg_send_media", msgSendMedia],
+  ["msg_send_audio", msgSendAudio],
+  ["msg_send_forward", msgSendForward],
   ["msg_ack", msgAck],
   ["msg_new", msgNew],
   ["sync_req", syncReq],
@@ -225,10 +231,39 @@ describe("M8 media references (additive, null-absent)", () => {
     expect(isMediaRef(null)).toBe(false);
     expect(isMediaRef("x")).toBe(false);
     expect(isMediaRef({ ...validMedia, media_id: undefined })).toBe(false);
-    expect(isMediaRef({ ...validMedia, kind: "audio" })).toBe(false);
+    expect(isMediaRef({ ...validMedia, kind: "sticker" })).toBe(false);
     expect(isMediaRef({ ...validMedia, bytes: "12" })).toBe(false);
     expect(isMediaRef({ ...validMedia, width: "800" })).toBe(false);
     expect(isMediaRef({ ...validMedia, file_name: 7 })).toBe(false);
+  });
+
+  it("accepts an audio MediaRef carrying an optional duration_ms", () => {
+    const audio = {
+      media_id: validMedia.media_id,
+      kind: "audio",
+      mime: "audio/webm",
+      bytes: 4096,
+      file_name: "voice.webm",
+      duration_ms: 4200,
+    };
+    expect(isMediaRef(audio)).toBe(true);
+    // duration_ms is optional and must be an int when present.
+    const { duration_ms: _drop, ...withoutDuration } = audio;
+    expect(isMediaRef(withoutDuration)).toBe(true);
+    expect(isMediaRef({ ...audio, duration_ms: 1.5 })).toBe(false);
+  });
+
+  it("accepts audio media refs with an optional duration_ms", () => {
+    const audio = {
+      media_id: validMedia.media_id,
+      kind: "audio",
+      mime: "audio/webm",
+      bytes: 4321,
+      file_name: "voice.webm",
+    };
+    expect(isMediaRef(audio)).toBe(true);
+    expect(isMediaRef({ ...audio, duration_ms: 3_500 })).toBe(true);
+    expect(isMediaRef({ ...audio, duration_ms: "3500" })).toBe(false);
   });
 
   it("keeps msg.send valid when media is absent (M1 byte-identical)", () => {
@@ -300,5 +335,32 @@ describe("M8 media references (additive, null-absent)", () => {
         media: { ...validMedia, bytes: 1.5 },
       }),
     ).toBe(false);
+  });
+});
+
+describe("isSyncRes - untagged plain/secret union", () => {
+  it("accepts batches mixing plain replays and secret-chat ciphertext", () => {
+    expect(
+      isSyncRes({
+        messages: [
+          {
+            message_id: "m1",
+            conversation_id: 1,
+            seq: 1,
+            sender_id: "s",
+            body: "hi",
+            sent_at: "t",
+          },
+          { conversation_id: 1, client_msg_id: "c1", ciphertext: "opaque", message_type: 1 },
+        ],
+        complete: true,
+      }),
+    ).toBe(true);
+  });
+
+  it("rejects entries that are neither plain nor ciphertext", () => {
+    expect(isSyncRes({ messages: [{ hello: 1 }], complete: true })).toBe(false);
+    expect(isSyncRes({ messages: [], complete: "yes" })).toBe(false);
+    expect(isE2eeMsg({ conversation_id: 1, client_msg_id: "c1", ciphertext: "c", message_type: 1 })).toBe(true);
   });
 });

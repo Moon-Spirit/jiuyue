@@ -279,6 +279,7 @@ async fn send_and_ack(ws: &mut WsClient, conversation_id: i64, body: &str) -> Uu
             body: body.to_owned(),
             reply_to: None,
             media: None,
+            forward_of_message_id: None,
         }),
     };
     ws_send_text(ws, &serde_json::to_string(&frame).expect("serialize")).await;
@@ -751,6 +752,7 @@ async fn message_xp_is_10_per_100_chars_and_short_messages_earn_nothing() {
             body: "z".repeat(100),
             reply_to: None,
             media: None,
+            forward_of_message_id: None,
         }),
     };
     let wire = serde_json::to_string(&frame).expect("serialize");

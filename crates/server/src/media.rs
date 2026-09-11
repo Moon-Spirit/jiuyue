@@ -45,69 +45,97 @@ use uuid::Uuid;
 /// Bytes read up-front to sniff the format (all supported magics fit in 12).
 const SNIFF_LEN: usize = 16;
 
-/// A sniffed media kind + canonical mime.
+/// Container family detected by magic bytes.
+///
+/// A family pins the CONTAINER only, never the audio-vs-video distinction:
+/// EBML (webm), Ogg and ISO-BMFF (mp4 family) can each carry either an audio
+/// or a video track, and the bytes alone cannot tell them apart reliably
+/// (e.g. an audio-only `.m4a` and a `.mp4` share the `ftyp` box). The
+/// declared `Content-Type` therefore refines the family into a canonical mime
+/// in [`resolve_mime`], and the `kind` is derived from that mime prefix. The
+/// declarer and the sniffer must agree on the FAMILY envelope; disagreement
+/// is a `415`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Detected {
-    kind: &'static str,
-    mime: &'static str,
+enum Family {
+    Png,
+    Jpeg,
+    Gif,
+    Webp,
+    /// EBML header (webm/matroska): `video/webm` | `audio/webm`.
+    Ebml,
+    /// Ogg container: accepted only as `audio/ogg` in this build.
+    Ogg,
+    /// ISO base media file format (`ftyp` box): mp4/m4a/quicktime family.
+    IsoBmff,
 }
 
-/// Magic-byte type detection. Returns `None` for anything unsupported (or
+/// Magic-byte FAMILY detection. Returns `None` for anything unsupported (or
 /// truncated); callers map that to `415`.
-fn sniff(prefix: &[u8]) -> Option<Detected> {
+fn sniff_family(prefix: &[u8]) -> Option<Family> {
     // PNG: 89 50 4E 47 0D 0A 1A 0A
     if prefix.starts_with(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]) {
-        return Some(Detected {
-            kind: "image",
-            mime: "image/png",
-        });
+        return Some(Family::Png);
     }
     // JPEG: FF D8 FF
     if prefix.starts_with(&[0xFF, 0xD8, 0xFF]) {
-        return Some(Detected {
-            kind: "image",
-            mime: "image/jpeg",
-        });
+        return Some(Family::Jpeg);
     }
     // GIF: "GIF87a" | "GIF89a"
     if prefix.starts_with(b"GIF87a") || prefix.starts_with(b"GIF89a") {
-        return Some(Detected {
-            kind: "image",
-            mime: "image/gif",
-        });
+        return Some(Family::Gif);
     }
     // WebP: "RIFF" .... "WEBP" (bytes 0-3 and 8-11)
     if prefix.len() >= 12 && &prefix[0..4] == b"RIFF" && &prefix[8..12] == b"WEBP" {
-        return Some(Detected {
-            kind: "image",
-            mime: "image/webp",
-        });
+        return Some(Family::Webp);
     }
     // WebM / Matroska EBML header: 1A 45 DF A3
     if prefix.starts_with(&[0x1A, 0x45, 0xDF, 0xA3]) {
-        return Some(Detected {
-            kind: "video",
-            mime: "video/webm",
-        });
+        return Some(Family::Ebml);
     }
-    // ISO base media file format: `ftyp` box at offset 4, brand at 8..12.
+    // Ogg container: "OggS"
+    if prefix.starts_with(b"OggS") {
+        return Some(Family::Ogg);
+    }
+    // ISO base media file format: `ftyp` box at offset 4.
     if prefix.len() >= 12 && &prefix[4..8] == b"ftyp" {
-        let brand = String::from_utf8_lossy(&prefix[8..12]);
-        let brand = brand.trim_end();
-        return match brand {
-            "isom" | "iso2" | "mp41" | "mp42" => Some(Detected {
-                kind: "video",
-                mime: "video/mp4",
-            }),
-            // `qt  ` and `M4V ` trim to these.
-            "qt" | "M4V" => Some(Detected {
-                kind: "video",
-                mime: "video/quicktime",
-            }),
-            _ => None,
-        };
+        return Some(Family::IsoBmff);
     }
     None
+}
+
+/// Resolves the canonical mime from a (container family, declared mime) pair,
+/// or `None` when the declared type does not belong to the sniffed family.
+///
+/// Audio-vs-video is decided HERE, by the declared MIME prefix, because the
+/// container bytes cannot: `(Ebml, "audio/webm")` and `(Ebml, "video/webm")`
+/// sniff identically, as do `(IsoBmff, "audio/mp4")` and
+/// `(IsoBmff, "video/mp4")`.
+fn resolve_mime(family: Family, declared: &str) -> Option<&'static str> {
+    match (family, declared) {
+        (Family::Png, "image/png") => Some("image/png"),
+        (Family::Jpeg, "image/jpeg") => Some("image/jpeg"),
+        (Family::Gif, "image/gif") => Some("image/gif"),
+        (Family::Webp, "image/webp") => Some("image/webp"),
+        (Family::Ebml, "video/webm") => Some("video/webm"),
+        (Family::Ebml, "audio/webm") => Some("audio/webm"),
+        (Family::Ogg, "audio/ogg") => Some("audio/ogg"),
+        (Family::IsoBmff, "video/mp4") => Some("video/mp4"),
+        (Family::IsoBmff, "video/quicktime") => Some("video/quicktime"),
+        (Family::IsoBmff, "audio/mp4") => Some("audio/mp4"),
+        _ => None,
+    }
+}
+
+/// Canonical `kind` derived from a resolved mime: `audio/*` → `"audio"`,
+/// everything else image/video by prefix.
+fn kind_for_mime(mime: &str) -> &'static str {
+    if mime.starts_with("audio/") {
+        "audio"
+    } else if mime.starts_with("image/") {
+        "image"
+    } else {
+        "video"
+    }
 }
 
 /// Parses the declared `Content-Type` down to one of the accepted canonical
@@ -129,6 +157,9 @@ fn canonical_content_type(raw: Option<&HeaderValue>) -> Option<&'static str> {
         "video/mp4" => Some("video/mp4"),
         "video/quicktime" => Some("video/quicktime"),
         "video/webm" => Some("video/webm"),
+        "audio/webm" => Some("audio/webm"),
+        "audio/ogg" => Some("audio/ogg"),
+        "audio/mp4" => Some("audio/mp4"),
         _ => None,
     }
 }
@@ -143,6 +174,9 @@ fn ext_for_mime(mime: &str) -> Option<&'static str> {
         "video/mp4" => Some("mp4"),
         "video/quicktime" => Some("mov"),
         "video/webm" => Some("webm"),
+        "audio/webm" => Some("webm"),
+        "audio/ogg" => Some("ogg"),
+        "audio/mp4" => Some("m4a"),
         _ => None,
     }
 }
@@ -211,6 +245,10 @@ pub async fn upload(
     let (parts, body) = request.into_parts();
     let declared = canonical_content_type(parts.headers.get(CONTENT_TYPE))
         .ok_or(AppError::UnsupportedMediaType)?;
+    // Size cap: audio deliberately shares the VIDEO cap (200 MiB default,
+    // `JIUYUE_MEDIA_MAX_VIDEO_BYTES`). Voice clips are small in practice, and
+    // reusing the existing cap avoids inventing a second env knob for a
+    // per-kind limit nobody asked to tune. Only images get the tighter cap.
     let cap = if declared.starts_with("image/") {
         state.media_max_image_bytes
     } else {
@@ -258,12 +296,13 @@ pub async fn upload(
     if prefix.is_empty() {
         return Err(AppError::BadRequest("empty request body".to_owned()));
     }
-    let detected = sniff(&prefix).ok_or(AppError::UnsupportedMediaType)?;
-    if detected.mime != declared {
-        return Err(AppError::UnsupportedMediaType);
-    }
-    let ext = ext_for_mime(detected.mime)
-        .ok_or_else(|| AppError::internal(anyhow::anyhow!("unmapped mime `{}`", detected.mime)))?;
+    // Declarer/sniffer must agree on the container FAMILY; the declared mime
+    // refines it into the canonical type (and thus the audio-vs-video kind).
+    let family = sniff_family(&prefix).ok_or(AppError::UnsupportedMediaType)?;
+    let mime = resolve_mime(family, declared).ok_or(AppError::UnsupportedMediaType)?;
+    let kind = kind_for_mime(mime);
+    let ext = ext_for_mime(mime)
+        .ok_or_else(|| AppError::internal(anyhow::anyhow!("unmapped mime `{mime}`")))?;
 
     // Open the destination only after the type is proven, so rejected
     // uploads never create files.
@@ -320,8 +359,8 @@ pub async fn upload(
     )
     .bind(media_id)
     .bind(user.0)
-    .bind(detected.kind)
-    .bind(detected.mime)
+    .bind(kind)
+    .bind(mime)
     .bind(bytes)
     .bind(&file_name)
     .execute(&state.pool)
@@ -331,13 +370,13 @@ pub async fn upload(
         return Err(AppError::internal(err));
     }
 
-    tracing::info!(%media_id, owner = %user.0, kind = detected.kind, bytes, "media uploaded");
+    tracing::info!(%media_id, owner = %user.0, kind, bytes, "media uploaded");
     Ok((
         StatusCode::CREATED,
         Json(UploadResponse {
             media_id,
-            kind: detected.kind.to_owned(),
-            mime: detected.mime.to_owned(),
+            kind: kind.to_owned(),
+            mime: mime.to_owned(),
             bytes,
             file_name,
         }),
@@ -404,6 +443,7 @@ mod tests {
     const GIF: &[u8] = b"GIF89a.....";
     const WEBP: &[u8] = b"RIFF\x00\x00\x00\x00WEBPVP8 ";
     const WEBM: &[u8] = &[0x1A, 0x45, 0xDF, 0xA3, 0x01, 0x00];
+    const OGG: &[u8] = b"OggS\x00\x02\x00\x00\x00\x00\x00\x00";
     fn mp4_brand(brand: &[u8; 4]) -> Vec<u8> {
         let mut out = vec![0, 0, 0, 0x18];
         out.extend_from_slice(b"ftyp");
@@ -413,25 +453,53 @@ mod tests {
     }
 
     #[test]
-    fn sniff_recognises_every_supported_magic() {
-        assert_eq!(sniff(PNG).unwrap().mime, "image/png");
-        assert_eq!(sniff(JPEG).unwrap().mime, "image/jpeg");
-        assert_eq!(sniff(GIF).unwrap().mime, "image/gif");
-        assert_eq!(sniff(WEBP).unwrap().mime, "image/webp");
-        assert_eq!(sniff(WEBM).unwrap().mime, "video/webm");
-        assert_eq!(sniff(&mp4_brand(b"isom")).unwrap().mime, "video/mp4");
-        assert_eq!(sniff(&mp4_brand(b"qt  ")).unwrap().mime, "video/quicktime");
-        assert_eq!(sniff(&mp4_brand(b"M4V ")).unwrap().mime, "video/quicktime");
-        assert_eq!(sniff(&mp4_brand(b"qt  ")).unwrap().kind, "video");
+    fn sniff_recognises_every_supported_family_and_resolves_its_mimes() {
+        assert_eq!(sniff_family(PNG), Some(Family::Png));
+        assert_eq!(sniff_family(JPEG), Some(Family::Jpeg));
+        assert_eq!(sniff_family(GIF), Some(Family::Gif));
+        assert_eq!(sniff_family(WEBP), Some(Family::Webp));
+        assert_eq!(sniff_family(WEBM), Some(Family::Ebml));
+        assert_eq!(sniff_family(OGG), Some(Family::Ogg));
+        assert_eq!(sniff_family(&mp4_brand(b"isom")), Some(Family::IsoBmff));
+
+        assert_eq!(resolve_mime(Family::Png, "image/png"), Some("image/png"));
+        assert_eq!(resolve_mime(Family::Jpeg, "image/jpeg"), Some("image/jpeg"));
+        assert_eq!(resolve_mime(Family::Gif, "image/gif"), Some("image/gif"));
+        assert_eq!(resolve_mime(Family::Webp, "image/webp"), Some("image/webp"));
+        // EBML carries both audio and video webm; declared mime decides.
+        assert_eq!(resolve_mime(Family::Ebml, "video/webm"), Some("video/webm"));
+        assert_eq!(resolve_mime(Family::Ebml, "audio/webm"), Some("audio/webm"));
+        assert_eq!(resolve_mime(Family::Ogg, "audio/ogg"), Some("audio/ogg"));
+        assert_eq!(
+            resolve_mime(Family::IsoBmff, "video/mp4"),
+            Some("video/mp4")
+        );
+        assert_eq!(
+            resolve_mime(Family::IsoBmff, "video/quicktime"),
+            Some("video/quicktime")
+        );
+        assert_eq!(resolve_mime(Family::IsoBmff, "audio/mp4"), Some("audio/mp4"));
+
+        // Family disagreement is a hard reject (e.g. audio declared over PNG).
+        assert_eq!(resolve_mime(Family::Png, "audio/webm"), None);
+        assert_eq!(resolve_mime(Family::Ogg, "video/webm"), None);
     }
 
     #[test]
-    fn sniff_rejects_unknown_brand_and_garbage() {
-        assert!(sniff(&mp4_brand(b"zzzz")).is_none());
-        assert!(sniff(b"not media at all").is_none());
-        assert!(sniff(&[]).is_none());
-        // "ftyp" present but too short to read a full brand.
-        assert!(sniff(b"\x00\x00\x00\x18ftyp").is_none());
+    fn kind_is_derived_from_the_resolved_mime_prefix() {
+        assert_eq!(kind_for_mime("image/png"), "image");
+        assert_eq!(kind_for_mime("video/mp4"), "video");
+        assert_eq!(kind_for_mime("audio/webm"), "audio");
+        assert_eq!(kind_for_mime("audio/ogg"), "audio");
+        assert_eq!(kind_for_mime("audio/mp4"), "audio");
+    }
+
+    #[test]
+    fn sniff_rejects_garbage_and_truncated_headers() {
+        assert!(sniff_family(b"not media at all").is_none());
+        assert!(sniff_family(&[]).is_none());
+        // "ftyp" present but too short to read the box header fully.
+        assert!(sniff_family(b"\x00\x00\x00\x18ftyp").is_none());
     }
 
     #[test]
@@ -448,6 +516,18 @@ mod tests {
         assert_eq!(
             canonical_content_type(Some(&value("video/quicktime"))),
             Some("video/quicktime")
+        );
+        assert_eq!(
+            canonical_content_type(Some(&value("audio/webm"))),
+            Some("audio/webm")
+        );
+        assert_eq!(
+            canonical_content_type(Some(&value(" AUDIO/OGG ; codecs=opus"))),
+            Some("audio/ogg")
+        );
+        assert_eq!(
+            canonical_content_type(Some(&value("audio/mp4"))),
+            Some("audio/mp4")
         );
         assert_eq!(
             canonical_content_type(Some(&value("application/pdf"))),
@@ -492,6 +572,9 @@ mod tests {
     fn ext_mapping_matches_mime() {
         assert_eq!(ext_for_mime("image/jpeg"), Some("jpg"));
         assert_eq!(ext_for_mime("video/quicktime"), Some("mov"));
+        assert_eq!(ext_for_mime("audio/webm"), Some("webm"));
+        assert_eq!(ext_for_mime("audio/ogg"), Some("ogg"));
+        assert_eq!(ext_for_mime("audio/mp4"), Some("m4a"));
         assert_eq!(ext_for_mime("application/pdf"), None);
     }
 }

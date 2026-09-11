@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createPinia, setActivePinia } from "pinia";
 import en from "../i18n/locales/en";
 import zhCN from "../i18n/locales/zh-CN";
+import { PeerNotReadyError } from "../lib/api/e2ee";
 import * as olm from "../lib/crypto/olm-lite";
 import { useAuthStore } from "./auth";
 import { useWsStore } from "./ws";
@@ -161,6 +162,7 @@ describe("ws store — M3 secret conversations", () => {
     expect(e2ee).toHaveLength(1);
     expect(e2ee[0]?.d["conversation_id"]).toBe(1);
     expect(e2ee[0]?.d["message_type"]).toBe(0); // session-init
+    expect(e2ee[0]?.d["client_msg_id"]).toBe(message?.clientMsgId);
     const ciphertext = e2ee[0]?.d["ciphertext"];
     expect(typeof ciphertext).toBe("string");
     expect(ciphertext).not.toContain("hidden");
@@ -233,6 +235,7 @@ describe("ws store — M3 secret conversations", () => {
       t: "e2ee.msg",
       d: {
         conversation_id: 1,
+        client_msg_id: "cmid-inbound",
         ciphertext: reply.ciphertext,
         message_type: reply.messageType,
       },
@@ -280,7 +283,8 @@ describe("ws store — M3 secret conversations", () => {
       t: "e2ee.msg",
       d: {
         conversation_id: 1,
-        ciphertext: "!!!not-a-valid-envelope",
+        client_msg_id: "cmid-garbage",
+            ciphertext: "!!!not-a-valid-envelope",
         message_type: 1,
       },
     });
@@ -311,5 +315,140 @@ describe("M3 i18n strings exist in both locales", () => {
     }
     expect(typeof zhCN.errors.no_one_time_keys).toBe("string");
     expect(typeof en.errors.no_one_time_keys).toBe("string");
+  });
+
+  it("covers the peer-not-ready secret-chat key", () => {
+    expect(typeof zhCN.errors.secret_peer_not_ready).toBe("string");
+    expect(typeof en.errors.secret_peer_not_ready).toBe("string");
+  });
+});
+
+describe("ws store — M3 proactive key publish & peer readiness", () => {
+  it("publishes this device's key bundle once the socket opens", async () => {
+    const posts: string[] = [];
+    fetchMock.mockImplementation(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        if ((init?.method ?? "GET") !== "GET") posts.push(url);
+        if (url.includes("/api/auth/ws-ticket"))
+          return jsonResponse(200, { ticket: "t1" });
+        if (url.includes("/api/e2ee/keys/upload")) return jsonResponse(201, {});
+        if (url.includes("/api/conversations")) return jsonResponse(200, []);
+        return jsonResponse(200, {});
+      },
+    );
+
+    const auth = useAuthStore();
+    auth.accessToken = "tok";
+    auth.user = { userId: "7", username: "me", uid: 1000007 };
+    const store = useWsStore();
+    await store.connect();
+    const sock = lastSocket();
+    sock.serverOpen();
+
+    await vi.waitFor(
+      () => {
+        expect(posts.some((url) => url.includes("/api/e2ee/keys/upload"))).toBe(
+          true,
+        );
+      },
+      { timeout: 8000, interval: 25 },
+    );
+    // No secret conversation was opened — the publish is proactive.
+    expect(store.conversations).toHaveLength(0);
+  });
+
+  it("rejects a secret conversation whose peer has no published bundle", async () => {
+    fetchMock.mockImplementation(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        if (url.includes("/api/auth/ws-ticket"))
+          return jsonResponse(200, { ticket: "t1" });
+        if (url.includes("/api/e2ee/keys/upload")) return jsonResponse(201, {});
+        if (url.includes("/api/e2ee/keys/bob"))
+          return jsonResponse(404, {
+            error: "peer_not_found",
+            message: "no bundle",
+          });
+        if (url.includes("/api/conversations")) {
+          if ((init?.method ?? "GET") === "POST") {
+            return jsonResponse(201, {
+              conversation_id: 1,
+              peer: { user_id: "u-bob", username: "bob" },
+              created: true,
+              kind: "secret",
+            });
+          }
+          return jsonResponse(200, []);
+        }
+        return jsonResponse(200, {});
+      },
+    );
+
+    const auth = useAuthStore();
+    auth.accessToken = "tok";
+    auth.user = { userId: "7", username: "me", uid: 1000007 };
+    const store = useWsStore();
+    await store.connect();
+    lastSocket().serverOpen();
+    await settle();
+
+    await expect(
+      store.createOrOpenConversation("bob", "secret"),
+    ).rejects.toBeInstanceOf(PeerNotReadyError);
+  });
+});
+
+describe("ws store - sync replay of secret chats", () => {
+  it("routes replayed ciphertext entries from sync.res through the decrypt path", async () => {
+    const store = useWsStore();
+    store.conversations.push({
+      conversationId: 1,
+      peerUserId: "u-bob",
+      peerUsername: "bob",
+      lastMessagePreview: null,
+      lastActivityAt: "",
+      unread: 0,
+      lastSeenSeq: 0,
+      maxSeq: 0,
+      peerTypingUntil: null,
+      kind: "secret",
+    });
+    const auth = useAuthStore();
+    auth.accessToken = "tok";
+    auth.user = { userId: "7", username: "me", uid: 1000007 };
+    fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes("/api/auth/ws-ticket"))
+        return jsonResponse(200, { ticket: "t1" });
+      return jsonResponse(200, []);
+    });
+    await store.connect();
+    const sock = lastSocket();
+    sock.serverOpen();
+    await settle();
+
+    // Regression: before the fix the guard rejected the mixed batch as
+    // malformed, so replayed secret messages never reached the decrypt path.
+    sock.serverFrame({
+      v: 1,
+      t: "sync.res",
+      d: {
+        messages: [
+          {
+            conversation_id: 1,
+            client_msg_id: "cmid-garbage",
+            ciphertext: "!!!not-a-valid-envelope",
+            message_type: 1,
+          },
+        ],
+        complete: true,
+      },
+    });
+    await settle();
+
+    const messages = store.messagesByConversation[1] ?? [];
+    expect(messages).toHaveLength(1);
+    expect(messages[0]?.undecryptable).toBe(true);
   });
 });

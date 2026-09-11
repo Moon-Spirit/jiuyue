@@ -290,6 +290,7 @@ async fn send_and_ack_replying_to(
             body: body.to_owned(),
             reply_to,
             media: None,
+            forward_of_message_id: None,
         }),
     };
     ws_send_text(ws, &serde_json::to_string(&frame).expect("serialize")).await;
@@ -806,6 +807,7 @@ async fn reply_to_foreign_or_unknown_message_is_bad_request_without_persisting()
                 body: "bad reply".to_owned(),
                 reply_to: Some(target),
                 media: None,
+                forward_of_message_id: None,
             }),
         };
         ws_send_text(

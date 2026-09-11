@@ -62,6 +62,31 @@ const lightboxMedia = ref<ChatMessageMedia | null>(null);
 const imageInputEl = ref<HTMLInputElement | null>(null);
 const videoInputEl = ref<HTMLInputElement | null>(null);
 
+// --- M9 voice messages: recorder + custom minimal audio player ----------
+const recording = ref(false);
+const recordingSeconds = ref(0);
+let mediaRecorder: MediaRecorder | null = null;
+let recordedChunks: Blob[] = [];
+let recordingTimer: ReturnType<typeof setInterval> | null = null;
+let recordingStartedAt = 0;
+let recordingCancelled = false;
+let recordingStream: MediaStream | null = null;
+
+/** Live recording clock as mm:ss. */
+const voiceTimer = computed(() => {
+  const total = recordingSeconds.value;
+  const mm = String(Math.floor(total / 60)).padStart(2, "0");
+  const ss = String(total % 60).padStart(2, "0");
+  return `${mm}:${ss}`;
+});
+
+/** mediaId of the audio bubble currently playing (null = idle). */
+const playingMediaId = ref<string | null>(null);
+/** 0–1 playback progress of the active voice bubble. */
+const audioProgress = ref(0);
+/** Single lazily-created element; starting another pauses the previous. */
+let audioEl: HTMLAudioElement | null = null;
+
 /** Secret chats are e2ee-only: media attachments are not offered there. */
 const mediaEnabled = computed(
   () =>
@@ -80,6 +105,17 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
   document.removeEventListener("keydown", onGlobalKeydown);
+  // Release the microphone and any playing audio element cleanly.
+  if (recording.value && mediaRecorder !== null) {
+    recordingCancelled = true;
+    try {
+      mediaRecorder.stop();
+    } catch {
+      // Recorder already stopped — nothing to release.
+    }
+  }
+  resetRecordingState();
+  pauseAudio();
 });
 
 watch(
@@ -154,6 +190,7 @@ function truncatePreview(body: string | null): string {
 function conversationPreview(conversation: Conversation): string {
   if (conversation.lastMessageKind === "image") return t("chat.previewImage");
   if (conversation.lastMessageKind === "video") return t("chat.previewVideo");
+  if (conversation.lastMessageKind === "audio") return t("chat.previewAudio");
   return truncatePreview(conversation.lastMessagePreview);
 }
 
@@ -192,6 +229,8 @@ async function submitNewConversation(): Promise<void> {
     newPeerUsername.value = "";
     newConversationKind.value = "direct";
   } catch (error) {
+    // PeerNotReadyError (secret peer never published keys) and
+    // NoOneTimeKeysError are localized inside apiErrorMessage.
     conversationError.value = apiErrorMessage(error, (key) => t(key));
   } finally {
     creatingConversation.value = false;
@@ -546,6 +585,281 @@ async function handleMediaFile(file: File): Promise<void> {
   } finally {
     uploading.value = false;
     uploadPercent.value = 0;
+  }
+}
+
+// ---------------------------------------------------------------------
+// M9 voice messages: MediaRecorder capture + custom minimal player
+// ---------------------------------------------------------------------
+
+/** Preferred recorder container: opus/webm when supported, else defaults. */
+function pickAudioMime(): string | null {
+  if (typeof MediaRecorder === "undefined") return null;
+  const candidates = [
+    "audio/webm;codecs=opus",
+    "audio/webm",
+    "audio/ogg;codecs=opus",
+    "audio/mp4",
+  ];
+  if (typeof MediaRecorder.isTypeSupported !== "function") return null;
+  for (const candidate of candidates) {
+    if (MediaRecorder.isTypeSupported(candidate)) return candidate;
+  }
+  return null;
+}
+
+function clearRecordingTimer(): void {
+  if (recordingTimer !== null) {
+    clearInterval(recordingTimer);
+    recordingTimer = null;
+  }
+}
+
+function stopRecordingTracks(): void {
+  recordingStream?.getTracks().forEach((track) => track.stop());
+  recordingStream = null;
+}
+
+/** Returns the composer to an idle state; safe to call from any path. */
+function resetRecordingState(): void {
+  clearRecordingTimer();
+  stopRecordingTracks();
+  mediaRecorder = null;
+  recordedChunks = [];
+  recordingCancelled = false;
+  recording.value = false;
+  recordingSeconds.value = 0;
+}
+
+function voiceErrorMessage(error: unknown): string {
+  if (error instanceof MediaUploadError) {
+    if (error.code === "too_large") {
+      return t("chat.mediaTooLarge", {
+        limit: formatBytes(maxBytesForKind("audio")),
+      });
+    }
+    if (error.code === "unsupported_type") {
+      return t("chat.mediaUnsupportedType");
+    }
+  }
+  return t("chat.voiceUploadFailed");
+}
+
+async function startVoiceRecording(): Promise<void> {
+  const conversationId = ws.activeConversationId;
+  if (
+    recording.value ||
+    uploading.value ||
+    conversationId === null ||
+    !ws.isConnected ||
+    !mediaEnabled.value
+  ) {
+    return;
+  }
+  if (
+    typeof MediaRecorder === "undefined" ||
+    typeof navigator === "undefined" ||
+    navigator.mediaDevices?.getUserMedia === undefined
+  ) {
+    uploadError.value = t("chat.voicePermissionDenied");
+    return;
+  }
+  uploadError.value = "";
+  let stream: MediaStream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  } catch {
+    // Permission denied / no device: surface a localized error and reset.
+    uploadError.value = t("chat.voicePermissionDenied");
+    resetRecordingState();
+    return;
+  }
+  recordingStream = stream;
+  recordedChunks = [];
+  recordingCancelled = false;
+
+  const mime = pickAudioMime();
+  let recorder: MediaRecorder;
+  try {
+    recorder =
+      mime !== null
+        ? new MediaRecorder(stream, { mimeType: mime })
+        : new MediaRecorder(stream);
+  } catch {
+    try {
+      recorder = new MediaRecorder(stream);
+    } catch {
+      uploadError.value = t("chat.voiceUploadFailed");
+      resetRecordingState();
+      return;
+    }
+  }
+  mediaRecorder = recorder;
+  recorder.ondataavailable = (event: BlobEvent) => {
+    if (event.data !== undefined && event.data.size > 0) {
+      recordedChunks.push(event.data);
+    }
+  };
+  recorder.onstop = () => {
+    void finishVoiceRecording(conversationId);
+  };
+  recorder.onerror = () => {
+    uploadError.value = t("chat.voiceUploadFailed");
+    resetRecordingState();
+  };
+
+  recordingStartedAt = Date.now();
+  recordingSeconds.value = 0;
+  recording.value = true;
+  clearRecordingTimer();
+  recordingTimer = setInterval(() => {
+    recordingSeconds.value = Math.floor(
+      (Date.now() - recordingStartedAt) / 1000,
+    );
+  }, 250);
+  try {
+    recorder.start();
+  } catch {
+    uploadError.value = t("chat.voiceUploadFailed");
+    resetRecordingState();
+  }
+}
+
+function stopVoiceRecording(): void {
+  if (!recording.value || mediaRecorder === null) return;
+  if (mediaRecorder.state !== "inactive") {
+    mediaRecorder.stop();
+  } else {
+    resetRecordingState();
+  }
+}
+
+function cancelVoiceRecording(): void {
+  if (!recording.value) return;
+  recordingCancelled = true;
+  if (mediaRecorder !== null && mediaRecorder.state !== "inactive") {
+    mediaRecorder.stop();
+  } else {
+    resetRecordingState();
+  }
+}
+
+/** onstop → upload the recorded blob verbatim and send an audio message. */
+async function finishVoiceRecording(conversationId: number): Promise<void> {
+  const durationMs = Math.max(0, Date.now() - recordingStartedAt);
+  const chunks = recordedChunks;
+  const cancelled = recordingCancelled;
+  const recorderMime = mediaRecorder?.mimeType ?? "";
+  resetRecordingState();
+
+  if (cancelled || chunks.length === 0) return;
+
+  const containerMime =
+    recorderMime.split(";")[0]?.trim() !== ""
+      ? (recorderMime.split(";")[0]?.trim() ?? "audio/webm")
+      : "audio/webm";
+  const blob = new Blob(chunks, { type: containerMime });
+  const ext = containerMime.includes("ogg")
+    ? "ogg"
+    : containerMime.includes("mp4")
+      ? "m4a"
+      : "webm";
+  const file = new File([blob], `voice-${Date.now()}.${ext}`, {
+    type: containerMime,
+  });
+
+  uploading.value = true;
+  uploadPercent.value = 0;
+  try {
+    const token = await auth.ensureAccessToken();
+    if (token === null) {
+      uploadError.value = t("chat.voiceUploadFailed");
+      return;
+    }
+    const result = await uploadMedia(token, file, (percent) => {
+      uploadPercent.value = percent;
+    });
+    const media: ChatMessageMedia = {
+      mediaId: result.media_id,
+      kind: "audio",
+      mime: result.mime,
+      bytes: result.bytes,
+      fileName: result.file_name,
+      durationMs,
+    };
+    ws.sendMedia(conversationId, media);
+  } catch (error) {
+    uploadError.value = voiceErrorMessage(error);
+  } finally {
+    uploading.value = false;
+    uploadPercent.value = 0;
+  }
+}
+
+/** mm:ss label for a stored voice duration (0 when unknown). */
+function formatDuration(durationMs: number | undefined): string {
+  const totalSecs = Math.max(0, Math.round((durationMs ?? 0) / 1000));
+  const mm = String(Math.floor(totalSecs / 60)).padStart(2, "0");
+  const ss = String(totalSecs % 60).padStart(2, "0");
+  return `${mm}:${ss}`;
+}
+
+/** Pauses and rewinds the shared audio element, clearing player state. */
+function pauseAudio(): void {
+  if (audioEl !== null) {
+    try {
+      audioEl.pause();
+      audioEl.currentTime = 0;
+    } catch {
+      // jsdom / detached element: nothing to stop.
+    }
+  }
+  playingMediaId.value = null;
+  audioProgress.value = 0;
+}
+
+/** Play/pause one voice bubble; starting another pauses the previous one. */
+function toggleAudio(media: ChatMessageMedia): void {
+  if (playingMediaId.value === media.mediaId) {
+    pauseAudio();
+    return;
+  }
+  if (audioEl !== null) {
+    try {
+      audioEl.pause();
+      audioEl.currentTime = 0;
+    } catch {
+      // Detached element — replace it below.
+    }
+  }
+  if (typeof Audio === "undefined") return;
+  const el = new Audio(mediaUrl(media));
+  audioEl = el;
+  playingMediaId.value = media.mediaId;
+  audioProgress.value = 0;
+  el.addEventListener("timeupdate", () => {
+    const fallback = (media.durationMs ?? 0) / 1000;
+    const dur =
+      Number.isFinite(el.duration) && el.duration > 0 ? el.duration : fallback;
+    audioProgress.value = dur > 0 ? Math.min(1, el.currentTime / dur) : 0;
+  });
+  el.addEventListener("ended", () => {
+    playingMediaId.value = null;
+    audioProgress.value = 0;
+  });
+  el.addEventListener("error", () => {
+    playingMediaId.value = null;
+    audioProgress.value = 0;
+  });
+  try {
+    const played = el.play();
+    if (played !== undefined && typeof played.catch === "function") {
+      played.catch(() => {
+        playingMediaId.value = null;
+      });
+    }
+  } catch {
+    playingMediaId.value = null;
   }
 }
 </script>
@@ -937,6 +1251,16 @@ async function handleMediaFile(file: File): Promise<void> {
                   class="inline-block"
                   data-testid="media-bubble"
                 >
+                  <span
+                    v-if="message.forwardedFromUsername"
+                    class="mb-0.5 block text-[11px] text-neutral-400 dark:text-neutral-500"
+                    data-testid="forward-badge"
+                    >{{
+                      t("chat.forwardedFrom", {
+                        username: message.forwardedFromUsername,
+                      })
+                    }}</span
+                  >
                   <img
                     v-if="message.media.kind === 'image'"
                     :src="mediaUrl(message.media)"
@@ -947,6 +1271,52 @@ async function handleMediaFile(file: File): Promise<void> {
                     data-testid="media-image"
                     @click="openLightbox(message.media)"
                   />
+                  <!-- M9 voice: custom minimal player (no native chrome). -->
+                  <div
+                    v-else-if="message.media.kind === 'audio'"
+                    class="flex min-w-[180px] max-w-[260px] items-center gap-2 rounded-2xl px-3 py-2"
+                    :class="
+                      message.mine
+                        ? 'bg-indigo-600 text-white'
+                        : 'bg-slate-100 text-neutral-900 dark:bg-slate-800 dark:text-neutral-100'
+                    "
+                    data-testid="media-audio"
+                  >
+                    <button
+                      type="button"
+                      class="shrink-0 rounded-full p-1 text-sm leading-none hover:bg-black/10 dark:hover:bg-white/10"
+                      data-testid="audio-play"
+                      :aria-label="
+                        playingMediaId === message.media.mediaId
+                          ? t('chat.voicePause')
+                          : t('chat.voicePlay')
+                      "
+                      @click="toggleAudio(message.media)"
+                    >
+                      {{
+                        playingMediaId === message.media.mediaId ? "❚❚" : "▶"
+                      }}
+                    </button>
+                    <span
+                      class="h-1 flex-1 overflow-hidden rounded bg-black/20 dark:bg-white/20"
+                    >
+                      <span
+                        class="block h-1 rounded bg-current transition-[width] duration-150"
+                        :style="{
+                          width:
+                            (playingMediaId === message.media.mediaId
+                              ? audioProgress
+                              : 0) *
+                              100 +
+                            '%',
+                        }"
+                        data-testid="audio-progress"
+                      ></span>
+                    </span>
+                    <span class="shrink-0 text-[11px] tabular-nums">
+                      {{ formatDuration(message.media.durationMs) }}
+                    </span>
+                  </div>
                   <template v-else>
                     <video
                       :src="mediaUrl(message.media)"
@@ -974,6 +1344,17 @@ async function handleMediaFile(file: File): Promise<void> {
                   "
                   data-testid="message-bubble"
                 >
+                  <!-- Forward attribution (original author), above content -->
+                  <span
+                    v-if="message.forwardedFromUsername"
+                    class="mb-1 block border-l-2 border-current/40 pl-2 text-xs font-medium opacity-80"
+                    data-testid="forward-badge"
+                    >{{
+                      t("chat.forwardedFrom", {
+                        username: message.forwardedFromUsername,
+                      })
+                    }}</span
+                  >
                   <!-- Reply quote rendered inline from server-resolved metadata -->
                   <span
                     v-if="message.replyToBodyPreview"
@@ -1191,6 +1572,18 @@ async function handleMediaFile(file: File): Promise<void> {
               >
                 🎬
               </button>
+              <!-- M9 voice: record only (never in secret/e2ee chats) -->
+              <button
+                v-if="!recording"
+                type="button"
+                data-testid="voice-record"
+                :title="t('chat.voiceRecord')"
+                :aria-label="t('chat.voiceRecord')"
+                class="shrink-0 rounded-xl px-2 py-2 text-lg leading-none hover:bg-neutral-100 dark:hover:bg-neutral-800"
+                @click="startVoiceRecording()"
+              >
+                🎤
+              </button>
             </template>
             <input
               ref="imageInputEl"
@@ -1208,27 +1601,68 @@ async function handleMediaFile(file: File): Promise<void> {
               data-testid="video-file-input"
               @change="onFilePicked"
             />
-            <textarea
-              ref="composerEl"
-              v-model="draft"
-              rows="1"
-              data-testid="composer-input"
-              :placeholder="t('chat.inputPlaceholder')"
-              :disabled="!ws.isConnected"
-              class="max-h-40 min-h-9 flex-1 resize-none rounded-xl border border-neutral-300 bg-transparent px-3 py-2 text-sm outline-none focus:border-indigo-500 disabled:cursor-not-allowed disabled:opacity-60 dark:border-neutral-700"
-              @keydown.enter.exact.prevent="sendMessage()"
-              @input="onComposerInput()"
-              @blur="onComposerBlur()"
-            ></textarea>
-            <button
-              type="button"
-              data-testid="composer-send"
-              :disabled="!ws.isConnected || draft.trim().length === 0"
-              class="shrink-0 rounded-xl bg-indigo-600 px-4 py-2 text-sm font-medium text-white hover:bg-indigo-500 disabled:cursor-not-allowed disabled:opacity-50"
-              @click="sendMessage()"
-            >
-              {{ t("chat.composerSend") }}
-            </button>
+            <!-- Recording strip replaces the text input while capturing -->
+            <template v-if="recording">
+              <span
+                class="flex min-h-9 flex-1 items-center gap-2 rounded-xl border border-red-300 bg-red-50 px-3 py-2 text-sm dark:border-red-800 dark:bg-red-950/40"
+              >
+                <span
+                  class="h-2 w-2 shrink-0 animate-pulse rounded-full bg-red-500"
+                  aria-hidden="true"
+                ></span>
+                <span
+                  class="font-mono text-xs tabular-nums text-red-600 dark:text-red-300"
+                  data-testid="voice-timer"
+                  >{{ voiceTimer }}</span
+                >
+                <span class="truncate text-xs text-red-500 dark:text-red-300">
+                  {{ t("chat.voiceRecording") }}
+                </span>
+              </span>
+              <button
+                type="button"
+                data-testid="voice-cancel"
+                :title="t('chat.voiceCancel')"
+                :aria-label="t('chat.voiceCancel')"
+                class="shrink-0 rounded-xl border border-neutral-300 px-3 py-2 text-sm font-medium text-neutral-600 hover:bg-neutral-100 dark:border-neutral-700 dark:text-neutral-300 dark:hover:bg-neutral-800"
+                @click="cancelVoiceRecording()"
+              >
+                {{ t("chat.voiceCancel") }}
+              </button>
+              <button
+                type="button"
+                data-testid="voice-stop"
+                :title="t('chat.voiceStop')"
+                :aria-label="t('chat.voiceStop')"
+                class="shrink-0 rounded-xl bg-red-600 px-4 py-2 text-sm font-medium text-white hover:bg-red-500"
+                @click="stopVoiceRecording()"
+              >
+                {{ t("chat.voiceStop") }}
+              </button>
+            </template>
+            <template v-else>
+              <textarea
+                ref="composerEl"
+                v-model="draft"
+                rows="1"
+                data-testid="composer-input"
+                :placeholder="t('chat.inputPlaceholder')"
+                :disabled="!ws.isConnected"
+                class="max-h-40 min-h-9 flex-1 resize-none rounded-xl border border-neutral-300 bg-transparent px-3 py-2 text-sm outline-none focus:border-indigo-500 disabled:cursor-not-allowed disabled:opacity-60 dark:border-neutral-700"
+                @keydown.enter.exact.prevent="sendMessage()"
+                @input="onComposerInput()"
+                @blur="onComposerBlur()"
+              ></textarea>
+              <button
+                type="button"
+                data-testid="composer-send"
+                :disabled="!ws.isConnected || draft.trim().length === 0"
+                class="shrink-0 rounded-xl bg-indigo-600 px-4 py-2 text-sm font-medium text-white hover:bg-indigo-500 disabled:cursor-not-allowed disabled:opacity-50"
+                @click="sendMessage()"
+              >
+                {{ t("chat.composerSend") }}
+              </button>
+            </template>
           </div>
         </footer>
       </div>

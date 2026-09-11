@@ -16,8 +16,8 @@ use axum::{
 use futures_util::{SinkExt, StreamExt};
 use http_body_util::BodyExt;
 use jiuyue_protocol::{
-    ErrorCode, Frame, MediaRef, MsgAck, MsgNew, MsgSend, PROTOCOL_VERSION, Payload, SyncCursor,
-    SyncReq,
+    ErrorCode, Frame, MediaRef, MsgAck, MsgNew, MsgRecall, MsgRecalled, MsgSend, PROTOCOL_VERSION,
+    Payload, SyncCursor, SyncReq,
 };
 use jiuyue_server::crypto::BodyCipher;
 use jiuyue_server::state::AppState;
@@ -562,6 +562,7 @@ async fn msg_send_with_owned_media_fans_out_msg_new_carrying_media() {
         file_name: "photo.png".to_owned(),
         width: Some(64),
         height: Some(48),
+        duration_ms: None,
     };
     let frame = Frame {
         v: PROTOCOL_VERSION,
@@ -571,6 +572,7 @@ async fn msg_send_with_owned_media_fans_out_msg_new_carrying_media() {
             body: String::new(),
             reply_to: None,
             media: Some(media.clone()),
+            forward_of_message_id: None,
         }),
     };
     ws_send_text(&mut ws_a, &serde_json::to_string(&frame).unwrap()).await;
@@ -645,7 +647,9 @@ async fn msg_send_with_another_users_media_is_rejected() {
                 file_name: "photo.png".to_owned(),
                 width: None,
                 height: None,
+                duration_ms: None,
             }),
+            forward_of_message_id: None,
         }),
     };
     ws_send_text(&mut ws_c, &serde_json::to_string(&frame).unwrap()).await;
@@ -691,7 +695,9 @@ async fn sync_req_replays_media_message_like_live_fanout() {
                 file_name: "photo.png".to_owned(),
                 width: Some(12),
                 height: Some(34),
+                duration_ms: None,
             }),
+            forward_of_message_id: None,
         }),
     };
     ws_send_text(&mut ws_a, &serde_json::to_string(&frame).unwrap()).await;
@@ -736,6 +742,450 @@ async fn sync_req_replays_media_message_like_live_fanout() {
             assert_eq!(media.bytes, len as i64);
             assert_eq!(media.width, Some(12));
             assert_eq!(media.height, Some(34));
+        }
+        other => panic!("expected sync.res, got {other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// M9a: voice/audio + server-side forwarding
+// ---------------------------------------------------------------------------
+
+/// EBML (webm) magic + filler; the server only sniffs the container family.
+fn audio_webm_bytes(len: usize) -> Vec<u8> {
+    let mut out = vec![0x1A, 0x45, 0xDF, 0xA3];
+    out.resize(len.max(4), 0xCD);
+    out
+}
+
+/// Ogg-container magic (`OggS`) + filler.
+fn ogg_bytes(len: usize) -> Vec<u8> {
+    let mut out = b"OggS".to_vec();
+    out.resize(len.max(4), 0xEF);
+    out
+}
+
+/// ISO-BMFF `ftyp` box carrying an audio-ish brand.
+fn m4a_bytes() -> Vec<u8> {
+    let mut out = vec![0, 0, 0, 0x18];
+    out.extend_from_slice(b"ftyp");
+    out.extend_from_slice(b"M4A ");
+    out.extend_from_slice(&[0, 0, 0, 0]);
+    out
+}
+
+/// Uploads audio bytes as `access`; returns `(media_id, byte_len)`.
+async fn upload_audio(
+    t: &TestApp,
+    access: &str,
+    content_type: &str,
+    bytes: Vec<u8>,
+) -> (Uuid, usize) {
+    let (status, body) = upload_media(
+        &t.app,
+        Some(access),
+        content_type,
+        Some("voice.webm"),
+        bytes.clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["kind"], json!("audio"));
+    assert_eq!(body["mime"], json!(content_type));
+    assert_eq!(body["bytes"], json!(bytes.len()));
+    let media_id: Uuid = body["media_id"].as_str().unwrap().parse().unwrap();
+    (media_id, bytes.len())
+}
+
+/// Sends a plain text `msg.send` and returns the resulting message id (from
+/// the ack), consuming exactly one frame.
+async fn send_text_and_ack(
+    ws: &mut WsClient,
+    conversation_id: i64,
+    client_msg_id: Uuid,
+    body: &str,
+) -> Uuid {
+    let frame = Frame {
+        v: PROTOCOL_VERSION,
+        payload: Payload::MsgSend(MsgSend {
+            conversation_id,
+            client_msg_id,
+            body: body.to_owned(),
+            reply_to: None,
+            media: None,
+            forward_of_message_id: None,
+        }),
+    };
+    ws_send_text(ws, &serde_json::to_string(&frame).unwrap()).await;
+    match ws_next_frame(ws).await.payload {
+        Payload::MsgAck(MsgAck { message_id, .. }) => message_id,
+        other => panic!("expected msg.ack, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn forward_text_copies_body_and_attributes_original_author() {
+    let _guard = GATE.lock().await;
+    let t = test_app().await;
+    let (_a_id, a_access) = register_user(&t, "fwd-t-a@example.com", "fwdta").await;
+    let (b_id, b_access) = register_user(&t, "fwd-t-b@example.com", "fwdtdb").await;
+    let (_c_id, c_access) = register_user(&t, "fwd-t-c@example.com", "fwdtdc").await;
+    let conv1 = create_conversation(&t, &a_access, "fwdtdb").await;
+    let conv2 = create_conversation(&t, &b_access, "fwdtdc").await;
+
+    // A writes m1 in conv1 (A + B share it).
+    let mut ws_a = ws_connect(&t, &a_access).await;
+    let m1_id = send_text_and_ack(&mut ws_a, conv1, Uuid::now_v7(), "forward-me").await;
+    drop(ws_a);
+
+    // B forwards m1 into conv2 (B + C) with an empty body.
+    let mut ws_b = ws_connect(&t, &b_access).await;
+    let mut ws_c = ws_connect(&t, &c_access).await;
+    let frame = Frame {
+        v: PROTOCOL_VERSION,
+        payload: Payload::MsgSend(MsgSend {
+            conversation_id: conv2,
+            client_msg_id: Uuid::now_v7(),
+            body: String::new(),
+            reply_to: None,
+            media: None,
+            forward_of_message_id: Some(m1_id),
+        }),
+    };
+    ws_send_text(&mut ws_b, &serde_json::to_string(&frame).unwrap()).await;
+    match ws_next_frame(&mut ws_b).await.payload {
+        Payload::MsgAck(_) => {}
+        other => panic!("expected ack, got {other:?}"),
+    }
+
+    match ws_next_frame(&mut ws_c).await.payload {
+        Payload::MsgNew(MsgNew {
+            sender_id,
+            body,
+            forwarded_from_username,
+            media,
+            ..
+        }) => {
+            assert_eq!(sender_id, b_id, "the new message's sender is the forwarder");
+            assert_eq!(body, "forward-me", "forwarded text body is copied verbatim");
+            assert_eq!(
+                forwarded_from_username.as_deref(),
+                Some("fwdta"),
+                "attribution names the ORIGINAL author, not the forwarder"
+            );
+            assert!(media.is_none());
+        }
+        other => panic!("expected msg.new, got {other:?}"),
+    }
+
+    let (kind, stored): (String, Option<String>) = sqlx::query_as(
+        "SELECT kind, forwarded_from_username FROM messages WHERE conversation_id = $1",
+    )
+    .bind(conv2)
+    .fetch_one(&t.pool)
+    .await
+    .expect("forwarded row");
+    assert_eq!(kind, "text");
+    assert_eq!(stored.as_deref(), Some("fwdta"));
+}
+
+#[tokio::test]
+async fn forward_media_cross_user_copies_attachment_and_attribution() {
+    let _guard = GATE.lock().await;
+    let t = test_app().await;
+    let (_a_id, a_access) = register_user(&t, "fwd-m-a@example.com", "fwdma").await;
+    let (b_id, b_access) = register_user(&t, "fwd-m-b@example.com", "fwdmb").await;
+    let (_c_id, c_access) = register_user(&t, "fwd-m-c@example.com", "fwdmc").await;
+    let conv1 = create_conversation(&t, &a_access, "fwdmb").await;
+    let conv2 = create_conversation(&t, &b_access, "fwdmc").await;
+    let (media_id, len) = upload_png(&t, &a_access, 4242).await;
+
+    // A sends the image into conv1.
+    let mut ws_a = ws_connect(&t, &a_access).await;
+    let frame = Frame {
+        v: PROTOCOL_VERSION,
+        payload: Payload::MsgSend(MsgSend {
+            conversation_id: conv1,
+            client_msg_id: Uuid::now_v7(),
+            body: String::new(),
+            reply_to: None,
+            media: Some(MediaRef {
+                media_id,
+                kind: "image".to_owned(),
+                mime: "image/png".to_owned(),
+                bytes: len as i64,
+                file_name: "photo.png".to_owned(),
+                width: Some(5),
+                height: Some(6),
+                duration_ms: None,
+            }),
+            forward_of_message_id: None,
+        }),
+    };
+    ws_send_text(&mut ws_a, &serde_json::to_string(&frame).unwrap()).await;
+    let m1_id = match ws_next_frame(&mut ws_a).await.payload {
+        Payload::MsgAck(MsgAck { message_id, .. }) => message_id,
+        other => panic!("expected ack, got {other:?}"),
+    };
+    drop(ws_a);
+
+    // B forwards the media message WITHOUT a media field (server copies it).
+    let mut ws_b = ws_connect(&t, &b_access).await;
+    let mut ws_c = ws_connect(&t, &c_access).await;
+    let forward = Frame {
+        v: PROTOCOL_VERSION,
+        payload: Payload::MsgSend(MsgSend {
+            conversation_id: conv2,
+            client_msg_id: Uuid::now_v7(),
+            body: String::new(),
+            reply_to: None,
+            media: None,
+            forward_of_message_id: Some(m1_id),
+        }),
+    };
+    ws_send_text(&mut ws_b, &serde_json::to_string(&forward).unwrap()).await;
+    match ws_next_frame(&mut ws_b).await.payload {
+        Payload::MsgAck(_) => {}
+        other => panic!("expected ack, got {other:?}"),
+    }
+
+    match ws_next_frame(&mut ws_c).await.payload {
+        Payload::MsgNew(MsgNew {
+            sender_id,
+            body,
+            forwarded_from_username,
+            media,
+            ..
+        }) => {
+            assert_eq!(sender_id, b_id);
+            assert_eq!(body, "", "forwarded media fanout body is empty");
+            assert_eq!(forwarded_from_username.as_deref(), Some("fwdma"));
+            let got = media.expect("forwarded media must carry the MediaRef");
+            assert_eq!(got.media_id, media_id);
+            assert_eq!(got.kind, "image");
+            assert_eq!(got.mime, "image/png");
+            assert_eq!(got.bytes, len as i64);
+            assert_eq!(got.width, Some(5), "source width hint is copied");
+            assert_eq!(got.height, Some(6));
+        }
+        other => panic!("expected msg.new, got {other:?}"),
+    }
+
+    let kind: String = sqlx::query_scalar("SELECT kind FROM messages WHERE conversation_id = $1")
+        .bind(conv2)
+        .fetch_one(&t.pool)
+        .await
+        .expect("forwarded media row");
+    assert_eq!(kind, "image");
+}
+
+#[tokio::test]
+async fn forward_recalled_source_is_rejected() {
+    let _guard = GATE.lock().await;
+    let t = test_app().await;
+    let (_a_id, a_access) = register_user(&t, "fwd-r-a@example.com", "fwdra").await;
+    let (_b_id, b_access) = register_user(&t, "fwd-r-b@example.com", "fwdrb").await;
+    let (_c_id, _c_access) = register_user(&t, "fwd-r-c@example.com", "fwdrbc").await;
+    let conv1 = create_conversation(&t, &a_access, "fwdrb").await;
+    let conv2 = create_conversation(&t, &b_access, "fwdrbc").await;
+
+    let mut ws_a = ws_connect(&t, &a_access).await;
+    let m1_id = send_text_and_ack(&mut ws_a, conv1, Uuid::now_v7(), "regret").await;
+    let recall = Frame {
+        v: PROTOCOL_VERSION,
+        payload: Payload::MsgRecall(MsgRecall {
+            conversation_id: conv1,
+            message_id: m1_id,
+        }),
+    };
+    ws_send_text(&mut ws_a, &serde_json::to_string(&recall).unwrap()).await;
+    match ws_next_frame(&mut ws_a).await.payload {
+        Payload::MsgRecalled(MsgRecalled { message_id, .. }) => assert_eq!(message_id, m1_id),
+        other => panic!("expected msg.recalled, got {other:?}"),
+    }
+    drop(ws_a);
+
+    // B (a member of conv1) may not forward a recalled source.
+    let mut ws_b = ws_connect(&t, &b_access).await;
+    let forward = Frame {
+        v: PROTOCOL_VERSION,
+        payload: Payload::MsgSend(MsgSend {
+            conversation_id: conv2,
+            client_msg_id: Uuid::now_v7(),
+            body: String::new(),
+            reply_to: None,
+            media: None,
+            forward_of_message_id: Some(m1_id),
+        }),
+    };
+    ws_send_text(&mut ws_b, &serde_json::to_string(&forward).unwrap()).await;
+    let err = expect_error_code(ws_next_frame(&mut ws_b).await, ErrorCode::BadRequest);
+    assert!(
+        err.message.contains("forward_source_invalid"),
+        "recalled source must be refused: {}",
+        err.message
+    );
+}
+
+#[tokio::test]
+async fn forward_source_outside_requester_membership_is_rejected() {
+    let _guard = GATE.lock().await;
+    let t = test_app().await;
+    let (_a_id, a_access) = register_user(&t, "fwd-x-a@example.com", "fwdxa").await;
+    let (_b_id, _b_access) = register_user(&t, "fwd-x-b@example.com", "fwdxb").await;
+    let (_c_id, c_access) = register_user(&t, "fwd-x-c@example.com", "fwdxc").await;
+    let (_d_id, _d_access) = register_user(&t, "fwd-x-d@example.com", "fwdxd").await;
+    // conv1: A + B (C is NOT a member).
+    let conv1 = create_conversation(&t, &a_access, "fwdxb").await;
+    // conv2: C + D (C's own conversation).
+    let conv2 = create_conversation(&t, &c_access, "fwdxd").await;
+
+    let mut ws_a = ws_connect(&t, &a_access).await;
+    let m1_id = send_text_and_ack(&mut ws_a, conv1, Uuid::now_v7(), "private").await;
+    drop(ws_a);
+
+    // C, a stranger to conv1, tries to forward m1 into C's own conversation.
+    let mut ws_c = ws_connect(&t, &c_access).await;
+    let forward = Frame {
+        v: PROTOCOL_VERSION,
+        payload: Payload::MsgSend(MsgSend {
+            conversation_id: conv2,
+            client_msg_id: Uuid::now_v7(),
+            body: String::new(),
+            reply_to: None,
+            media: None,
+            forward_of_message_id: Some(m1_id),
+        }),
+    };
+    ws_send_text(&mut ws_c, &serde_json::to_string(&forward).unwrap()).await;
+    let err = expect_error_code(ws_next_frame(&mut ws_c).await, ErrorCode::BadRequest);
+    assert!(
+        err.message.contains("forward_source_invalid"),
+        "non-member source must be refused: {}",
+        err.message
+    );
+}
+
+#[tokio::test]
+async fn audio_upload_accepts_supported_families_and_rejects_mismatches() {
+    let _guard = GATE.lock().await;
+    let t = test_app().await;
+    let (_id, access) = register_user(&t, "aud-a@example.com", "auda").await;
+
+    // EBML (webm) family → audio/webm.
+    let (media_id, len) = upload_audio(&t, &access, "audio/webm", audio_webm_bytes(2048)).await;
+    assert!(len >= 2048);
+    assert!(media_id != Uuid::nil());
+
+    // Ogg family → audio/ogg.
+    upload_audio(&t, &access, "audio/ogg", ogg_bytes(777)).await;
+
+    // ISO-BMFF family → audio/mp4.
+    upload_audio(&t, &access, "audio/mp4", m4a_bytes()).await;
+
+    // Wrong magic (PNG bytes declared audio/webm) → 415.
+    let (status, body) =
+        upload_media(&t.app, Some(&access), "audio/webm", None, png_bytes(64)).await;
+    assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE, "{body}");
+    assert_eq!(body["error"], json!("unsupported_type"));
+
+    // Family disagreement (EBML bytes declared audio/ogg) → 415.
+    let (status, body) = upload_media(
+        &t.app,
+        Some(&access),
+        "audio/ogg",
+        None,
+        audio_webm_bytes(128),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE, "{body}");
+}
+
+#[tokio::test]
+async fn audio_message_fans_out_and_syncs_with_duration_ms() {
+    let _guard = GATE.lock().await;
+    let t = test_app().await;
+    let (a_id, a_access) = register_user(&t, "aud-msg-a@example.com", "audmsga").await;
+    let (_b_id, b_access) = register_user(&t, "aud-msg-b@example.com", "audmsgb").await;
+    let conversation_id = create_conversation(&t, &a_access, "audmsgb").await;
+    let (media_id, len) = upload_audio(&t, &a_access, "audio/webm", audio_webm_bytes(4096)).await;
+
+    let mut ws_a = ws_connect(&t, &a_access).await;
+    let mut ws_b = ws_connect(&t, &b_access).await;
+    let frame = Frame {
+        v: PROTOCOL_VERSION,
+        payload: Payload::MsgSend(MsgSend {
+            conversation_id,
+            client_msg_id: Uuid::now_v7(),
+            body: String::new(),
+            reply_to: None,
+            media: Some(MediaRef {
+                media_id,
+                kind: "audio".to_owned(),
+                mime: "audio/webm".to_owned(),
+                bytes: len as i64,
+                file_name: "voice.webm".to_owned(),
+                width: None,
+                height: None,
+                duration_ms: Some(4200),
+            }),
+            forward_of_message_id: None,
+        }),
+    };
+    ws_send_text(&mut ws_a, &serde_json::to_string(&frame).unwrap()).await;
+    match ws_next_frame(&mut ws_a).await.payload {
+        Payload::MsgAck(_) => {}
+        other => panic!("expected ack, got {other:?}"),
+    }
+
+    match ws_next_frame(&mut ws_b).await.payload {
+        Payload::MsgNew(MsgNew {
+            sender_id,
+            body,
+            media,
+            ..
+        }) => {
+            assert_eq!(sender_id, a_id);
+            assert_eq!(body, "", "audio message body must be empty");
+            let got = media.expect("audio msg.new must carry the media object");
+            assert_eq!(got.media_id, media_id);
+            assert_eq!(got.kind, "audio");
+            assert_eq!(got.mime, "audio/webm");
+            assert_eq!(got.duration_ms, Some(4200), "duration hint is preserved");
+        }
+        other => panic!("expected msg.new, got {other:?}"),
+    }
+    drop(ws_a);
+    drop(ws_b);
+
+    // Fresh replay must produce the identical audio attachment.
+    let mut ws_b2 = ws_connect(&t, &b_access).await;
+    let sync = Frame {
+        v: PROTOCOL_VERSION,
+        payload: Payload::SyncReq(SyncReq {
+            cursors: vec![SyncCursor {
+                conversation_id,
+                last_delivered_seq: 0,
+            }],
+        }),
+    };
+    ws_send_text(&mut ws_b2, &serde_json::to_string(&sync).unwrap()).await;
+    match ws_next_frame(&mut ws_b2).await.payload {
+        Payload::SyncRes(res) => {
+            let entry = res
+                .messages
+                .iter()
+                .find_map(|message| match message {
+                    jiuyue_protocol::SyncMessage::Plain(msg) => Some(msg),
+                    jiuyue_protocol::SyncMessage::Encrypted(_) => None,
+                })
+                .expect("a plain msg.new entry");
+            assert_eq!(entry.body, "", "replayed audio body must be empty");
+            let media = entry.media.as_ref().expect("sync entry carries media");
+            assert_eq!(media.media_id, media_id);
+            assert_eq!(media.kind, "audio");
+            assert_eq!(media.mime, "audio/webm");
+            assert_eq!(media.duration_ms, Some(4200));
         }
         other => panic!("expected sync.res, got {other:?}"),
     }

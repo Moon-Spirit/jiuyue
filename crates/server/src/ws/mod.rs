@@ -448,17 +448,14 @@ async fn handle_frame(
                 let _ = out_tx.send(serialize_frame(&ack)).await;
                 if !outcome.duplicate {
                     // Media messages carry no text body; the attachment rides
-                    // in `outcome.media` on the `msg.new` frame instead.
-                    let body_for_fanout = if outcome.media.is_some() {
-                        ""
-                    } else {
-                        send.body.as_str()
-                    };
+                    // in `outcome.media` on the `msg.new` frame instead. For an
+                    // M9a forwarded text message `plaintext_body` is the
+                    // decrypted copy of the source body.
                     fanout_msg_new(
                         state,
                         sender_id,
                         sender_device_id,
-                        body_for_fanout,
+                        &outcome.plaintext_body,
                         &outcome,
                     )
                     .await;
@@ -471,7 +468,10 @@ async fn handle_frame(
                     //
                     // M8 media messages award NO XP: there is no character
                     // count to measure, so the award call is skipped outright.
-                    if send.media.is_none() {
+                    // M9a forwarded messages likewise award none (their
+                    // plaintext is whichever the source carried, and the client
+                    // sends an empty body).
+                    if outcome.media.is_none() && send.forward_of_message_id.is_none() {
                         spawn_message_xp(state, sender_id, send.conversation_id, &send.body);
                     }
                 }
@@ -751,6 +751,12 @@ struct SendOutcome {
     /// Resolved media attachment (M8) for the fresh insert; `None` for text
     /// messages and for duplicates.
     media: Option<MediaRef>,
+    /// Plaintext body to fan out: empty for media messages, the sender's body
+    /// for a normal text send, or the DECRYPTED source body for an M9a
+    /// forwarded text message. Duplicates never refanout so they carry `""`.
+    plaintext_body: String,
+    /// M9a original-author attribution for a forward; `None` otherwise.
+    forwarded_from_username: Option<String>,
 }
 
 /// Server-resolved quote metadata carried on `msg.new` so receivers can
@@ -792,6 +798,55 @@ impl From<time::error::Format> for SendRejection {
 /// `(message_id, sender_id, body_enc, recalled_at, kind)` of a reply target.
 type ReplyTargetRow = (Uuid, Uuid, Vec<u8>, Option<OffsetDateTime>, String);
 
+/// M9a forward source resolved from `forward_of_message_id`: everything the
+/// copy needs. `username` is the ORIGINAL author (JOIN users), not the sender.
+struct ForwardSource {
+    /// Source `messages.kind` — copied verbatim onto the new row.
+    kind: String,
+    /// Source `body_enc` — copied VERBATIM (portable at-rest ciphertext; no
+    /// re-encryption, no plaintext handling).
+    body_enc: Vec<u8>,
+    /// Source sender's username, surfaced as `forwarded_from_username`.
+    username: String,
+}
+
+/// Resolves and authorizes an M9a forward source in one query.
+///
+/// Missing id, recalled source and "requester is not a member of the source
+/// conversation" all collapse into `None` → `forward_source_invalid`, so the
+/// send path is not an existence/membership oracle. On success the row's
+/// `kind`, `body_enc` and original author username are returned.
+async fn resolve_forward_source(
+    state: &AppState,
+    requester_id: Uuid,
+    forward_of_message_id: Uuid,
+) -> Result<Option<ForwardSource>, SendRejection> {
+    let row: Option<(String, Vec<u8>, String)> = sqlx::query_as(
+        "SELECT m.kind, m.body_enc, u.username \
+           FROM messages m \
+           JOIN users u ON u.id = m.sender_id \
+          WHERE m.id = $1 \
+            AND m.recalled_at IS NULL \
+            AND EXISTS (SELECT 1 FROM conversation_members cm \
+                         WHERE cm.conversation_id = m.conversation_id AND cm.user_id = $2)",
+    )
+    .bind(forward_of_message_id)
+    .bind(requester_id)
+    .fetch_optional(&state.pool)
+    .await?;
+    Ok(row.map(|(kind, body_enc, username)| ForwardSource {
+        kind,
+        body_enc,
+        username,
+    }))
+}
+
+/// Whether a message `kind` stores an encrypted MediaRef envelope in
+/// `body_enc` (M8 images/videos + M9a audio) rather than a text body.
+fn is_media_kind(kind: &str) -> bool {
+    matches!(kind, "image" | "video" | "audio")
+}
+
 /// Persist-then-ack pipeline for one `msg.send` frame.
 ///
 /// One transaction:
@@ -826,36 +881,70 @@ async fn process_msg_send(
         ));
     }
 
-    // M8 media attachment: the referenced `media` row must exist and belong
-    // to the sender. The authoritative metadata is rebuilt from the DB row
-    // (only width/height are client-supplied hints); a missing id and someone
-    // else's id collapse into the same rejection so sends are not an
-    // existence oracle. This runs BEFORE the seq transaction.
-    let media: Option<MediaRef> = match &send.media {
-        Some(reference) => {
-            let row: Option<(Uuid, String, String, i64, String)> = sqlx::query_as(
-                "SELECT owner_id, kind, mime, bytes, file_name FROM media WHERE id = $1",
-            )
-            .bind(reference.media_id)
-            .fetch_optional(&state.pool)
-            .await?;
-            let Some((owner_id, kind, mime, bytes, file_name)) = row else {
-                return Err(SendRejection::BadRequest("media_not_found"));
+    // M9a forward source: resolved and authorized BEFORE media/reply handling.
+    // A missing id, a recalled source, or a requester who is not a member of
+    // the source conversation all collapse into `forward_source_invalid` (no
+    // existence/membership oracle).
+    let forward: Option<ForwardSource> = match send.forward_of_message_id {
+        Some(source_id) => {
+            let resolved = resolve_forward_source(state, sender_id, source_id).await?;
+            let Some(resolved) = resolved else {
+                return Err(SendRejection::BadRequest("forward_source_invalid"));
             };
-            if owner_id != sender_id {
-                return Err(SendRejection::BadRequest("media_not_found"));
-            }
-            Some(MediaRef {
-                media_id: reference.media_id,
-                kind,
-                mime,
-                bytes,
-                file_name,
-                width: reference.width,
-                height: reference.height,
-            })
+            Some(resolved)
         }
         None => None,
+    };
+
+    // M8 media attachment: the referenced `media` row must exist and belong
+    // to the sender. The authoritative metadata is rebuilt from the DB row
+    // (only width/height/duration_ms are client-supplied hints); a missing id
+    // and someone else's id collapse into the same rejection so sends are not
+    // an existence oracle. This runs BEFORE the seq transaction.
+    //
+    // M9a forward: there is NO `send.media` — the attachment is recovered by
+    // decrypting the copied source `body_enc`, which holds the same encrypted
+    // MediaRef envelope a normal media send stores. This is exactly the
+    // decode the replay pipeline performs, so the wire shape is identical.
+    let media: Option<MediaRef> = match &forward {
+        Some(source) if is_media_kind(&source.kind) => {
+            let envelope = state.cipher.decrypt(&source.body_enc)?;
+            match serde_json::from_str::<MediaRef>(&envelope) {
+                Ok(reference) => Some(reference),
+                Err(err) => {
+                    tracing::warn!(error = %err, "forwarded media envelope decode failed");
+                    return Err(SendRejection::BadRequest("forward_source_invalid"));
+                }
+            }
+        }
+        Some(_) => None,
+        None => match &send.media {
+            Some(reference) => {
+                let row: Option<(Uuid, String, String, i64, String)> = sqlx::query_as(
+                    "SELECT owner_id, kind, mime, bytes, file_name FROM media WHERE id = $1",
+                )
+                .bind(reference.media_id)
+                .fetch_optional(&state.pool)
+                .await?;
+                let Some((owner_id, kind, mime, bytes, file_name)) = row else {
+                    return Err(SendRejection::BadRequest("media_not_found"));
+                };
+                if owner_id != sender_id {
+                    return Err(SendRejection::BadRequest("media_not_found"));
+                }
+                Some(MediaRef {
+                    media_id: reference.media_id,
+                    kind,
+                    mime,
+                    bytes,
+                    file_name,
+                    width: reference.width,
+                    height: reference.height,
+                    duration_ms: reference.duration_ms,
+                })
+            }
+            None => None,
+        },
     };
 
     // Reply target validation: must exist AND belong to the same
@@ -888,17 +977,49 @@ async fn process_msg_send(
     // crypto). Media messages store the serialized MediaRef envelope through
     // the SAME at-rest cipher as text bodies — the replay path decrypts and
     // decodes it back into the typed attachment.
-    let body_enc = match &media {
-        Some(reference) => {
-            let envelope = serde_json::to_string(reference)
-                .map_err(|err| SendRejection::Internal(err.into()))?;
-            state.cipher.encrypt(&envelope)?
+    //
+    // M9a forward: copy the source `body_enc` VERBATIM (the at-rest ciphertext
+    // is portable across conversations — no re-encryption, no plaintext
+    // handling) and carry the source `kind`, so a forwarded image/video/audio
+    // message replays exactly like a normal media message.
+    let (body_enc, message_kind): (Vec<u8>, &str) = match &forward {
+        Some(source) => (source.body_enc.clone(), source.kind.as_str()),
+        None => {
+            let enc = match &media {
+                Some(reference) => {
+                    let envelope = serde_json::to_string(reference)
+                        .map_err(|err| SendRejection::Internal(err.into()))?;
+                    state.cipher.encrypt(&envelope)?
+                }
+                None => state.cipher.encrypt(&send.body)?,
+            };
+            let kind = media
+                .as_ref()
+                .map_or("text", |reference| reference.kind.as_str());
+            (enc, kind)
         }
-        None => state.cipher.encrypt(&send.body)?,
     };
-    let message_kind = media
-        .as_ref()
-        .map_or("text", |reference| reference.kind.as_str());
+    // Plaintext body for the fanout: empty for media, the original text for a
+    // forwarded text body (decrypted from the copied ciphertext), the sender's
+    // plaintext for a normal send.
+    let plaintext_body = if media.is_some() {
+        String::new()
+    } else {
+        match &forward {
+            Some(source) => match state.cipher.decrypt(&source.body_enc) {
+                Ok(text) => text,
+                Err(err) => {
+                    tracing::warn!(error = %err, "forwarded body decrypt failed; fanout empty");
+                    String::new()
+                }
+            },
+            None => send.body.clone(),
+        }
+    };
+    // M9a forward attribution: the ORIGINAL author username (resolved by the
+    // JOIN in `resolve_forward_source`), never the forwarding sender. NULL for
+    // ordinary sends, in which case the wire field stays null-absent.
+    let forwarded_from_username = forward.as_ref().map(|source| source.username.clone());
     let allocated_seq: Option<i64> = sqlx::query_scalar(
         "UPDATE conversations SET last_seq = last_seq + 1 WHERE id = $1 RETURNING last_seq",
     )
@@ -913,13 +1034,6 @@ async fn process_msg_send(
     };
 
     let candidate_id = Uuid::now_v7();
-    // DECISION (forwarding): forward is a pure CLIENT-side compose of a new
-    // msg.send whose body is prefixed "[转发] " — there is deliberately no
-    // wire field on msg.send to set forwarded_from_username, so the column
-    // is always NULL on this insert. The schema column and the null-absent
-    // `forwarded_from_username` field on msg.new are reserved for a future
-    // server-side attribution path.
-    let forwarded_from_username: Option<String> = None;
     let fresh: Option<(Uuid, i64, OffsetDateTime)> = sqlx::query_as(
         "INSERT INTO messages (id, conversation_id, seq, sender_id, client_msg_id, key_id, body_enc, reply_to, forwarded_from_username, kind) \
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
@@ -950,7 +1064,7 @@ async fn process_msg_send(
                 // again"); a MEDIA target stores an encrypted MediaRef
                 // envelope rather than text, so it must not leak a JSON
                 // preview either.
-                let is_media = matches!(reply_kind.as_str(), "image" | "video");
+                let is_media = is_media_kind(&reply_kind);
                 let body_preview = if recalled_at.is_some() || is_media {
                     None
                 } else {
@@ -978,6 +1092,8 @@ async fn process_msg_send(
             duplicate: false,
             reply,
             media,
+            plaintext_body,
+            forwarded_from_username,
         });
     }
 
@@ -999,6 +1115,8 @@ async fn process_msg_send(
         duplicate: true,
         reply: None,
         media: None,
+        plaintext_body: String::new(),
+        forwarded_from_username: None,
     })
 }
 
@@ -1047,8 +1165,9 @@ async fn fanout_msg_new(
             reply_to_message_id: outcome.reply.as_ref().map(|r| r.message_id),
             reply_to_sender_id: outcome.reply.as_ref().map(|r| r.sender_id),
             reply_to_body_preview: outcome.reply.as_ref().and_then(|r| r.body_preview.clone()),
-            // Always None today (see the DECISION comment in process_msg_send).
-            forwarded_from_username: None,
+            // M9a: original author for a forward, `None` (null-absent) for a
+            // normal send.
+            forwarded_from_username: outcome.forwarded_from_username.clone(),
             recalled: false,
             // M8: the resolved attachment for media messages; `None` for text
             // so the wire shape stays byte-compatible.
@@ -1843,13 +1962,13 @@ async fn process_sync_req(
                 continue;
             }
 
-            // M8 media rows (kind 'image'|'video') store the encrypted
-            // MediaRef envelope in `body_enc` through the SAME at-rest cipher
-            // as text bodies; replay decrypts it back into the typed
-            // attachment and serves an empty body. A recalled media tombstone
-            // seals the attachment too (refs are content). The reply fields
-            // are carried verbatim: they describe the QUOTED message.
-            if matches!(kind.as_str(), "image" | "video") {
+            // M8/M9a media rows (kind 'image'|'video'|'audio') store the
+            // encrypted MediaRef envelope in `body_enc` through the SAME
+            // at-rest cipher as text bodies; replay decrypts it back into the
+            // typed attachment and serves an empty body. A recalled media
+            // tombstone seals the attachment too (refs are content). The reply
+            // fields are carried verbatim: they describe the QUOTED message.
+            if is_media_kind(&kind) {
                 let media = if recalled {
                     None
                 } else {
@@ -1902,9 +2021,9 @@ async fn process_sync_req(
                 (reply_to, reply_sender_id, reply_body_enc, reply_recalled_at)
             {
                 reply_to_sender_id = Some(r_sender);
-                // A media quote target has no plaintext preview (its body_enc
-                // is an encrypted MediaRef envelope, not text).
-                let reply_is_media = matches!(reply_kind.as_deref(), Some("image" | "video"));
+                // A media/audio quote target has no plaintext preview (its
+                // body_enc is an encrypted MediaRef envelope, not text).
+                let reply_is_media = reply_kind.as_deref().is_some_and(is_media_kind);
                 if r_recalled.is_none()
                     && !reply_is_media
                     && let Ok(plaintext) = state.cipher.decrypt(&r_body)

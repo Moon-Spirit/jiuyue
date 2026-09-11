@@ -800,10 +800,33 @@ describe("ws store — M2 reply quoting", () => {
     const plainFrame = sentFrames(sock).at(-1);
     expect("reply_to" in (plainFrame?.d ?? {})).toBe(false);
   });
+
+  it("populates the optimistic bubble with quote metadata from the reply context", async () => {
+    const store = useWsStore();
+    seedConversation(store, 1);
+    await connectAndOpen();
+
+    store.setReplyContext(
+      seededMessage({
+        messageId: "m-quote",
+        senderId: "peer-1",
+        body: "quoted body content",
+      }),
+    );
+    const message = store.send(1, "answer");
+
+    // Regression: the sender's own bubble must show the quote immediately,
+    // not only after the server-confirmed metadata round-trips.
+    expect(message?.replyToMessageId).toBe("m-quote");
+    expect(message?.replyToSenderId).toBe("peer-1");
+    expect(message?.replyToBodyPreview).toBe("quoted body content");
+    // Context is still consumed exactly once.
+    expect(store.replyContext).toBeNull();
+  });
 });
 
 describe("ws store — M2 forwarding", () => {
-  it("composes a NEW prefixed message into the target conversation", async () => {
+  it("sends a forward frame carrying forward_of_message_id with no body/media", async () => {
     const store = useWsStore();
     seedConversation(store, 1);
     seedConversation(store, 2);
@@ -814,27 +837,99 @@ describe("ws store — M2 forwarding", () => {
       seededMessage({ messageId: "m-src", body: "original text" }),
     );
 
-    expect(result?.body).toBe("[转发] original text");
     expect(result?.conversationId).toBe(2);
     expect(result?.clientMsgId).not.toBe("");
+    // The optimistic bubble mirrors the source content for instant display…
+    expect(result?.body).toBe("original text");
+    // …while the WIRE frame carries no body/media, only the forward source.
     const sendFrame = sentFrames(sock).at(-1);
     expect(sendFrame?.t).toBe("msg.send");
     expect(sendFrame?.d["conversation_id"]).toBe(2);
-    expect(sendFrame?.d["body"]).toBe("[转发] original text");
+    expect(sendFrame?.d["body"]).toBe("");
+    expect(sendFrame?.d["forward_of_message_id"]).toBe("m-src");
+    expect("media" in (sendFrame?.d ?? {})).toBe(false);
   });
 
-  it("refuses to forward recalled (empty-content) sources", async () => {
+  it("forwards a media source without a media field on the frame", async () => {
+    const store = useWsStore();
+    seedConversation(store, 1);
+    seedConversation(store, 2);
+    const sock = await connectAndOpen();
+
+    const media = {
+      mediaId: "mid-v",
+      kind: "video" as const,
+      mime: "video/mp4",
+      bytes: 4096,
+      fileName: "clip.mp4",
+    };
+    const result = store.forwardMessage(
+      2,
+      seededMessage({ messageId: "m-video", body: "", media }),
+    );
+
+    expect(result).not.toBeNull();
+    const sendFrame = sentFrames(sock).at(-1);
+    expect(sendFrame?.d["forward_of_message_id"]).toBe("m-video");
+    expect("media" in (sendFrame?.d ?? {})).toBe(false);
+  });
+
+  it("refuses to forward recalled sources and unacked (no id) sources", async () => {
     const store = useWsStore();
     seedConversation(store, 1);
     seedConversation(store, 2);
     await connectAndOpen();
 
-    const result = store.forwardMessage(
+    const recalled = store.forwardMessage(
       2,
       seededMessage({ messageId: "m-dead", body: "", recalled: true }),
     );
-    expect(result).toBeNull();
+    expect(recalled).toBeNull();
+
+    // Optimistic bubble without a server-assigned id cannot be forwarded.
+    const unacked = store.forwardMessage(
+      2,
+      seededMessage({ messageId: null, body: "pending" }),
+    );
+    expect(unacked).toBeNull();
   });
+
+  it("shows the original author on the optimistic forward badge", async () => {
+    const store = useWsStore();
+    seedConversation(store, 1, { peerUsername: "alice" });
+    seedConversation(store, 2);
+    await connectAndOpen();
+
+    // Peer's own message: optimistic badge attributes it to the peer.
+    const fromPeer = store.forwardMessage(
+      2,
+      seededMessage({
+        messageId: "m-src",
+        senderId: "alice",
+        mine: false,
+      }),
+    );
+    expect(fromPeer?.forwardedFromUsername).toBe("alice");
+
+    // Re-forwarding a forward keeps the ORIGINAL attribution chain.
+    const reForward = store.forwardMessage(
+      2,
+      seededMessage({
+        messageId: "m-fwd",
+        mine: true,
+        forwardedFromUsername: "carol",
+      }),
+    );
+    expect(reForward?.forwardedFromUsername).toBe("carol");
+
+    // Forwarding MY OWN message attributes it to me.
+    const mine = store.forwardMessage(
+      2,
+      seededMessage({ messageId: "m-mine", mine: true }),
+    );
+    expect(mine?.forwardedFromUsername).toBe("me");
+  });
+
   it("enriches skeleton conversations created by live msg.new with peer identity", async () => {
     const store = useWsStore();
     const sock = await connectAndOpen();

@@ -11,7 +11,7 @@
  * |------------------|-----------|----------------------------------------------------------------|
  * | auth.ticket.req  | C → S     | `{}`                                                           |
  * | auth.ticket.res  | S → C     | `{ ticket }`                                                   |
- * | msg.send         | C → S     | `{ conversation_id, client_msg_id, body, reply_to? }`          |
+ * | msg.send         | C → S     | `{ conversation_id, client_msg_id, body, reply_to?, forward_of_message_id? }` |
  * | msg.ack          | S → C     | `{ client_msg_id, message_id, seq, duplicate }`                |
  * | msg.new          | S → C     | `{ message_id, conversation_id, seq, sender_id, body, sent_at, reply_to_message_id?, reply_to_sender_id?, reply_to_body_preview?, forwarded_from_username?, recalled? }` |
  * | sync.req         | C → S     | `{ cursors: [{ conversation_id, last_delivered_seq }] }`       |
@@ -59,13 +59,15 @@ export interface AuthTicketRes {
  */
 export interface MediaRef {
   media_id: string;
-  kind: "image" | "video";
+  kind: "image" | "video" | "audio";
   mime: string;
   bytes: number;
   file_name: string;
   /** Natural pixel dimensions (client-computed, best-effort); absent if unknown. */
   width?: number;
   height?: number;
+  /** Voice-message duration in milliseconds (audio only); absent otherwise. */
+  duration_ms?: number;
 }
 
 export interface MsgSend {
@@ -77,6 +79,11 @@ export interface MsgSend {
   media?: MediaRef;
   /** Optional reply target; must be a message of the same conversation. */
   reply_to?: string;
+  /**
+   * Optional forward source: the server copies text/media/audio from that
+   * message into this one. Sent with an empty body and no media.
+   */
+  forward_of_message_id?: string;
 }
 
 export interface MsgAck {
@@ -118,7 +125,8 @@ export interface SyncReq {
 }
 
 export interface SyncRes {
-  messages: MsgNew[];
+  /** Plain replays PLUS replayed secret-chat ciphertext (shape-routed). */
+  messages: (MsgNew | E2eeMsg)[];
   complete: boolean;
 }
 
@@ -167,6 +175,8 @@ export interface MsgRecalled {
  */
 export interface E2eeMsg {
   conversation_id: number;
+  /** Client-generated idempotency key — REQUIRED by the server schema. */
+  client_msg_id: string;
   /** base64 payload produced by lib/crypto/olm-lite. */
   ciphertext: string;
   /** 0 = session-init, 1 = normal ratchet message. */
@@ -305,11 +315,16 @@ function hasOptionalInt(d: Record<string, unknown>, key: string): boolean {
 export function isMediaRef(v: unknown): v is MediaRef {
   if (!isRecord(v)) return false;
   if (!hasString(v, "media_id")) return false;
-  if (v["kind"] !== "image" && v["kind"] !== "video") return false;
+  if (v["kind"] !== "image" && v["kind"] !== "video" && v["kind"] !== "audio")
+    return false;
   if (!hasString(v, "mime")) return false;
   if (!hasInt(v, "bytes")) return false;
   if (!hasString(v, "file_name")) return false;
-  return hasOptionalInt(v, "width") && hasOptionalInt(v, "height");
+  return (
+    hasOptionalInt(v, "width") &&
+    hasOptionalInt(v, "height") &&
+    hasOptionalInt(v, "duration_ms")
+  );
 }
 
 /** Optional media reference: absent is valid; present must match MediaRef. */
@@ -332,7 +347,8 @@ export function isMsgSend(d: unknown): d is MsgSend {
     hasString(d, "client_msg_id") &&
     hasString(d, "body") &&
     hasOptionalMedia(d) &&
-    hasOptionalString(d, "reply_to")
+    hasOptionalString(d, "reply_to") &&
+    hasOptionalString(d, "forward_of_message_id")
   );
 }
 
@@ -380,7 +396,9 @@ export function isSyncReq(d: unknown): d is SyncReq {
 export function isSyncRes(d: unknown): d is SyncRes {
   if (!isRecord(d) || !Array.isArray(d["messages"]) || !hasBool(d, "complete"))
     return false;
-  return d["messages"].every((m) => isMsgNew(m));
+  // Batches mix plain replays and replayed secret-chat ciphertext (the
+  // server's SyncMessage is an untagged union), so accept both shapes.
+  return d["messages"].every((m) => isMsgNew(m) || isE2eeMsg(m));
 }
 
 export function isErrorPayload(d: unknown): d is ErrorPayload {
@@ -441,6 +459,7 @@ export function isE2eeMsg(d: unknown): d is E2eeMsg {
   return (
     isRecord(d) &&
     hasInt(d, "conversation_id") &&
+    hasString(d, "client_msg_id") &&
     hasString(d, "ciphertext") &&
     hasInt(d, "message_type")
   );

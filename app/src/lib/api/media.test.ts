@@ -86,6 +86,16 @@ describe("mediaKindFor", () => {
     expect(mediaKindFor("application/pdf")).toBeNull();
     expect(mediaKindFor("")).toBeNull();
   });
+
+  it("recognizes voice containers, including parameterized MediaRecorder MIME", () => {
+    expect(mediaKindFor("audio/webm")).toBe("audio");
+    expect(mediaKindFor("audio/ogg")).toBe("audio");
+    expect(mediaKindFor("audio/mp4")).toBe("audio");
+    // Browsers report the codec parameter; the bare container decides.
+    expect(mediaKindFor("audio/webm;codecs=opus")).toBe("audio");
+    expect(mediaKindFor("audio/ogg; codecs=opus")).toBe("audio");
+    expect(mediaKindFor("audio/mpeg")).toBeNull();
+  });
 });
 
 describe("checkMediaFile", () => {

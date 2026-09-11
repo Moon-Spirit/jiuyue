@@ -269,6 +269,7 @@ async fn send_and_ack(
             body: body.to_owned(),
             reply_to: None,
             media: None,
+            forward_of_message_id: None,
         }),
     };
     ws_send_text(

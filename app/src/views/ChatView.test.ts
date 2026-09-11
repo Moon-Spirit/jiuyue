@@ -1,5 +1,5 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
-import { mount } from "@vue/test-utils";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { flushPromises, mount } from "@vue/test-utils";
 import type { DOMWrapper, VueWrapper } from "@vue/test-utils";
 import { createPinia, setActivePinia } from "pinia";
 import type { Pinia } from "pinia";
@@ -598,7 +598,9 @@ describe("ChatView — unread and composer", () => {
       );
 
       const forwarded = ws.messagesByConversation[2]?.at(-1);
-      expect(forwarded?.body).toBe("[转发] 来自对方的消息");
+      // Optimistic bubble mirrors the source content for instant display.
+      expect(forwarded?.body).toBe("来自对方的消息");
+      expect(forwarded?.forwardedFromUsername).toBe("alice");
       expect(forwarded?.mine).toBe(true);
     });
 
@@ -840,5 +842,336 @@ describe("ChatView — M8 media & emoji", () => {
     expect(clickSpy).toHaveBeenCalledTimes(2);
 
     clickSpy.mockRestore();
+  });
+});
+
+describe("ChatView — M9 voice, audio player & forward attribution", () => {
+  class MockMediaRecorder {
+    static instances: MockMediaRecorder[] = [];
+    state = "inactive";
+    mimeType = "audio/webm;codecs=opus";
+    ondataavailable: ((event: { data: Blob }) => void) | null = null;
+    onstop: (() => void) | null = null;
+    onerror: (() => void) | null = null;
+    constructor(_stream: unknown, options?: { mimeType?: string }) {
+      if (options?.mimeType !== undefined) this.mimeType = options.mimeType;
+      MockMediaRecorder.instances.push(this);
+    }
+    static isTypeSupported(): boolean {
+      return true;
+    }
+    start(): void {
+      this.state = "recording";
+    }
+    stop(): void {
+      this.state = "inactive";
+      this.ondataavailable?.({
+        data: new Blob(["voice-bytes"], { type: "audio/webm" }),
+      });
+      this.onstop?.();
+    }
+  }
+
+  class MockUploadXHR {
+    static instances: MockUploadXHR[] = [];
+    method = "";
+    url = "";
+    requestHeaders = new Map<string, string>();
+    sentBody: unknown = null;
+    status = 0;
+    responseText = "";
+    responseType = "";
+    upload: {
+      onprogress: ((event: { loaded: number; total: number }) => void) | null;
+    } = { onprogress: null };
+    onload: (() => void) | null = null;
+    onerror: (() => void) | null = null;
+    constructor() {
+      MockUploadXHR.instances.push(this);
+    }
+    open(method: string, url: string): void {
+      this.method = method;
+      this.url = url;
+    }
+    setRequestHeader(name: string, value: string): void {
+      this.requestHeaders.set(name, value);
+    }
+    send(body: unknown): void {
+      this.sentBody = body;
+      this.status = 201;
+      this.responseText = JSON.stringify({
+        media_id: "mid-voice",
+        kind: "audio",
+        mime: "audio/webm",
+        bytes: 11,
+        file_name: "voice.webm",
+      });
+      this.onload?.();
+    }
+  }
+
+  class MockAudio {
+    currentTime = 0;
+    duration = 4.2;
+    src = "";
+    paused = true;
+    constructor(src: string) {
+      this.src = src;
+    }
+    addEventListener(): void {
+      // timeupdate/ended/error listeners are irrelevant in jsdom.
+    }
+    play(): Promise<void> {
+      this.paused = false;
+      return Promise.resolve();
+    }
+    pause(): void {
+      this.paused = true;
+    }
+  }
+
+  const audioMedia = {
+    mediaId: "mid-audio",
+    kind: "audio" as const,
+    mime: "audio/webm",
+    bytes: 2048,
+    fileName: "voice.webm",
+    durationMs: 4200,
+  };
+
+  let originalMediaDevices: PropertyDescriptor | undefined;
+
+  beforeEach(() => {
+    MockMediaRecorder.instances = [];
+    MockUploadXHR.instances = [];
+    originalMediaDevices = Object.getOwnPropertyDescriptor(
+      navigator,
+      "mediaDevices",
+    );
+    vi.stubGlobal("MediaRecorder", MockMediaRecorder);
+    vi.stubGlobal("XMLHttpRequest", MockUploadXHR);
+    vi.stubGlobal("Audio", MockAudio);
+    Object.defineProperty(navigator, "mediaDevices", {
+      configurable: true,
+      value: {
+        getUserMedia: vi
+          .fn()
+          .mockResolvedValue({ getTracks: () => [{ stop: vi.fn() }] }),
+      },
+    });
+  });
+
+  afterEach(() => {
+    if (originalMediaDevices === undefined) {
+      delete (navigator as { mediaDevices?: unknown }).mediaDevices;
+    } else {
+      Object.defineProperty(navigator, "mediaDevices", originalMediaDevices);
+    }
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  async function mountVoiceConversation(): Promise<{
+    wrapper: VueWrapper;
+    ws: ReturnType<typeof useWsStore>;
+  }> {
+    const pinia = createPinia();
+    setActivePinia(pinia);
+    useAuthStore().user = { userId: "7", username: "me", uid: 1000007 };
+    useAuthStore().accessToken = "tok";
+    const ws = useWsStore();
+    ws.conversations.push(conversation(1, { peerUsername: "alice" }));
+    ws.openConversation(1);
+    ws.status = "open";
+    const wrapper = await mountView(pinia);
+    return { wrapper, ws };
+  }
+
+  it("records, stops, uploads the webm and sends an audio message with duration_ms", async () => {
+    const { wrapper, ws } = await mountVoiceConversation();
+    const main = mainPane(wrapper);
+
+    await main.find('[data-testid="voice-record"]').trigger("click");
+    await flushPromises();
+
+    // Recording UI replaces the composer and shows a live mm:ss timer.
+    expect(main.find('[data-testid="voice-timer"]').exists()).toBe(true);
+    expect(main.find('[data-testid="composer-input"]').exists()).toBe(false);
+
+    await main.find('[data-testid="voice-stop"]').trigger("click");
+    await flushPromises();
+    await flushPromises();
+
+    const xhr = MockUploadXHR.instances.at(-1);
+    expect(xhr).toBeDefined();
+    expect(xhr?.method).toBe("POST");
+    expect(xhr?.url).toBe("/api/media");
+    const uploaded = xhr?.sentBody as File;
+    expect(uploaded).toBeInstanceOf(File);
+    expect(uploaded.type).toBe("audio/webm");
+    expect(uploaded.name).toMatch(/^voice-.*\.webm$/);
+
+    const sent = ws.messagesByConversation[1]?.at(-1);
+    expect(sent?.media?.kind).toBe("audio");
+    expect(sent?.media?.mediaId).toBe("mid-voice");
+    expect(typeof sent?.media?.durationMs).toBe("number");
+    expect((sent?.media?.durationMs ?? -1) >= 0).toBe(true);
+
+    // Recording UI is fully torn down after a successful send.
+    expect(main.find('[data-testid="voice-timer"]').exists()).toBe(false);
+    expect(main.find('[data-testid="composer-input"]').exists()).toBe(true);
+  });
+
+  it("cancels a recording without uploading anything", async () => {
+    const { wrapper, ws } = await mountVoiceConversation();
+    const main = mainPane(wrapper);
+
+    await main.find('[data-testid="voice-record"]').trigger("click");
+    await flushPromises();
+    await main.find('[data-testid="voice-cancel"]').trigger("click");
+    await flushPromises();
+    await flushPromises();
+
+    expect(MockUploadXHR.instances).toHaveLength(0);
+    expect(ws.messagesByConversation[1] ?? []).toHaveLength(0);
+    expect(main.find('[data-testid="composer-input"]').exists()).toBe(true);
+  });
+
+  it("shows a localized error when the microphone is denied", async () => {
+    const getUserMedia = vi
+      .fn()
+      .mockRejectedValue(new Error("NotAllowedError"));
+    Object.defineProperty(navigator, "mediaDevices", {
+      configurable: true,
+      value: { getUserMedia },
+    });
+    const { wrapper } = await mountVoiceConversation();
+    const main = mainPane(wrapper);
+
+    await main.find('[data-testid="voice-record"]').trigger("click");
+    await flushPromises();
+
+    const error = main.find('[data-testid="upload-error"]');
+    expect(error.exists()).toBe(true);
+    expect(error.text()).toContain("麦克风");
+    // The composer is restored, never stuck in a recording state.
+    expect(main.find('[data-testid="composer-input"]').exists()).toBe(true);
+    expect(main.find('[data-testid="voice-timer"]').exists()).toBe(false);
+  });
+
+  it("renders a custom audio player with duration and toggles play/pause", async () => {
+    const pinia = createPinia();
+    setActivePinia(pinia);
+    useAuthStore().user = { userId: "7", username: "me", uid: 1000007 };
+    const ws = useWsStore();
+    ws.conversations.push(conversation(1, { peerUsername: "alice" }));
+    ws.messagesByConversation[1] = [
+      message({
+        messageId: "m-audio",
+        seq: 1,
+        senderId: "alice",
+        body: "",
+        media: audioMedia,
+        sentAt: isoAt(-30_000),
+      }),
+    ];
+    ws.openConversation(1);
+    ws.status = "open";
+    const wrapper = await mountView(pinia);
+    const main = mainPane(wrapper);
+
+    expect(main.find('[data-testid="media-audio"]').exists()).toBe(true);
+    expect(main.find('[data-testid="audio-play"]').exists()).toBe(true);
+    expect(main.find('[data-testid="audio-progress"]').exists()).toBe(true);
+    expect(main.find('[data-testid="media-audio"]').text()).toContain("00:04");
+    // No native audio chrome.
+    expect(main.find("audio").exists()).toBe(false);
+
+    await main.find('[data-testid="audio-play"]').trigger("click");
+    await wrapper.vm.$nextTick();
+    expect(main.find('[data-testid="audio-play"]').text()).toContain("❚❚");
+
+    await main.find('[data-testid="audio-play"]').trigger("click");
+    await wrapper.vm.$nextTick();
+    expect(main.find('[data-testid="audio-play"]').text()).toContain("▶");
+  });
+
+  it("shows a localized voice session preview", async () => {
+    const pinia = createPinia();
+    setActivePinia(pinia);
+    useAuthStore().user = { userId: "7", username: "me", uid: 1000007 };
+    const ws = useWsStore();
+    ws.conversations.push(
+      conversation(1, {
+        peerUsername: "alice",
+        lastMessagePreview: "",
+        lastMessageKind: "audio",
+      }),
+    );
+    const wrapper = await mountView(pinia);
+    expect(
+      sessionsPane(wrapper).find('[data-testid="session-preview"]').text(),
+    ).toBe("[语音]");
+  });
+
+  it("renders a 转发自 attribution badge on text and media bubbles", async () => {
+    const pinia = createPinia();
+    setActivePinia(pinia);
+    useAuthStore().user = { userId: "7", username: "me", uid: 1000007 };
+    const ws = useWsStore();
+    ws.conversations.push(conversation(1, { peerUsername: "alice" }));
+    ws.messagesByConversation[1] = [
+      message({
+        messageId: "m-fwd-text",
+        seq: 1,
+        senderId: "7",
+        body: "转发的文字",
+        forwardedFromUsername: "carol",
+        mine: true,
+        status: "delivered",
+        sentAt: isoAt(-20_000),
+      }),
+      message({
+        messageId: "m-fwd-media",
+        seq: 2,
+        senderId: "7",
+        body: "",
+        media: audioMedia,
+        forwardedFromUsername: "dave",
+        mine: true,
+        status: "delivered",
+        sentAt: isoAt(-10_000),
+      }),
+    ];
+    ws.openConversation(1);
+    ws.status = "open";
+    const wrapper = await mountView(pinia);
+    const main = mainPane(wrapper);
+
+    const badges = main.findAll('[data-testid="forward-badge"]');
+    expect(badges).toHaveLength(2);
+    const texts = badges.map((b) => b.text());
+    expect(texts.some((t) => t.includes("carol"))).toBe(true);
+    expect(texts.some((t) => t.includes("dave"))).toBe(true);
+  });
+
+  it("hides attachment and voice buttons in secret conversations", async () => {
+    const pinia = createPinia();
+    setActivePinia(pinia);
+    useAuthStore().user = { userId: "7", username: "me", uid: 1000007 };
+    const ws = useWsStore();
+    ws.conversations.push(
+      conversation(1, { peerUsername: "alice", kind: "secret" }),
+    );
+    ws.openConversation(1);
+    ws.status = "open";
+    const wrapper = await mountView(pinia);
+    const main = mainPane(wrapper);
+
+    expect(main.find('[data-testid="attach-image"]').exists()).toBe(false);
+    expect(main.find('[data-testid="attach-video"]').exists()).toBe(false);
+    expect(main.find('[data-testid="voice-record"]').exists()).toBe(false);
+    // Emoji panel stays available in secret chats.
+    expect(main.find('[data-testid="emoji-toggle"]').exists()).toBe(true);
   });
 });

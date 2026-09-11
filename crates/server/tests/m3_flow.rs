@@ -625,6 +625,7 @@ async fn reconnect_sync_replays_stored_e2ee_frames_in_order() {
             body: "plain-hello".to_owned(),
             reply_to: None,
             media: None,
+            forward_of_message_id: None,
         }),
     };
     ws_send_text(

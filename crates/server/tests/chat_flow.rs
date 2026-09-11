@@ -328,6 +328,7 @@ async fn happy_path_direct_message_delivers_ack_and_live_msg_new() {
             body: "\u{5728}\u{5417}\u{ff1f}".to_owned(),
             reply_to: None,
             media: None,
+            forward_of_message_id: None,
         }),
     };
     ws_send_text(
@@ -383,6 +384,7 @@ async fn happy_path_direct_message_delivers_ack_and_live_msg_new() {
             body: "second".to_owned(),
             reply_to: None,
             media: None,
+            forward_of_message_id: None,
         }),
     };
     ws_send_text(
@@ -424,6 +426,7 @@ async fn duplicate_client_msg_id_is_idempotent_down_to_one_db_row() {
                 body: "exactly once".to_owned(),
                 reply_to: None,
                 media: None,
+                forward_of_message_id: None,
             }),
         };
         ws_send_text(
@@ -493,6 +496,7 @@ async fn body_is_ciphertext_at_rest_and_decrypts_back_to_plaintext() {
             body: plaintext.to_owned(),
             reply_to: None,
             media: None,
+            forward_of_message_id: None,
         }),
     };
     ws_send_text(
@@ -551,6 +555,7 @@ async fn non_member_cannot_send_and_connection_is_closed() {
             body: "let me in".to_owned(),
             reply_to: None,
             media: None,
+            forward_of_message_id: None,
         }),
     };
     ws_send_text(
@@ -712,6 +717,7 @@ async fn unknown_frame_type_is_answered_without_closing() {
             body: "still here".to_owned(),
             reply_to: None,
             media: None,
+            forward_of_message_id: None,
         }),
     };
     ws_send_text(

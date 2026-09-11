@@ -12,7 +12,7 @@
 //! |--------------------|-----------|------------------------------------------------------------------------------------------------------|
 //! | `auth.ticket.req`  | C → S     | `{}`                                                                                                 |
 //! | `auth.ticket.res`  | S → C     | `{ ticket }`                                                                                         |
-//! | `msg.send`         | C → S     | `{ conversation_id, client_msg_id, body, reply_to?, media? }`                                        |
+//! | `msg.send`         | C → S     | `{ conversation_id, client_msg_id, body, reply_to?, media?, forward_of_message_id? }`                |
 //! | `msg.ack`          | S → C     | `{ client_msg_id, message_id, seq, duplicate }`                                                      |
 //! | `msg.new`          | S → C     | `{ message_id, conversation_id, seq, sender_id, body, sent_at, reply_to_message_id?, reply_to_sender_id?, reply_to_body_preview?, forwarded_from_username?, recalled?, media? }` |
 //! | `sync.req`         | C → S     | `{ cursors: [{ conversation_id, last_delivered_seq }] }`                                             |
@@ -53,8 +53,8 @@
 //! ```
 
 use serde::{
-    Deserialize, Deserializer, Serialize,
     de::{DeserializeOwned, Error as _},
+    Deserialize, Deserializer, Serialize,
 };
 use serde_json::Value;
 use uuid::Uuid;
@@ -86,15 +86,15 @@ pub struct SyncCursor {
 /// Media attachment reference (M8) carried on `msg.send`, `msg.new` and the
 /// `sync.res` entries that replay media messages.
 ///
-/// `width`/`height` are CLIENT-supplied presentation hints — the server never
-/// decodes image/video bytes. Every other field mirrors the authoritative
-/// `media` row created by `POST /api/media`; on the fanout/replay side the
-/// server rebuilds this object from that row. Null-absent: an absent
-/// `width`/`height` is omitted from the wire entirely.
+/// `width`/`height`/`duration_ms` are CLIENT-supplied presentation hints — the
+/// server never decodes image/video/audio bytes. Every other field mirrors the
+/// authoritative `media` row created by `POST /api/media`; on the
+/// fanout/replay side the server rebuilds this object from that row.
+/// Null-absent: an absent hint is omitted from the wire entirely.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MediaRef {
     pub media_id: Uuid,
-    /// `"image"` | `"video"` (mirrors `messages.kind` for this message).
+    /// `"image"` | `"video"` | `"audio"` (mirrors `messages.kind`).
     pub kind: String,
     pub mime: String,
     pub bytes: i64,
@@ -103,6 +103,9 @@ pub struct MediaRef {
     pub width: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub height: Option<i32>,
+    /// M9a audio/voice length hint in milliseconds (absent for images/videos).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<i64>,
 }
 
 /// Server-pushed message record; the shape of `msg.new` and of entries in
@@ -174,6 +177,13 @@ pub struct MsgSend {
     /// `media.kind` and an empty body; server awards no XP for it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub media: Option<MediaRef>,
+    /// M9a forward source: when present the server copies that message's
+    /// stored content (text, media or audio) into THIS conversation instead of
+    /// using `body`/`media`, attributing the original author via
+    /// `forwarded_from_username`. The client therefore sends an empty `body`
+    /// and, for media forwarding, no `media` field at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forward_of_message_id: Option<Uuid>,
 }
 
 /// Server acknowledgement of a [`MsgSend`].
@@ -512,6 +522,7 @@ mod tests {
                 body: "你好".to_owned(),
                 reply_to: None,
                 media: None,
+                forward_of_message_id: None,
             }),
         };
 
@@ -665,6 +676,7 @@ mod tests {
                 body: "plain".to_owned(),
                 reply_to: None,
                 media: None,
+                forward_of_message_id: None,
             }),
         };
         let value = serde_json::to_value(&send).unwrap();
@@ -751,6 +763,7 @@ mod tests {
                     body: String::new(),
                     reply_to: None,
                     media: None,
+                    forward_of_message_id: None,
                 }),
             },
             Frame {
@@ -867,6 +880,7 @@ mod tests {
             file_name: "photo.png".to_owned(),
             width: Some(800),
             height: Some(600),
+            duration_ms: Some(4200),
         };
         let frame = Frame {
             v: 1,
@@ -876,6 +890,7 @@ mod tests {
                 body: String::new(),
                 reply_to: None,
                 media: Some(media.clone()),
+                forward_of_message_id: None,
             }),
         };
         let value = serde_json::to_value(&frame).unwrap();
@@ -885,18 +900,21 @@ mod tests {
         );
         assert_eq!(value["d"]["media"]["kind"], json!("image"));
         assert_eq!(value["d"]["media"]["width"], json!(800));
+        assert_eq!(value["d"]["media"]["duration_ms"], json!(4200));
         let back: Frame = serde_json::from_value(value).unwrap();
         assert_eq!(frame, back, "media frame roundtrips");
 
-        // width/height absent -> omitted from the wire entirely.
+        // Absent hints (width/height/duration_ms) -> omitted entirely.
         let bare = MediaRef {
             width: None,
             height: None,
+            duration_ms: None,
             ..media
         };
         let value = serde_json::to_value(&bare).unwrap();
         assert!(value.get("width").is_none());
         assert!(value.get("height").is_none());
+        assert!(value.get("duration_ms").is_none());
 
         // A MsgNew without media emits no `media` key (M1 byte-compat).
         let msg_new = Frame {

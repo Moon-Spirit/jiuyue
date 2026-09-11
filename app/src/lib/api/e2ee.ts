@@ -25,6 +25,20 @@ export class NoOneTimeKeysError extends Error {
   }
 }
 
+/**
+ * Thrown when the peer has never published an E2EE bundle (HTTP 404 on the
+ * key directory). The user may well exist — they simply have not opened a
+ * client that publishes keys yet, so a secret chat cannot be established.
+ */
+export class PeerNotReadyError extends Error {
+  readonly username: string;
+  constructor(username: string) {
+    super(`peer has not published an e2ee bundle: ${username}`);
+    this.name = "PeerNotReadyError";
+    this.username = username;
+  }
+}
+
 /** POST /api/e2ee/keys/upload { identity_key, one_time_keys } (Bearer access). */
 export function uploadE2eeKeyBundle(
   accessToken: string,
@@ -51,6 +65,10 @@ export async function fetchPeerBundle(
   } catch (error) {
     if (error instanceof ApiError && error.status === 409) {
       throw new NoOneTimeKeysError(username);
+    }
+    // 404 (peer_not_found / not_found): no bundle has ever been published.
+    if (error instanceof ApiError && error.status === 404) {
+      throw new PeerNotReadyError(username);
     }
     throw error;
   }
