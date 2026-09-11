@@ -155,6 +155,60 @@ describe("ChatView — sessions pane", () => {
       sessionsPane(wrapper).find('[data-testid="session-list"]').exists(),
     ).toBe(false);
   });
+
+  it("glides the session indicator between active rows", async () => {
+    const pinia = createPinia();
+    setActivePinia(pinia);
+    useAuthStore().user = { userId: "7", username: "me", uid: 1000007 };
+    const ws = useWsStore();
+    ws.conversations.push(
+      conversation(1, {
+        peerUsername: "alice",
+        lastActivityAt: isoAt(-2 * HOUR),
+      }),
+      conversation(2, {
+        peerUsername: "bob",
+        lastActivityAt: isoAt(-MINUTE),
+      }),
+    );
+
+    // jsdom has no layout engine: fake the geometry the pill measures.
+    const offsetTopSpy = vi
+      .spyOn(HTMLElement.prototype, "offsetTop", "get")
+      .mockImplementation(function (this: HTMLElement) {
+        return this.getAttribute("data-conversation-id") === "1" ? 64 : 8;
+      });
+    const offsetHeightSpy = vi
+      .spyOn(HTMLElement.prototype, "offsetHeight", "get")
+      .mockReturnValue(56);
+
+    try {
+      const wrapper = await mountView(pinia);
+      const list = sessionsPane(wrapper);
+      const indicator = list.find('[data-testid="session-indicator"]');
+      expect(indicator.exists()).toBe(true);
+      // Hidden until a conversation is active.
+      expect(indicator.attributes("style")).toContain("opacity: 0");
+
+      const rows = list.findAll('[data-testid="session-item"]');
+      expect(rows[0]?.attributes("data-conversation-id")).toBe("2");
+
+      await rows[0]?.trigger("click");
+      await flushPromises();
+      await wrapper.vm.$nextTick();
+      expect(indicator.attributes("style")).toContain("translateY(8px)");
+      expect(indicator.attributes("style")).toContain("height: 56px");
+
+      await rows[1]?.trigger("click");
+      await flushPromises();
+      await wrapper.vm.$nextTick();
+      expect(ws.activeConversationId).toBe(1);
+      expect(indicator.attributes("style")).toContain("translateY(64px)");
+    } finally {
+      offsetTopSpy.mockRestore();
+      offsetHeightSpy.mockRestore();
+    }
+  });
 });
 
 describe("ChatView — message thread", () => {
@@ -807,6 +861,19 @@ describe("ChatView — M8 media & emoji", () => {
     expect(main.find('[data-testid="emoji-panel"]').exists()).toBe(false);
   });
 
+  it("renders the emoji toggle as a monochrome svg icon instead of a glyph", async () => {
+    const { wrapper } = await mountWithMedia();
+    const toggle = mainPane(wrapper).find('[data-testid="emoji-toggle"]');
+
+    const icon = toggle.find("svg");
+    expect(icon.exists()).toBe(true);
+    // Line icon: drawn with currentColor, no colored emoji text remains.
+    expect(icon.attributes("stroke")).toBe("currentColor");
+    expect(toggle.text()).toBe("");
+    expect(toggle.attributes("title")).toBeTruthy();
+    expect(toggle.attributes("aria-label")).toBeTruthy();
+  });
+
   it("rejects an oversized image locally before any upload", async () => {
     const { wrapper, ws } = await mountWithMedia();
     ws.status = "open";
@@ -1397,6 +1464,37 @@ describe("ChatView — M11 groups", () => {
     expect(main.find('[data-testid="group-owner-leave-hint"]').exists()).toBe(
       true,
     );
+  });
+
+  it("renders the group info as a right-side drawer with a frosted backdrop", async () => {
+    const wrapper = await mountGroupPanel("7", "owner", [
+      member("7", "owner"),
+      member("u2", "member"),
+    ]);
+    const panel = mainPane(wrapper).find('[data-testid="group-info-panel"]');
+    expect(panel.exists()).toBe(true);
+
+    const drawer = panel.find('[data-testid="group-info-drawer"]');
+    expect(drawer.exists()).toBe(true);
+    const drawerClasses = drawer.classes();
+    expect(drawerClasses).toContain("group-drawer-panel");
+    expect(drawerClasses).toContain("right-0");
+    expect(drawerClasses).toContain("max-w-[90vw]");
+    expect(drawerClasses).toContain("overflow-y-auto");
+    expect(drawerClasses).toContain("shadow-2xl");
+    expect(drawer.attributes("role")).toBe("dialog");
+
+    const backdrop = panel.find('[data-testid="group-info-backdrop"]');
+    expect(backdrop.classes()).toContain("group-drawer-backdrop");
+    expect(backdrop.classes()).toContain("bg-black/30");
+    expect(backdrop.classes()).toContain("backdrop-blur-md");
+
+    // Backdrop click still closes the panel.
+    await backdrop.trigger("click");
+    await wrapper.vm.$nextTick();
+    expect(
+      mainPane(wrapper).find('[data-testid="group-info-panel"]').exists(),
+    ).toBe(false);
   });
 
   it("admin can only kick plain members and cannot leave-manage roles", async () => {

@@ -2,7 +2,7 @@
 /**
  * Responsive application shell.
  *
- * - ≥1024px (lg): [56px nav rail | 300px sessions | 1fr main]
+ * - ≥1024px (lg): [72px floating nav dock | 300px sessions | 1fr main]
  * - 640–1023px (sm–lg): top bar + [300px sessions | 1fr main]
  * - <640px: single column (top bar + main) + bottom tab placeholder
  *
@@ -15,14 +15,20 @@
   <div
     class="h-dvh w-full overflow-hidden bg-white text-neutral-900 dark:bg-neutral-950 dark:text-neutral-100"
   >
-    <!-- Desktop: three columns -->
-    <div class="hidden h-full lg:grid lg:grid-cols-[56px_300px_1fr]">
-      <aside
-        class="flex flex-col items-center gap-2 border-r border-neutral-200 py-3 dark:border-neutral-800"
-        data-testid="shell-nav-desktop"
-      >
-        <slot name="nav" />
-      </aside>
+    <!-- Desktop: floating nav dock + sessions + main -->
+    <div class="hidden h-full lg:grid lg:grid-cols-[72px_300px_1fr]">
+      <!-- Tinted gutter (8px on all sides) so the translucent white dock never
+           sits white-on-white. Kept scoped to the nav column on purpose: the
+           chat canvas stays white because slate-100 peer bubbles would all but
+           vanish against a neutral-100 page background. -->
+      <div class="min-h-0 bg-neutral-200/80 p-2 dark:bg-neutral-900">
+        <aside
+          class="flex h-full min-h-0 flex-col items-center gap-2 overflow-y-auto rounded-2xl border border-black/10 bg-white/85 py-2 shadow-[0_12px_32px_rgba(0,0,0,0.18)] backdrop-blur-xl dark:border-white/10 dark:bg-neutral-900/70 dark:shadow-[0_12px_32px_rgba(0,0,0,0.6)]"
+          data-testid="shell-nav-desktop"
+        >
+          <slot name="nav" />
+        </aside>
+      </div>
       <section
         class="overflow-y-auto border-r border-neutral-200 dark:border-neutral-800"
         data-testid="shell-sessions-desktop"

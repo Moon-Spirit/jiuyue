@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import {
   computed,
+  getCurrentInstance,
   nextTick,
   onBeforeUnmount,
   onMounted,
@@ -50,6 +51,8 @@ const ws = useWsStore();
 const friends = useFriendsStore();
 const groups = useGroupsStore();
 const profile = useProfileStore();
+/** Own instance, captured for cross-breakpoint DOM measurement at runtime. */
+const viewInstance = getCurrentInstance();
 
 const PREVIEW_MAX_CHARS = 40;
 /** Group name bounds (mirrors the server contract: 1..32). */
@@ -142,10 +145,13 @@ onMounted(() => {
     void ws.connect();
   }
   document.addEventListener("keydown", onGlobalKeydown);
+  window.addEventListener("resize", onSessionListResize);
+  syncSessionIndicator();
 });
 
 onBeforeUnmount(() => {
   document.removeEventListener("keydown", onGlobalKeydown);
+  window.removeEventListener("resize", onSessionListResize);
   // Release the microphone and any playing audio element cleanly.
   if (recording.value && mediaRecorder !== null) {
     recordingCancelled = true;
@@ -352,6 +358,108 @@ function openConversation(conversationId: number): void {
   // Resets unread and advances lastSeenSeq inside the store.
   ws.openConversation(conversationId);
 }
+
+// ---------------------------------------------------------------------
+// Sessions: sliding active-conversation indicator
+// ---------------------------------------------------------------------
+
+/**
+ * Position of the grey pill behind the active session row, relative to the
+ * session list. `null` while nothing is active (the pill stays hidden).
+ */
+const indicatorMetrics = ref<{ y: number; height: number } | null>(null);
+/** Flipped on after the first placement so the pill only glides on changes. */
+const indicatorSettled = ref(false);
+
+const indicatorStyle = computed(() => {
+  const metrics = indicatorMetrics.value;
+  if (metrics === null) return { opacity: "0" };
+  return {
+    transform: `translateY(${metrics.y}px)`,
+    height: `${metrics.height}px`,
+  };
+});
+
+const indicatorTransitionClass = computed(() =>
+  indicatorSettled.value
+    ? "transition-transform duration-[280ms] ease-[cubic-bezier(0.34,1.3,0.64,1)] motion-reduce:transition-none"
+    : "",
+);
+
+/** The shell renders one session list per breakpoint; measure the visible one. */
+function visibleSessionList(root: HTMLElement): HTMLElement | null {
+  const lists = Array.from(
+    root.querySelectorAll<HTMLElement>('[data-testid="session-list"]'),
+  );
+  return (
+    lists.find(
+      (list) =>
+        list.offsetParent !== null && list.getBoundingClientRect().width > 0,
+    ) ??
+    lists[0] ??
+    null
+  );
+}
+
+/** Scrolls the active row into view when the sessions pane is scrolled away. */
+function revealSessionRow(row: HTMLElement): void {
+  const scroller = row.closest<HTMLElement>('[data-testid^="shell-sessions"]');
+  if (scroller === null) return;
+  const rowRect = row.getBoundingClientRect();
+  const scrollRect = scroller.getBoundingClientRect();
+  const fullyVisible =
+    rowRect.top >= scrollRect.top && rowRect.bottom <= scrollRect.bottom;
+  // Optional call: jsdom (tests) does not implement scrollIntoView.
+  if (!fullyVisible) row.scrollIntoView?.({ block: "nearest" });
+}
+
+/**
+ * Re-measures the active session row and glides the pill to it. Safe to call
+ * at any time (mount / active change / list reorder / viewport resize).
+ */
+function syncSessionIndicator(): void {
+  const root: unknown = viewInstance?.proxy?.$el;
+  if (!(root instanceof HTMLElement)) return;
+  const list = visibleSessionList(root);
+  const activeId = ws.activeConversationId;
+  if (list === null || activeId === null) {
+    indicatorMetrics.value = null;
+    return;
+  }
+  const row = list.querySelector<HTMLElement>(
+    `[data-conversation-id="${activeId}"]`,
+  );
+  if (row === null) {
+    indicatorMetrics.value = null;
+    return;
+  }
+  revealSessionRow(row);
+  const firstPlacement = indicatorMetrics.value === null;
+  indicatorMetrics.value = { y: row.offsetTop, height: row.offsetHeight };
+  if (firstPlacement) {
+    // Jump on first placement; enable the glide from the next change on.
+    indicatorSettled.value = false;
+    requestAnimationFrame(() => {
+      indicatorSettled.value = true;
+    });
+  }
+}
+
+function onSessionListResize(): void {
+  syncSessionIndicator();
+}
+
+// Re-measure when the active conversation changes or the list reorders /
+// changes membership (new message bumps, deletions, new conversations).
+watch(
+  () => [
+    ws.activeConversationId,
+    ws.sortedConversations.map((c) => c.conversationId).join(","),
+  ],
+  () => {
+    void nextTick(syncSessionIndicator);
+  },
+);
 
 // ---------------------------------------------------------------------
 // Message thread
@@ -1367,22 +1475,26 @@ async function submitGroupInvite(): Promise<void> {
           {{ t("group.newGroup") }}
         </button>
 
-        <!-- Conversation list -->
+        <!-- Conversation list; the grey pill behind the active row glides via
+             syncSessionIndicator() (screen-reader hidden, not a real row) -->
         <ul
           v-if="ws.sortedConversations.length > 0"
-          class="space-y-1"
+          class="relative space-y-1"
           data-testid="session-list"
         >
+          <li
+            aria-hidden="true"
+            data-testid="session-indicator"
+            class="pointer-events-none absolute inset-x-0 top-0 z-0 rounded-lg bg-neutral-100 will-change-transform dark:bg-neutral-800"
+            :class="indicatorTransitionClass"
+            :style="indicatorStyle"
+          ></li>
           <li
             v-for="conversation in ws.sortedConversations"
             :key="conversation.conversationId"
             data-testid="session-item"
             :data-conversation-id="conversation.conversationId"
-            class="flex cursor-pointer items-center gap-3 rounded-lg p-2 hover:bg-neutral-100 dark:hover:bg-neutral-800"
-            :class="{
-              'bg-neutral-100 dark:bg-neutral-800':
-                ws.activeConversationId === conversation.conversationId,
-            }"
+            class="relative z-10 flex cursor-pointer items-center gap-3 rounded-lg p-2 hover:bg-neutral-100 dark:hover:bg-neutral-800"
             @click="openConversation(conversation.conversationId)"
           >
             <Avatar
@@ -1976,10 +2088,25 @@ async function submitGroupInvite(): Promise<void> {
               data-testid="emoji-toggle"
               :title="t('chat.emojiToggle')"
               :aria-label="t('chat.emojiToggle')"
-              class="shrink-0 rounded-xl px-2 py-2 text-lg leading-none hover:bg-neutral-100 dark:hover:bg-neutral-800"
+              :aria-expanded="emojiOpen"
+              class="shrink-0 rounded-xl px-2 py-2 text-neutral-500 hover:bg-neutral-100 hover:text-indigo-600 dark:text-neutral-400 dark:hover:bg-neutral-800 dark:hover:text-indigo-400"
               @click="toggleEmoji()"
             >
-              😀
+              <svg
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                class="h-6 w-6"
+                aria-hidden="true"
+              >
+                <circle cx="12" cy="12" r="10" />
+                <path d="M8 14s1.5 2 4 2 4-2 4-2" />
+                <line x1="9" y1="9" x2="9.01" y2="9" />
+                <line x1="15" y1="9" x2="15.01" y2="9" />
+              </svg>
             </button>
             <template v-if="mediaEnabled">
               <button
@@ -2292,215 +2419,261 @@ async function submitGroupInvite(): Promise<void> {
         </div>
       </div>
 
-      <!-- M11 group info panel: roster, role badges, gated actions -->
-      <div
-        v-if="groupPanelOpen && activeGroupInfo !== null"
-        class="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4"
-        data-testid="group-info-panel"
-      >
+      <!-- M11 group info panel: right-side drawer over a frosted backdrop -->
+      <Transition name="group-drawer">
         <div
-          class="w-full max-w-sm rounded-xl bg-white p-4 shadow-lg dark:bg-neutral-900"
+          v-if="groupPanelOpen && activeGroupInfo !== null"
+          class="fixed inset-0 z-50 overflow-hidden"
+          data-testid="group-info-panel"
         >
-          <div class="flex items-center justify-between pb-2">
-            <h3
-              class="min-w-0 truncate text-sm font-semibold"
-              data-testid="group-info-title"
-            >
-              {{ activeGroupInfo.name }}
-            </h3>
-            <button
-              type="button"
-              class="shrink-0 rounded px-1.5 text-lg leading-none text-neutral-400 hover:bg-neutral-100 hover:text-neutral-700 dark:hover:bg-neutral-800"
-              data-testid="group-info-close"
-              :aria-label="t('group.close')"
-              @click="closeGroupPanel()"
-            >
-              ×
-            </button>
-          </div>
-          <p
-            class="text-xs text-neutral-500 dark:text-neutral-400"
-            data-testid="group-info-meta"
-          >
-            {{ t("group.memberCount", { n: activeGroupInfo.member_count }) }} ·
-            {{
-              t("group.myRole", {
-                role: memberRoleLabel(activeGroupInfo.my_role),
-              })
-            }}
-          </p>
-
-          <!-- Invite row: owner/admin only -->
-          <div v-if="canInvite" class="flex items-center gap-2 pt-2">
-            <input
-              v-model="groupInviteUsername"
-              type="text"
-              :placeholder="t('group.invitePlaceholder')"
-              data-testid="group-invite-input"
-              class="min-w-0 flex-1 rounded-lg border border-neutral-300 bg-transparent px-2 py-1.5 text-sm outline-none focus:border-indigo-500 dark:border-neutral-700"
-              @keydown.enter.prevent="submitGroupInvite()"
-            />
-            <button
-              type="button"
-              data-testid="group-invite-submit"
-              :disabled="groupInviteUsername.trim().length === 0"
-              class="shrink-0 rounded-lg bg-indigo-600 px-2 py-1.5 text-xs font-medium text-white hover:bg-indigo-500 disabled:cursor-not-allowed disabled:opacity-50"
-              @click="submitGroupInvite()"
-            >
-              {{ t("group.invite") }}
-            </button>
-          </div>
-
-          <p
-            v-if="groupActionError.length > 0"
-            class="px-1 pt-2 text-xs text-red-500"
-            data-testid="group-action-error"
-          >
-            {{ groupActionError }}
-          </p>
-
-          <ul
-            class="mt-2 max-h-72 space-y-1 overflow-y-auto"
-            data-testid="group-member-list"
-          >
-            <li
-              v-for="member in activeGroupInfo.members"
-              :key="member.user_id"
-              data-testid="group-member"
-              :data-user-id="member.user_id"
-              :data-role="member.role"
-              class="flex items-center gap-2 rounded-lg p-1.5 hover:bg-neutral-100 dark:hover:bg-neutral-800"
-            >
-              <Avatar
-                class="shrink-0"
-                :username="member.username"
-                :display-name="member.display_name"
-                :avatar="member.avatar"
-                :size="28"
-              />
-              <span class="min-w-0 flex-1 truncate text-sm">
-                {{ memberLabelOf(member) }}
-              </span>
-              <span
-                v-if="member.role === 'owner'"
-                class="shrink-0 text-sm"
-                data-testid="group-member-owner"
-                :title="t('group.roleOwner')"
-                >👑</span
-              >
-              <span
-                v-else-if="member.role === 'admin'"
-                class="shrink-0 rounded bg-amber-100 px-1.5 py-0.5 text-[10px] font-medium text-amber-700 dark:bg-amber-900/40 dark:text-amber-300"
-                data-testid="group-member-admin"
-                >{{ t("group.roleAdmin") }}</span
-              >
-              <template v-if="member.user_id !== myUserId">
-                <button
-                  v-if="canChangeMemberRole(member) && member.role !== 'admin'"
-                  type="button"
-                  data-testid="group-appoint"
-                  :disabled="busyMemberId !== null"
-                  class="shrink-0 rounded px-1.5 py-0.5 text-[11px] text-indigo-600 hover:underline disabled:opacity-50 dark:text-indigo-400"
-                  @click="askRoleChange(member, 'admin')"
-                >
-                  {{ t("group.appointAdmin") }}
-                </button>
-                <button
-                  v-if="canChangeMemberRole(member) && member.role === 'admin'"
-                  type="button"
-                  data-testid="group-demote"
-                  :disabled="busyMemberId !== null"
-                  class="shrink-0 rounded px-1.5 py-0.5 text-[11px] text-indigo-600 hover:underline disabled:opacity-50 dark:text-indigo-400"
-                  @click="askRoleChange(member, 'member')"
-                >
-                  {{ t("group.demoteAdmin") }}
-                </button>
-                <button
-                  v-if="canTransferTo(member)"
-                  type="button"
-                  data-testid="group-transfer"
-                  :disabled="busyMemberId !== null"
-                  class="shrink-0 rounded px-1.5 py-0.5 text-[11px] text-neutral-500 hover:underline disabled:opacity-50 dark:text-neutral-400"
-                  @click="askTransfer(member)"
-                >
-                  {{ t("group.transfer") }}
-                </button>
-                <button
-                  v-if="canKick(member)"
-                  type="button"
-                  data-testid="group-kick"
-                  :disabled="busyMemberId !== null"
-                  class="shrink-0 rounded px-1.5 py-0.5 text-[11px] text-red-500 hover:underline disabled:opacity-50"
-                  @click="askKick(member)"
-                >
-                  {{ t("group.kick") }}
-                </button>
-              </template>
-              <span
-                v-else
-                class="shrink-0 text-[10px] text-neutral-400 dark:text-neutral-500"
-                data-testid="group-member-self"
-                >{{ t("group.you") }}</span
-              >
-            </li>
-          </ul>
-
-          <div class="pt-3">
-            <button
-              v-if="canLeave"
-              type="button"
-              data-testid="group-leave"
-              class="w-full rounded-lg bg-red-600 py-1.5 text-xs font-medium text-white hover:bg-red-500"
-              @click="askLeave()"
-            >
-              {{ t("group.leave") }}
-            </button>
-            <p
-              v-else
-              class="px-1 text-[11px] text-neutral-400 dark:text-neutral-500"
-              data-testid="group-owner-leave-hint"
-            >
-              {{ t("group.ownerLeaveHint") }}
-            </p>
-          </div>
-
-          <!-- In-app confirmation overlay for destructive group actions -->
           <div
-            v-if="groupConfirm !== null"
-            class="fixed inset-0 z-[60] flex items-center justify-center bg-black/40 p-4"
-            data-testid="group-confirm"
+            class="group-drawer-backdrop absolute inset-0 bg-black/30 backdrop-blur-md dark:bg-black/40"
+            data-testid="group-info-backdrop"
+            @click="closeGroupPanel()"
+          ></div>
+          <div
+            class="group-drawer-panel absolute inset-y-0 right-0 flex h-full w-full max-w-[90vw] flex-col overflow-y-auto bg-white p-4 shadow-2xl sm:w-[400px] dark:bg-neutral-900"
+            data-testid="group-info-drawer"
+            role="dialog"
+            aria-modal="true"
           >
-            <div
-              class="w-full max-w-xs rounded-xl bg-white p-4 shadow-lg dark:bg-neutral-900"
-            >
-              <p
-                class="pb-3 text-sm text-neutral-700 dark:text-neutral-200"
-                data-testid="group-confirm-message"
+            <div class="flex items-center justify-between pb-2">
+              <h3
+                class="min-w-0 truncate text-sm font-semibold"
+                data-testid="group-info-title"
               >
-                {{ groupConfirm.message }}
+                {{ activeGroupInfo.name }}
+              </h3>
+              <button
+                type="button"
+                class="shrink-0 rounded px-1.5 text-lg leading-none text-neutral-400 hover:bg-neutral-100 hover:text-neutral-700 dark:hover:bg-neutral-800"
+                data-testid="group-info-close"
+                :aria-label="t('group.close')"
+                @click="closeGroupPanel()"
+              >
+                ×
+              </button>
+            </div>
+            <p
+              class="text-xs text-neutral-500 dark:text-neutral-400"
+              data-testid="group-info-meta"
+            >
+              {{ t("group.memberCount", { n: activeGroupInfo.member_count }) }}
+              ·
+              {{
+                t("group.myRole", {
+                  role: memberRoleLabel(activeGroupInfo.my_role),
+                })
+              }}
+            </p>
+
+            <!-- Invite row: owner/admin only -->
+            <div v-if="canInvite" class="flex items-center gap-2 pt-2">
+              <input
+                v-model="groupInviteUsername"
+                type="text"
+                :placeholder="t('group.invitePlaceholder')"
+                data-testid="group-invite-input"
+                class="min-w-0 flex-1 rounded-lg border border-neutral-300 bg-transparent px-2 py-1.5 text-sm outline-none focus:border-indigo-500 dark:border-neutral-700"
+                @keydown.enter.prevent="submitGroupInvite()"
+              />
+              <button
+                type="button"
+                data-testid="group-invite-submit"
+                :disabled="groupInviteUsername.trim().length === 0"
+                class="shrink-0 rounded-lg bg-indigo-600 px-2 py-1.5 text-xs font-medium text-white hover:bg-indigo-500 disabled:cursor-not-allowed disabled:opacity-50"
+                @click="submitGroupInvite()"
+              >
+                {{ t("group.invite") }}
+              </button>
+            </div>
+
+            <p
+              v-if="groupActionError.length > 0"
+              class="px-1 pt-2 text-xs text-red-500"
+              data-testid="group-action-error"
+            >
+              {{ groupActionError }}
+            </p>
+
+            <ul
+              class="mt-2 max-h-72 space-y-1 overflow-y-auto"
+              data-testid="group-member-list"
+            >
+              <li
+                v-for="member in activeGroupInfo.members"
+                :key="member.user_id"
+                data-testid="group-member"
+                :data-user-id="member.user_id"
+                :data-role="member.role"
+                class="flex items-center gap-2 rounded-lg p-1.5 hover:bg-neutral-100 dark:hover:bg-neutral-800"
+              >
+                <Avatar
+                  class="shrink-0"
+                  :username="member.username"
+                  :display-name="member.display_name"
+                  :avatar="member.avatar"
+                  :size="28"
+                />
+                <span class="min-w-0 flex-1 truncate text-sm">
+                  {{ memberLabelOf(member) }}
+                </span>
+                <span
+                  v-if="member.role === 'owner'"
+                  class="shrink-0 text-sm"
+                  data-testid="group-member-owner"
+                  :title="t('group.roleOwner')"
+                  >👑</span
+                >
+                <span
+                  v-else-if="member.role === 'admin'"
+                  class="shrink-0 rounded bg-amber-100 px-1.5 py-0.5 text-[10px] font-medium text-amber-700 dark:bg-amber-900/40 dark:text-amber-300"
+                  data-testid="group-member-admin"
+                  >{{ t("group.roleAdmin") }}</span
+                >
+                <template v-if="member.user_id !== myUserId">
+                  <button
+                    v-if="
+                      canChangeMemberRole(member) && member.role !== 'admin'
+                    "
+                    type="button"
+                    data-testid="group-appoint"
+                    :disabled="busyMemberId !== null"
+                    class="shrink-0 rounded px-1.5 py-0.5 text-[11px] text-indigo-600 hover:underline disabled:opacity-50 dark:text-indigo-400"
+                    @click="askRoleChange(member, 'admin')"
+                  >
+                    {{ t("group.appointAdmin") }}
+                  </button>
+                  <button
+                    v-if="
+                      canChangeMemberRole(member) && member.role === 'admin'
+                    "
+                    type="button"
+                    data-testid="group-demote"
+                    :disabled="busyMemberId !== null"
+                    class="shrink-0 rounded px-1.5 py-0.5 text-[11px] text-indigo-600 hover:underline disabled:opacity-50 dark:text-indigo-400"
+                    @click="askRoleChange(member, 'member')"
+                  >
+                    {{ t("group.demoteAdmin") }}
+                  </button>
+                  <button
+                    v-if="canTransferTo(member)"
+                    type="button"
+                    data-testid="group-transfer"
+                    :disabled="busyMemberId !== null"
+                    class="shrink-0 rounded px-1.5 py-0.5 text-[11px] text-neutral-500 hover:underline disabled:opacity-50 dark:text-neutral-400"
+                    @click="askTransfer(member)"
+                  >
+                    {{ t("group.transfer") }}
+                  </button>
+                  <button
+                    v-if="canKick(member)"
+                    type="button"
+                    data-testid="group-kick"
+                    :disabled="busyMemberId !== null"
+                    class="shrink-0 rounded px-1.5 py-0.5 text-[11px] text-red-500 hover:underline disabled:opacity-50"
+                    @click="askKick(member)"
+                  >
+                    {{ t("group.kick") }}
+                  </button>
+                </template>
+                <span
+                  v-else
+                  class="shrink-0 text-[10px] text-neutral-400 dark:text-neutral-500"
+                  data-testid="group-member-self"
+                  >{{ t("group.you") }}</span
+                >
+              </li>
+            </ul>
+
+            <div class="pt-3">
+              <button
+                v-if="canLeave"
+                type="button"
+                data-testid="group-leave"
+                class="w-full rounded-lg bg-red-600 py-1.5 text-xs font-medium text-white hover:bg-red-500"
+                @click="askLeave()"
+              >
+                {{ t("group.leave") }}
+              </button>
+              <p
+                v-else
+                class="px-1 text-[11px] text-neutral-400 dark:text-neutral-500"
+                data-testid="group-owner-leave-hint"
+              >
+                {{ t("group.ownerLeaveHint") }}
               </p>
-              <div class="flex justify-end gap-2">
-                <button
-                  type="button"
-                  data-testid="group-confirm-cancel"
-                  class="rounded-lg border border-neutral-300 px-3 py-1.5 text-xs font-medium text-neutral-600 hover:bg-neutral-100 dark:border-neutral-700 dark:text-neutral-300 dark:hover:bg-neutral-800"
-                  @click="cancelGroupConfirm()"
+            </div>
+
+            <!-- In-app confirmation overlay for destructive group actions -->
+            <div
+              v-if="groupConfirm !== null"
+              class="fixed inset-0 z-[60] flex items-center justify-center bg-black/40 p-4"
+              data-testid="group-confirm"
+            >
+              <div
+                class="w-full max-w-xs rounded-xl bg-white p-4 shadow-lg dark:bg-neutral-900"
+              >
+                <p
+                  class="pb-3 text-sm text-neutral-700 dark:text-neutral-200"
+                  data-testid="group-confirm-message"
                 >
-                  {{ t("group.cancel") }}
-                </button>
-                <button
-                  type="button"
-                  data-testid="group-confirm-accept"
-                  class="rounded-lg bg-red-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-red-500"
-                  @click="runGroupConfirm()"
-                >
-                  {{ t("group.confirm") }}
-                </button>
+                  {{ groupConfirm.message }}
+                </p>
+                <div class="flex justify-end gap-2">
+                  <button
+                    type="button"
+                    data-testid="group-confirm-cancel"
+                    class="rounded-lg border border-neutral-300 px-3 py-1.5 text-xs font-medium text-neutral-600 hover:bg-neutral-100 dark:border-neutral-700 dark:text-neutral-300 dark:hover:bg-neutral-800"
+                    @click="cancelGroupConfirm()"
+                  >
+                    {{ t("group.cancel") }}
+                  </button>
+                  <button
+                    type="button"
+                    data-testid="group-confirm-accept"
+                    class="rounded-lg bg-red-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-red-500"
+                    @click="runGroupConfirm()"
+                  >
+                    {{ t("group.confirm") }}
+                  </button>
+                </div>
               </div>
             </div>
           </div>
         </div>
-      </div>
+      </Transition>
     </template>
   </AppShell>
 </template>
+
+<style scoped>
+/* Group info drawer: slide in/out from the right edge on a strong ease-out
+   curve, with the dim layer fading in behind the frosted-glass backdrop. */
+.group-drawer-enter-active .group-drawer-panel,
+.group-drawer-leave-active .group-drawer-panel {
+  transition: transform 320ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+.group-drawer-enter-active .group-drawer-backdrop,
+.group-drawer-leave-active .group-drawer-backdrop {
+  transition: opacity 320ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+.group-drawer-enter-from .group-drawer-panel,
+.group-drawer-leave-to .group-drawer-panel {
+  transform: translateX(100%);
+}
+.group-drawer-enter-from .group-drawer-backdrop,
+.group-drawer-leave-to .group-drawer-backdrop {
+  opacity: 0;
+}
+
+/* Reduced motion: cut the slide/fade down to a near-instant swap. */
+@media (prefers-reduced-motion: reduce) {
+  .group-drawer-enter-active .group-drawer-panel,
+  .group-drawer-leave-active .group-drawer-panel,
+  .group-drawer-enter-active .group-drawer-backdrop,
+  .group-drawer-leave-active .group-drawer-backdrop {
+    transition-duration: 0.01ms;
+  }
+}
+</style>
