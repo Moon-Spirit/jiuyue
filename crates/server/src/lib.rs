@@ -12,6 +12,7 @@ pub mod crypto;
 pub mod e2ee;
 pub mod error;
 pub mod friends;
+pub mod groups;
 pub mod media;
 pub mod profile;
 pub mod push;

@@ -24,6 +24,8 @@
  * | e2ee.msg         | C ⇄ S     | `{ conversation_id, ciphertext, message_type }`                |
  * | friend.requested | S → C     | `{ request_id, from: { user_id, username } }`                  |
  * | friend.accepted  | S → C     | `{ friend: { user_id, username } }`                            |
+ * | group.invited    | S → C     | `{ invite_id, conversation_id, group_name, from: { user_id, username, display_name? } }` |
+ * | group.updated    | S → C     | `{ conversation_id }`                                          |
  * | error            | S → C     | `{ code, message, retryable }`                                 |
  *
  * M2 optional `msg.*` metadata fields are null-absent: absent on the wire
@@ -209,6 +211,30 @@ export interface ProfileUpdated {
   avatar: string;
 }
 
+/** Shared `{ user_id, username, display_name? }` ref inside group frames. */
+export interface GroupInviteFrom {
+  user_id: string;
+  username: string;
+  /** Curated label; additive (older servers omit it). */
+  display_name?: string;
+}
+
+/** Server → client: I was invited to a group conversation. */
+export interface GroupInvited {
+  invite_id: string;
+  conversation_id: number;
+  group_name: string;
+  from: GroupInviteFrom;
+}
+
+/**
+ * Server → client: a group's membership or roles changed. Payload is just the
+ * conversation id — receivers refetch the authoritative group info / listing.
+ */
+export interface GroupUpdated {
+  conversation_id: number;
+}
+
 export type ErrorCode =
   | "bad_request"
   | "unauthorized"
@@ -241,6 +267,8 @@ export const FRAME_TYPES = [
   "friend.requested",
   "friend.accepted",
   "profile.updated",
+  "group.invited",
+  "group.updated",
   "error",
 ] as const;
 
@@ -269,6 +297,8 @@ export type Frame =
   | Envelope<"friend.requested", FriendRequested>
   | Envelope<"friend.accepted", FriendAccepted>
   | Envelope<"profile.updated", ProfileUpdated>
+  | Envelope<"group.invited", GroupInvited>
+  | Envelope<"group.updated", GroupUpdated>
   | Envelope<"error", ErrorPayload>;
 
 /** Thrown when a raw value cannot be interpreted as a v1 frame at all. */
@@ -492,6 +522,31 @@ export function isProfileUpdated(d: unknown): d is ProfileUpdated {
   );
 }
 
+/** Shape guard for the `from` reference inside a `group.invited` frame. */
+function isGroupInviteFrom(v: unknown): v is GroupInviteFrom {
+  return (
+    isRecord(v) &&
+    hasString(v, "user_id") &&
+    hasString(v, "username") &&
+    // display_name is optional on the wire (older servers omit it).
+    hasOptionalString(v, "display_name")
+  );
+}
+
+export function isGroupInvited(d: unknown): d is GroupInvited {
+  return (
+    isRecord(d) &&
+    hasString(d, "invite_id") &&
+    hasInt(d, "conversation_id") &&
+    hasString(d, "group_name") &&
+    isGroupInviteFrom(d["from"])
+  );
+}
+
+export function isGroupUpdated(d: unknown): d is GroupUpdated {
+  return isRecord(d) && hasInt(d, "conversation_id");
+}
+
 const PAYLOAD_GUARDS: { [T in FrameType]: (d: unknown) => boolean } = {
   "auth.ticket.req": isAuthTicketReq,
   "auth.ticket.res": isAuthTicketRes,
@@ -509,6 +564,8 @@ const PAYLOAD_GUARDS: { [T in FrameType]: (d: unknown) => boolean } = {
   "friend.requested": isFriendRequested,
   "friend.accepted": isFriendAccepted,
   "profile.updated": isProfileUpdated,
+  "group.invited": isGroupInvited,
+  "group.updated": isGroupUpdated,
   error: isErrorPayload,
 };
 

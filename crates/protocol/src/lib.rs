@@ -24,6 +24,8 @@
 //! | `msg.recalled`     | S → C     | `{ conversation_id, message_id }`                                                                    |
 //! | `friend.requested` | S → C     | `{ request_id, from: { user_id, username, uid? } }`                                                              |
 //! | `friend.accepted`  | S → C     | `{ friend: { user_id, username, uid? } }`                                                                  |
+//! | `group.invited`    | S → C     | `{ invite_id, conversation_id, group_name, from: { user_id, username, uid? } }`                       |
+//! | `group.updated`    | S → C     | `{ conversation_id }`                                                                                 |
 //! | `error`            | S → C     | `{ code, message, retryable }`                                                                       |
 //!
 //! Optional `msg.*` metadata fields are null-absent: when absent they are
@@ -318,6 +320,27 @@ pub struct ProfileUpdated {
     pub avatar: String,
 }
 
+/// Server push when a group invite is created (`group.invited`): sent live to
+/// the INVITEE. Fire-and-forget registry relay only -- never persisted, never
+/// replayed by `sync.req`; authoritative invite state lives in the
+/// `/api/groups/invites` REST surface. `from` names the inviter.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupInvited {
+    pub invite_id: Uuid,
+    pub conversation_id: i64,
+    pub group_name: String,
+    pub from: UserIdentity,
+}
+
+/// Server push when a group's membership or roles change (`group.updated`):
+/// sent live to every CURRENT member after accept / kick / leave / role change
+/// / ownership transfer. Fire-and-forget: clients refetch
+/// `GET /api/groups/{conversation_id}` on receipt — REST stays authoritative.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupUpdated {
+    pub conversation_id: i64,
+}
+
 /// Client-to-server end-to-end-encrypted send request (secret chats).
 ///
 /// `ciphertext` is an opaque Olm message produced by the sender's device;
@@ -388,6 +411,10 @@ pub enum Payload {
     FriendAccepted(FriendAccepted),
     #[serde(rename = "profile.updated")]
     ProfileUpdated(ProfileUpdated),
+    #[serde(rename = "group.invited")]
+    GroupInvited(GroupInvited),
+    #[serde(rename = "group.updated")]
+    GroupUpdated(GroupUpdated),
     #[serde(rename = "e2ee.msg")]
     E2eeMsg(E2eeMsg),
     #[serde(rename = "error")]
@@ -492,6 +519,8 @@ fn decode_payload(t: &str, d: Value) -> Result<Payload, FrameError> {
         "friend.requested" => Ok(Payload::FriendRequested(decode_as(t, d)?)),
         "friend.accepted" => Ok(Payload::FriendAccepted(decode_as(t, d)?)),
         "profile.updated" => Ok(Payload::ProfileUpdated(decode_as(t, d)?)),
+        "group.invited" => Ok(Payload::GroupInvited(decode_as(t, d)?)),
+        "group.updated" => Ok(Payload::GroupUpdated(decode_as(t, d)?)),
         "e2ee.msg" => Ok(Payload::E2eeMsg(decode_as(t, d)?)),
         "error" => Ok(Payload::Error(decode_as(t, d)?)),
         other => Ok(Payload::Error(ErrorPayload {
@@ -851,6 +880,25 @@ mod tests {
                 payload: Payload::MsgRecalled(MsgRecalled {
                     conversation_id: 42,
                     message_id: "0190aabb-ccdd-7e01-8a1b-2c3d4e5f6071".parse().unwrap(),
+                }),
+            },
+            Frame {
+                v: 1,
+                payload: Payload::GroupInvited(GroupInvited {
+                    invite_id: "0190aabb-ccdd-7e01-8a1b-2c3d4e5f6071".parse().unwrap(),
+                    conversation_id: 42,
+                    group_name: "Rust 学习".to_owned(),
+                    from: UserIdentity {
+                        user_id: "018e1122-3344-7006-9a2b-1c2d3e4f5a6b".parse().unwrap(),
+                        uid: Some(100042),
+                        username: "alice".to_owned(),
+                    },
+                }),
+            },
+            Frame {
+                v: 1,
+                payload: Payload::GroupUpdated(GroupUpdated {
+                    conversation_id: 42,
                 }),
             },
             Frame {

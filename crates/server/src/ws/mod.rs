@@ -37,9 +37,9 @@ use axum::extract::{Query, State};
 use axum::response::{IntoResponse, Response};
 use futures_util::{SinkExt, StreamExt};
 use jiuyue_protocol::{
-    E2eeMsg, ErrorCode, ErrorPayload, Frame, MediaRef, MsgAck, MsgNew, MsgRecall, MsgRecalled,
-    MsgSend, PROTOCOL_VERSION, Payload, ProfileUpdated, ReadReceipt, ReadUpdate, SyncMessage,
-    SyncReq, SyncRes, Typing, TypingState,
+    E2eeMsg, ErrorCode, ErrorPayload, Frame, GroupUpdated, MediaRef, MsgAck, MsgNew, MsgRecall,
+    MsgRecalled, MsgSend, PROTOCOL_VERSION, Payload, ProfileUpdated, ReadReceipt, ReadUpdate,
+    SyncMessage, SyncReq, SyncRes, Typing, TypingState,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -208,6 +208,52 @@ pub(crate) fn relay_friend_payload(state: &AppState, to_user: Uuid, payload: Pay
     let wire = serialize_frame(&frame);
     let delivered = state.registry.deliver_to(to_user, &wire);
     tracing::debug!(%to_user, delivered, "friend frame relayed");
+}
+
+/// Fire-and-forget relay for group-system frames (M11a): pushes one
+/// server-to-client payload to every live device of `to_user`. Same
+/// drop-lag policy as [`relay_friend_payload`] — never persisted, never
+/// replayed by `sync.req`; authoritative group state lives in the
+/// `/api/groups` REST surface.
+pub(crate) fn relay_group_payload(state: &AppState, to_user: Uuid, payload: Payload) {
+    let frame = Frame {
+        v: PROTOCOL_VERSION,
+        payload,
+    };
+    let wire = serialize_frame(&frame);
+    let delivered = state.registry.deliver_to(to_user, &wire);
+    tracing::debug!(%to_user, delivered, "group frame relayed");
+}
+
+/// Fire-and-forget `group.updated` fan-out after a membership/role mutation
+/// commits (accept, kick, leave, role change, ownership transfer).
+///
+/// Recipients: every CURRENT member of the group, resolved post-commit so a
+/// freshly accepted member is included and a kicked/left member is not.
+/// Clients refetch the group over REST on receipt; offline members miss the
+/// live nudge and pick the change up on their next listing.
+pub(crate) async fn broadcast_group_updated(state: &AppState, conversation_id: i64) {
+    let members: Vec<Uuid> = match sqlx::query_scalar(
+        "SELECT user_id FROM conversation_members WHERE conversation_id = $1",
+    )
+    .bind(conversation_id)
+    .fetch_all(&state.pool)
+    .await
+    {
+        Ok(rows) => rows,
+        Err(err) => {
+            tracing::error!(conversation_id, error = %err, "group.updated member lookup failed");
+            return;
+        }
+    };
+    let frame = serialize_frame(&Frame {
+        v: PROTOCOL_VERSION,
+        payload: Payload::GroupUpdated(GroupUpdated { conversation_id }),
+    });
+    for user_id in members {
+        let delivered = state.registry.deliver_to(user_id, &frame);
+        tracing::debug!(%user_id, delivered, conversation_id, "group.updated relayed");
+    }
 }
 
 /// Fire-and-forget `profile.updated` fan-out after a profile PATCH commits.
@@ -726,7 +772,9 @@ async fn handle_frame(
         | Payload::MsgRecalled(_)
         | Payload::FriendRequested(_)
         | Payload::FriendAccepted(_)
-        | Payload::ProfileUpdated(_) => {
+        | Payload::ProfileUpdated(_)
+        | Payload::GroupInvited(_)
+        | Payload::GroupUpdated(_) => {
             let _ = out_tx
                 .send(serialize_frame(&error_frame(
                     ErrorCode::BadRequest,
@@ -1691,7 +1739,8 @@ async fn relay_typing(
 enum RecallRejection {
     /// Requester is not in the conversation at all (connection closes).
     NotMember,
-    /// Member, but not the author of the message (refused, socket stays).
+    /// Member, but not the author of the message and not the group owner
+    /// (refused, socket stays). Group owners moderate-recall anything.
     NotSender,
     /// No such message in this conversation.
     NotFound,
@@ -1708,18 +1757,21 @@ impl From<sqlx::Error> for RecallRejection {
 
 /// Recall pipeline for one `msg.recall`, composing BOTH domain guards:
 ///
-/// 1. [`jiuyue_domain::RecallPolicy`] — identity first ("only the sender"),
-///    then the injected-clock window check (`now_utc()` vs `sent_at`,
-///    default 120s inclusive).
+/// 1. [`jiuyue_domain::RecallPolicy`] — for a message the requester AUTHORED,
+///    identity first then the injected-clock window check (`now_utc()` vs
+///    `sent_at`, default 120s inclusive). M11a adds ONE moderation carve-out:
+///    the `owner` of a `kind='group'` conversation may recall ANY message in
+///    that group with NO time window; admins/members keep the strict
+///    sender-only rule, and a member's own messages keep their window.
 /// 2. [`jiuyue_domain::MessageStateMachine`] — a tombstone is terminal, so
 ///    an already-recalled message rejects the second recall as an illegal
 ///    transition (mapped to `conflict`). Non-recalled messages are all
 ///    representable as `Sent` here because `Recall` is legal from
 ///    Sent/Delivered/Read alike.
 ///
-/// The final UPDATE re-checks `(id, sender, recalled_at IS NULL)` so a race
-/// between two concurrent recalls still lands exactly one tombstone; losing
-/// that race surfaces as `conflict`.
+/// The final UPDATE re-checks `(id, conversation, recalled_at IS NULL)` so a
+/// race between two concurrent recalls still lands exactly one tombstone;
+/// losing that race surfaces as `conflict`.
 async fn process_msg_recall(
     state: &AppState,
     requester_id: Uuid,
@@ -1727,16 +1779,22 @@ async fn process_msg_recall(
 ) -> Result<(), RecallRejection> {
     use jiuyue_domain::{MessageStateMachine, MessageStatus, RecallPolicy, TransitionEvent};
 
-    let member: Option<i64> = sqlx::query_scalar(
-        "SELECT 1::int8 FROM conversation_members WHERE conversation_id = $1 AND user_id = $2",
+    // Membership + role + conversation kind in one round trip. Non-members
+    // get `NotMember` (connection closes); the role/kind feed the owner
+    // moderation carve-out below.
+    let membership: Option<(String, String)> = sqlx::query_as(
+        "SELECT cm.role, c.kind FROM conversation_members cm \
+         JOIN conversations c ON c.id = cm.conversation_id \
+         WHERE cm.conversation_id = $1 AND cm.user_id = $2",
     )
     .bind(req.conversation_id)
     .bind(requester_id)
     .fetch_optional(&state.pool)
     .await?;
-    if member.is_none() {
+    let Some((requester_role, conversation_kind)) = membership else {
         return Err(RecallRejection::NotMember);
-    }
+    };
+    let owner_moderator = conversation_kind == "group" && requester_role == "owner";
 
     let row: Option<(Uuid, OffsetDateTime, Option<OffsetDateTime>)> = sqlx::query_as(
         "SELECT sender_id, sent_at, recalled_at FROM messages \
@@ -1751,14 +1809,20 @@ async fn process_msg_recall(
     };
 
     // Guard 1: policy (identity + window), clock injected at this instant.
-    RecallPolicy::default()
-        .can_recall(requester_id, sender_id, sent_at, OffsetDateTime::now_utc())
-        .map_err(|err| match err {
-            jiuyue_domain::RecallError::NotSender => RecallRejection::NotSender,
-            jiuyue_domain::RecallError::WindowExpired => {
-                RecallRejection::Conflict("recall window expired")
-            }
-        })?;
+    // Own messages always go through the window check; someone else's message
+    // is recallable ONLY by the owner of a group (moderation), unwindowed.
+    if requester_id == sender_id {
+        RecallPolicy::default()
+            .can_recall(requester_id, sender_id, sent_at, OffsetDateTime::now_utc())
+            .map_err(|err| match err {
+                jiuyue_domain::RecallError::NotSender => RecallRejection::NotSender,
+                jiuyue_domain::RecallError::WindowExpired => {
+                    RecallRejection::Conflict("recall window expired")
+                }
+            })?;
+    } else if !owner_moderator {
+        return Err(RecallRejection::NotSender);
+    }
 
     // Guard 2: state machine (tombstone is terminal → double recall dies here).
     let mut machine = MessageStateMachine::from(if recalled_at.is_some() {
@@ -1772,10 +1836,10 @@ async fn process_msg_recall(
 
     let updated = sqlx::query(
         "UPDATE messages SET recalled_at = now() \
-         WHERE id = $1 AND sender_id = $2 AND recalled_at IS NULL",
+         WHERE id = $1 AND conversation_id = $2 AND recalled_at IS NULL",
     )
     .bind(req.message_id)
-    .bind(sender_id)
+    .bind(req.conversation_id)
     .execute(&state.pool)
     .await?
     .rows_affected();

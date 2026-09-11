@@ -31,8 +31,10 @@ const props = withDefaults(
     size?: number;
     /** When set, clicking navigates to this route (stopPropagation first). */
     to?: string;
+    /** Group avatar: force the indigo initial circle (never a curated palette). */
+    group?: boolean;
   }>(),
-  { displayName: "", avatar: null, size: 36, to: "" },
+  { displayName: "", avatar: null, size: 36, to: "", group: false },
 );
 
 const emit = defineEmits<{
@@ -65,6 +67,10 @@ const initial = computed<string>(() => {
 
 /** Deterministic palette per user so initials stay stable across reloads. */
 const circleClass = computed<string>(() => {
+  // Groups always render the brand indigo circle, regardless of name hash.
+  if (props.group) {
+    return "bg-indigo-500 text-white dark:bg-indigo-600 dark:text-white";
+  }
   const palette = [
     "bg-indigo-100 text-indigo-700 dark:bg-indigo-900 dark:text-indigo-200",
     "bg-rose-100 text-rose-700 dark:bg-rose-900 dark:text-rose-200",

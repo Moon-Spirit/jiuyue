@@ -7,6 +7,7 @@ import {
   createConversation as apiCreateConversation,
   listConversations,
 } from "../lib/api/messages";
+import { createGroup as apiCreateGroup } from "../lib/api/groups";
 import type { ConversationListItem } from "../lib/api/messages";
 import type { ConversationKind } from "../lib/api/messages";
 import * as olm from "../lib/crypto/olm-lite";
@@ -32,6 +33,7 @@ import {
 } from "../lib/protocol/frames";
 import { useAuthStore } from "./auth";
 import { useFriendsStore } from "./friends";
+import { useGroupsStore } from "./groups";
 import { useProfileStore } from "./profile";
 
 /**
@@ -185,7 +187,13 @@ export interface Conversation {
    * M3: "secret" conversations carry end-to-end encrypted traffic over
    * e2ee.msg frames; absent/undefined means "direct".
    */
-  kind?: ConversationKind;
+  kind?: ConversationKind | "group";
+  /**
+   * M11: group display name (`kind === "group"`); null/absent for direct and
+   * secret conversations. Pure local presentation state mirrored from the
+   * server listing / group creation response.
+   */
+  name?: string;
 }
 
 /** Composer-level reply context shown above the input until cancelled. */
@@ -288,7 +296,16 @@ function loadPersistedConversations(): Conversation[] {
       maxSeq: Number(c["maxSeq"] ?? 0),
       peerTypingUntil:
         typeof c["peerTypingUntil"] === "number" ? c["peerTypingUntil"] : null,
-      kind: c["kind"] === "secret" ? "secret" : "direct",
+      kind:
+        c["kind"] === "group"
+          ? "group"
+          : c["kind"] === "secret"
+            ? "secret"
+            : "direct",
+      name:
+        typeof c["name"] === "string" && String(c["name"]).length > 0
+          ? String(c["name"])
+          : undefined,
       peerUid: typeof c["peerUid"] === "number" ? c["peerUid"] : undefined,
       peerDisplayName:
         typeof c["peerDisplayName"] === "string" &&
@@ -661,6 +678,14 @@ export const useWsStore = defineStore("ws", {
           (c) => c.conversationId === item.conversation_id,
         );
         if (existing !== undefined) {
+          if (item.kind === "group") {
+            // Groups carry a name (not a peer); keep the row label current.
+            existing.kind = "group";
+            if (item.name !== undefined && item.name !== null) {
+              existing.name = item.name;
+            }
+            continue;
+          }
           if (
             existing.peerUsername === "" &&
             item.peer !== null &&
@@ -697,7 +722,13 @@ export const useWsStore = defineStore("ws", {
           lastSeenSeq: 0,
           maxSeq: 0,
           peerTypingUntil: null,
-          kind: item.kind === "secret" ? "secret" : "direct",
+          kind:
+            item.kind === "group"
+              ? "group"
+              : item.kind === "secret"
+                ? "secret"
+                : "direct",
+          name: item.name ?? undefined,
           peerUid: item.peer?.uid,
           peerDisplayName:
             item.peer !== null ? displayNameOf(item.peer) : undefined,
@@ -820,6 +851,12 @@ export const useWsStore = defineStore("ws", {
           break;
         case "friend.accepted":
           useFriendsStore().onFriendAccepted(frame.d);
+          break;
+        case "group.invited":
+          useGroupsStore().onInvited(frame.d);
+          break;
+        case "group.updated":
+          void useGroupsStore().onUpdated(frame.d);
           break;
         case "profile.updated":
           this.handleProfileUpdated(frame.d);
@@ -1712,6 +1749,81 @@ export const useWsStore = defineStore("ws", {
       }
       this.openConversation(result.conversation_id);
       return conversation;
+    },
+
+    /**
+     * M11: create a group conversation, add it locally as a group session
+     * (kind "group", name, no peer), and open it. The creator is always a
+     * member; `invite_usernames` may be empty.
+     */
+    async createGroup(
+      name: string,
+      usernames: string[] = [],
+    ): Promise<Conversation> {
+      const auth = useAuthStore();
+      const token = await auth.ensureAccessToken();
+      if (token === null) {
+        throw new ApiError(0, "network_error", "not signed in");
+      }
+      const result = await apiCreateGroup(token, name, usernames);
+      let conversation = this.conversations.find(
+        (c) => c.conversationId === result.conversation_id,
+      );
+      if (conversation === undefined) {
+        conversation = {
+          conversationId: result.conversation_id,
+          peerUserId: "",
+          peerUsername: "",
+          name: result.name,
+          lastMessagePreview: null,
+          lastActivityAt: new Date().toISOString(),
+          unread: 0,
+          lastSeenSeq: 0,
+          maxSeq: 0,
+          peerTypingUntil: null,
+          kind: "group",
+        };
+        this.conversations.push(conversation);
+      } else {
+        conversation.kind = "group";
+        conversation.name = result.name;
+      }
+      this.persistConversations();
+      this.openConversation(result.conversation_id);
+      return conversation;
+    },
+
+    /**
+     * Refetches the server conversation listing (names/memberships) and
+     * applies it. Used by group frame handlers and invite acceptance.
+     */
+    async refreshListing(): Promise<void> {
+      const auth = useAuthStore();
+      const token = await auth.ensureAccessToken();
+      if (token === null) return;
+      this.applyServerConversationList(await listConversations(token));
+      this.persistConversations();
+    },
+
+    /**
+     * Drops a conversation from the local cache (left group / removed).
+     * Messages and the persisted copy go with it; the active selection
+     * clears when it pointed at the forgotten conversation.
+     */
+    forgetConversation(conversationId: number): void {
+      this.conversations = this.conversations.filter(
+        (c) => c.conversationId !== conversationId,
+      );
+      delete this.messagesByConversation[conversationId];
+      if (this.activeConversationId === conversationId) {
+        this.activeConversationId = null;
+      }
+      this.persistConversations();
+      try {
+        localStorage.removeItem(MSGS_KEY_PREFIX + String(conversationId));
+      } catch {
+        // Best-effort persistence cleanup.
+      }
     },
 
     /**

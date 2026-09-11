@@ -1,8 +1,8 @@
 //! Uniform error model: every failure is JSON `{"error": "<machine_code>", "message": "<human>"}`.
 
-use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
+use axum::Json;
 use serde::Serialize;
 
 #[derive(Debug, Serialize)]
@@ -23,6 +23,14 @@ pub enum ConflictKind {
     /// M5 friends: a pending request already exists between the pair in
     /// EITHER direction.
     RequestAlreadyPending,
+    /// M11a groups: the target user is already a member of the group.
+    AlreadyMember,
+    /// M11a groups: a PENDING invite already exists for this
+    /// (conversation, invitee).
+    InviteAlreadyPending,
+    /// M11a groups: the invite is no longer pending (accepted/declined, or
+    /// lost a race to a concurrent response).
+    InviteNotPending,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -54,6 +62,11 @@ pub enum AppError {
     /// 400 — friend-system self-action (requesting yourself as a peer).
     #[error("self request")]
     SelfRequest,
+
+    /// 403 — authenticated but not permitted to perform this action on this
+    /// resource (M11a groups: wrong role, e.g. a member trying to kick).
+    #[error("forbidden: {0}")]
+    Forbidden(String),
 
     /// 422 — semantically invalid input (username format, weak password, bad target).
     #[error("validation failed: {0}")]
@@ -122,6 +135,22 @@ impl IntoResponse for AppError {
                 "request_already_pending",
                 "a friend request between you two is already pending".to_string(),
             ),
+            AppError::Conflict(ConflictKind::AlreadyMember) => (
+                StatusCode::CONFLICT,
+                "already_member",
+                "this user is already a member of the group".to_string(),
+            ),
+            AppError::Conflict(ConflictKind::InviteAlreadyPending) => (
+                StatusCode::CONFLICT,
+                "invite_already_pending",
+                "an invite for this user is already pending".to_string(),
+            ),
+            AppError::Conflict(ConflictKind::InviteNotPending) => (
+                StatusCode::CONFLICT,
+                "invite_not_pending",
+                "this invite is no longer pending".to_string(),
+            ),
+            AppError::Forbidden(msg) => (StatusCode::FORBIDDEN, "forbidden", msg.clone()),
             AppError::ResourceNotFound => (
                 StatusCode::NOT_FOUND,
                 "not_found",

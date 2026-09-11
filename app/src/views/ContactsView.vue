@@ -8,10 +8,13 @@ import LanguageToggle from "../components/LanguageToggle.vue";
 import ThemeToggle from "../components/ThemeToggle.vue";
 import { friendApiErrorMessage } from "../lib/api/friends";
 import type { Friend, IncomingFriendRequest } from "../lib/api/friends";
+import type { GroupInvite } from "../lib/api/groups";
+import { groupApiErrorMessage } from "../lib/api/groups";
 import type { UserSearchResult } from "../lib/api/users";
 import { displayNameOf } from "../lib/identity";
 import { useAuthStore } from "../stores/auth";
 import { useFriendsStore } from "../stores/friends";
+import { useGroupsStore } from "../stores/groups";
 import { useProfileStore } from "../stores/profile";
 import { useWsStore } from "../stores/ws";
 
@@ -23,6 +26,7 @@ const router = useRouter();
 const auth = useAuthStore();
 const ws = useWsStore();
 const friends = useFriendsStore();
+const groups = useGroupsStore();
 const profile = useProfileStore();
 
 const searchQuery = ref("");
@@ -42,6 +46,8 @@ const busyRequestId = ref<string | null>(null);
 const pendingUnfriendId = ref<string | null>(null);
 /** Username whose 发消息 navigation is in flight. */
 const messagingUsername = ref<string | null>(null);
+/** Group invite currently being accepted/declined (disables its row). */
+const busyInviteId = ref<string | null>(null);
 
 let searchTimer: number | null = null;
 
@@ -52,6 +58,7 @@ onMounted(() => {
     profile.ensureLoaded();
     void ws.connect();
     void friends.loadAll();
+    void groups.loadInvites();
   }
 });
 
@@ -179,6 +186,33 @@ async function declineRequest(request: IncomingFriendRequest): Promise<void> {
 }
 
 // ---------------------------------------------------------------------
+// Group invitations
+// ---------------------------------------------------------------------
+
+async function acceptGroupInvite(invite: GroupInvite): Promise<void> {
+  if (busyInviteId.value !== null) return;
+  busyInviteId.value = invite.invite_id;
+  try {
+    const conversationId = await groups.acceptInvite(invite.invite_id);
+    if (conversationId !== null) await router.push("/chat");
+  } catch (error) {
+    searchError.value = groupApiErrorMessage(error, (key) => t(key));
+  } finally {
+    busyInviteId.value = null;
+  }
+}
+
+async function declineGroupInvite(invite: GroupInvite): Promise<void> {
+  if (busyInviteId.value !== null) return;
+  busyInviteId.value = invite.invite_id;
+  try {
+    await groups.declineInvite(invite.invite_id);
+  } finally {
+    busyInviteId.value = null;
+  }
+}
+
+// ---------------------------------------------------------------------
 // Friend list actions
 // ---------------------------------------------------------------------
 
@@ -262,11 +296,11 @@ async function confirmUnfriend(friend: Friend): Promise<void> {
         >
           {{ t("nav.contacts") }}
           <span
-            v-if="friends.pendingCount > 0"
+            v-if="friends.pendingCount + groups.pendingInviteCount > 0"
             data-testid="nav-contacts-badge"
             class="flex h-4 min-w-4 items-center justify-center rounded-full bg-indigo-600 px-1 text-[10px] font-semibold text-white"
           >
-            {{ friends.pendingCount }}
+            {{ friends.pendingCount + groups.pendingInviteCount }}
           </span>
         </router-link>
         <ThemeToggle />
@@ -390,6 +424,71 @@ async function confirmUnfriend(friend: Friend): Promise<void> {
               </li>
             </ul>
           </div>
+        </div>
+
+        <!-- Pending group invitations -->
+        <div
+          v-if="groups.invites.length > 0"
+          class="pb-2"
+          data-testid="group-invites"
+        >
+          <h3
+            class="px-1 pb-1 text-xs font-semibold text-neutral-500 dark:text-neutral-400"
+            data-testid="group-invites-title"
+          >
+            {{ t("contacts.groupInvitesTitle") }}
+          </h3>
+          <ul class="space-y-1" data-testid="group-invite-list">
+            <li
+              v-for="invite in groups.invites"
+              :key="invite.invite_id"
+              data-testid="group-invite-item"
+              :data-invite-id="invite.invite_id"
+              class="flex items-center gap-2 rounded-lg p-2 hover:bg-neutral-100 dark:hover:bg-neutral-800"
+            >
+              <Avatar
+                class="shrink-0"
+                group
+                :username="invite.group_name"
+                :size="32"
+                data-testid="group-invite-avatar"
+              />
+              <span class="min-w-0 flex-1">
+                <span
+                  class="block truncate text-sm font-medium"
+                  data-testid="group-invite-name"
+                  >{{ invite.group_name }}</span
+                >
+                <span
+                  class="block truncate text-[11px] text-neutral-400 dark:text-neutral-500"
+                  data-testid="group-invite-from"
+                  >{{
+                    t("contacts.groupInviteFrom", {
+                      name: displayNameOf(invite.from),
+                    })
+                  }}</span
+                >
+              </span>
+              <button
+                type="button"
+                data-testid="group-invite-accept"
+                :disabled="busyInviteId !== null"
+                class="shrink-0 rounded-lg bg-emerald-600 px-2 py-1 text-[11px] font-medium text-white hover:bg-emerald-500 disabled:cursor-not-allowed disabled:opacity-50"
+                @click="acceptGroupInvite(invite)"
+              >
+                {{ t("contacts.groupInviteAccept") }}
+              </button>
+              <button
+                type="button"
+                data-testid="group-invite-decline"
+                :disabled="busyInviteId !== null"
+                class="shrink-0 rounded-lg border border-neutral-300 px-2 py-1 text-[11px] font-medium text-neutral-600 hover:bg-neutral-100 disabled:cursor-not-allowed disabled:opacity-50 dark:border-neutral-700 dark:text-neutral-300 dark:hover:bg-neutral-800"
+                @click="declineGroupInvite(invite)"
+              >
+                {{ t("contacts.groupInviteDecline") }}
+              </button>
+            </li>
+          </ul>
         </div>
 
         <!-- Incoming friend requests -->

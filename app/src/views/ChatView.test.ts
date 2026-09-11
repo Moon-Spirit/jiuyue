@@ -7,6 +7,8 @@ import { createMemoryHistory, createRouter } from "vue-router";
 import type { Router } from "vue-router";
 import { i18n } from "../i18n";
 import { useAuthStore } from "../stores/auth";
+import { useFriendsStore } from "../stores/friends";
+import { useGroupsStore } from "../stores/groups";
 import { useWsStore } from "../stores/ws";
 import type { ChatMessage, Conversation } from "../stores/ws";
 import ChatView from "./ChatView.vue";
@@ -1188,5 +1190,244 @@ describe("ChatView — M9 voice, audio player & forward attribution", () => {
     expect(main.find('[data-testid="voice-record"]').exists()).toBe(false);
     // Emoji panel stays available in secret chats.
     expect(main.find('[data-testid="emoji-toggle"]').exists()).toBe(true);
+  });
+});
+
+describe("ChatView — M11 groups", () => {
+  function jsonResponse(status: number, body: unknown): Response {
+    return new Response(JSON.stringify(body), {
+      status,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("renders a group session with its name and indigo initial avatar", async () => {
+    const pinia = createPinia();
+    setActivePinia(pinia);
+    useAuthStore().user = { userId: "7", username: "me", uid: 1000007 };
+    const ws = useWsStore();
+    ws.conversations.push(
+      conversation(3, {
+        kind: "group",
+        name: "团队",
+        lastActivityAt: isoAt(-MINUTE),
+      }),
+    );
+
+    const wrapper = await mountView(pinia);
+    const row = sessionsPane(wrapper).find('[data-testid="session-item"]');
+    expect(row.find('[data-testid="session-name"]').text()).toBe("团队");
+    const avatar = row.find('[data-testid="session-avatar"]');
+    expect(avatar.find('[data-testid="avatar-initial"]').text()).toBe("团");
+    expect(avatar.find('[data-testid="avatar-initial"]').classes()).toContain(
+      "bg-indigo-500",
+    );
+  });
+
+  it("creates a group from the dialog and opens it", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      jsonResponse(201, {
+        conversation_id: 9,
+        name: "团队",
+        member_count: 2,
+        invited: ["alice"],
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const pinia = createPinia();
+    setActivePinia(pinia);
+    const auth = useAuthStore();
+    auth.user = { userId: "7", username: "me", uid: 1000007 };
+    auth.accessToken = "tok";
+    const friends = useFriendsStore();
+    friends.loaded = true;
+    friends.friends.push({
+      user_id: "u1",
+      username: "alice",
+      uid: 100001,
+      since: "2026-01-01T00:00:00Z",
+    });
+
+    const wrapper = await mountView(pinia);
+    const pane = sessionsPane(wrapper);
+    await pane.find('[data-testid="new-group-button"]').trigger("click");
+    expect(wrapper.find('[data-testid="group-create-dialog"]').exists()).toBe(
+      true,
+    );
+
+    await wrapper.find('[data-testid="group-name-input"]').setValue("团队");
+    await wrapper
+      .find('[data-testid="group-candidate"] button')
+      .trigger("click");
+    expect(
+      wrapper.find('[data-testid="group-selected-count"]').text(),
+    ).toContain("1");
+    await wrapper.find('[data-testid="group-create-submit"]').trigger("click");
+    await flushPromises();
+
+    const ws = useWsStore();
+    const created = ws.conversations.find((c) => c.conversationId === 9);
+    expect(created?.kind).toBe("group");
+    expect(created?.name).toBe("团队");
+    expect(ws.activeConversationId).toBe(9);
+    expect(wrapper.find('[data-testid="group-create-dialog"]').exists()).toBe(
+      false,
+    );
+
+    const [path, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(path).toBe("/api/groups");
+    expect(JSON.parse(String(init.body))).toEqual({
+      name: "团队",
+      invite_usernames: ["alice"],
+    });
+  });
+
+  it("shows the uploaded audio file name but hides generated voice names", async () => {
+    const pinia = createPinia();
+    setActivePinia(pinia);
+    useAuthStore().user = { userId: "7", username: "me", uid: 1000007 };
+    const ws = useWsStore();
+    ws.conversations.push(conversation(1, { peerUsername: "alice" }));
+    ws.messagesByConversation[1] = [
+      message({
+        messageId: "m-audio-file",
+        seq: 1,
+        senderId: "alice",
+        body: "",
+        sentAt: isoAt(-60_000),
+        media: {
+          mediaId: "mid-1",
+          kind: "audio",
+          mime: "audio/mpeg",
+          bytes: 2048,
+          fileName: "meeting-notes.mp3",
+          durationMs: 4200,
+        },
+      }),
+      message({
+        messageId: "m-audio-voice",
+        seq: 2,
+        senderId: "alice",
+        body: "",
+        sentAt: isoAt(-30_000),
+        media: {
+          mediaId: "mid-2",
+          kind: "audio",
+          mime: "audio/webm",
+          bytes: 1024,
+          fileName: "voice-1700000000000.webm",
+          durationMs: 3000,
+        },
+      }),
+    ];
+    ws.openConversation(1);
+    ws.status = "open";
+
+    const wrapper = await mountView(pinia);
+    const main = mainPane(wrapper);
+    const names = main.findAll('[data-testid="audio-filename"]');
+    expect(names).toHaveLength(1);
+    expect(names[0]?.text()).toBe("meeting-notes.mp3");
+  });
+
+  function member(
+    user_id: string,
+    role: "owner" | "admin" | "member",
+    username = user_id,
+  ) {
+    return {
+      user_id,
+      username,
+      role,
+      joined_at: "2026-01-01T00:00:00Z",
+    };
+  }
+
+  async function mountGroupPanel(
+    myId: string,
+    myRole: "owner" | "admin" | "member",
+    members: ReturnType<typeof member>[],
+  ): Promise<VueWrapper> {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(jsonResponse(404, { error: "not_found" })),
+    );
+    const pinia = createPinia();
+    setActivePinia(pinia);
+    const auth = useAuthStore();
+    auth.user = { userId: myId, username: "me", uid: 1000007 };
+    auth.accessToken = "tok";
+    const ws = useWsStore();
+    ws.conversations.push(conversation(1, { kind: "group", name: "团队" }));
+    useGroupsStore().applyGroupInfo({
+      conversation_id: 1,
+      name: "团队",
+      my_role: myRole,
+      member_count: members.length,
+      members,
+    });
+    ws.openConversation(1);
+    const wrapper = await mountView(pinia);
+    await mainPane(wrapper)
+      .find('[data-testid="group-info-button"]')
+      .trigger("click");
+    await wrapper.vm.$nextTick();
+    return wrapper;
+  }
+
+  it("owner sees kick on every other member, plus role and transfer actions", async () => {
+    const wrapper = await mountGroupPanel("7", "owner", [
+      member("7", "owner"),
+      member("u2", "admin"),
+      member("u3", "member"),
+    ]);
+    const main = mainPane(wrapper);
+    expect(main.find('[data-testid="group-info-panel"]').exists()).toBe(true);
+    expect(main.findAll('[data-testid="group-member"]')).toHaveLength(3);
+    expect(main.findAll('[data-testid="group-kick"]')).toHaveLength(2);
+    expect(main.findAll('[data-testid="group-transfer"]')).toHaveLength(2);
+    expect(main.find('[data-testid="group-demote"]').exists()).toBe(true);
+    expect(main.find('[data-testid="group-appoint"]').exists()).toBe(true);
+    // Owner cannot leave; the hint replaces the leave button.
+    expect(main.find('[data-testid="group-leave"]').exists()).toBe(false);
+    expect(main.find('[data-testid="group-owner-leave-hint"]').exists()).toBe(
+      true,
+    );
+  });
+
+  it("admin can only kick plain members and cannot leave-manage roles", async () => {
+    const wrapper = await mountGroupPanel("7", "admin", [
+      member("u1", "owner"),
+      member("7", "admin"),
+      member("u3", "member"),
+    ]);
+    const main = mainPane(wrapper);
+    expect(main.findAll('[data-testid="group-kick"]')).toHaveLength(1);
+    expect(main.find('[data-testid="group-transfer"]').exists()).toBe(false);
+    expect(main.find('[data-testid="group-appoint"]').exists()).toBe(false);
+    expect(main.find('[data-testid="group-demote"]').exists()).toBe(false);
+    expect(main.find('[data-testid="group-leave"]').exists()).toBe(true);
+    // Admin may invite.
+    expect(main.find('[data-testid="group-invite-input"]').exists()).toBe(true);
+  });
+
+  it("plain members see no management actions at all", async () => {
+    const wrapper = await mountGroupPanel("7", "member", [
+      member("u1", "owner"),
+      member("7", "member"),
+    ]);
+    const main = mainPane(wrapper);
+    expect(main.find('[data-testid="group-kick"]').exists()).toBe(false);
+    expect(main.find('[data-testid="group-transfer"]').exists()).toBe(false);
+    expect(main.find('[data-testid="group-appoint"]').exists()).toBe(false);
+    expect(main.find('[data-testid="group-demote"]').exists()).toBe(false);
+    expect(main.find('[data-testid="group-invite-input"]').exists()).toBe(
+      false,
+    );
+    expect(main.find('[data-testid="group-leave"]').exists()).toBe(true);
   });
 });

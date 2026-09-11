@@ -14,6 +14,16 @@ import Avatar from "../components/Avatar.vue";
 import LanguageToggle from "../components/LanguageToggle.vue";
 import ThemeToggle from "../components/ThemeToggle.vue";
 import { apiErrorMessage } from "../lib/api/messages";
+import { groupApiErrorMessage } from "../lib/api/groups";
+import type { GroupInfo, GroupMember, GroupRole } from "../lib/api/groups";
+import {
+  canChangeRole,
+  canInviteMembers,
+  canKickMember,
+  canLeaveGroup,
+  canTransferOwnership,
+  roleLabelKey,
+} from "../lib/groupRoles";
 import { apiBase } from "../lib/apiConfig";
 import { EMOJIS } from "../lib/emoji";
 import {
@@ -27,6 +37,7 @@ import type { MediaKind } from "../lib/api/media";
 import * as olm from "../lib/crypto/olm-lite";
 import { useAuthStore } from "../stores/auth";
 import { useFriendsStore } from "../stores/friends";
+import { useGroupsStore } from "../stores/groups";
 import { useProfileStore } from "../stores/profile";
 import { RECALL_WINDOW_MS, useWsStore } from "../stores/ws";
 import type { ChatMessage, ChatMessageMedia, Conversation } from "../stores/ws";
@@ -37,9 +48,14 @@ const route = useRoute();
 const auth = useAuthStore();
 const ws = useWsStore();
 const friends = useFriendsStore();
+const groups = useGroupsStore();
 const profile = useProfileStore();
 
 const PREVIEW_MAX_CHARS = 40;
+/** Group name bounds (mirrors the server contract: 1..32). */
+const GROUP_NAME_MAX = 32;
+/** Audio filename caption truncation (chars before the ellipsis). */
+const AUDIO_FILE_NAME_MAX = 24;
 
 const newPeerUsername = ref("");
 /** M3: kind chosen in the segmented 普通/密聊 control. */
@@ -51,6 +67,30 @@ const draft = ref("");
 const sasCode = ref<string | null>(null);
 const composerEl = ref<HTMLTextAreaElement | null>(null);
 const messagesEndRef = ref<HTMLElement | null>(null);
+
+// --- M11 groups: create dialog state ------------------------------------
+const groupDialogOpen = ref(false);
+const groupNameInput = ref("");
+/** Trivial client-side friend filter for the create dialog. */
+const groupMemberFilter = ref("");
+/** Usernames of the friends selected in the create dialog. */
+const groupSelected = ref<string[]>([]);
+const creatingGroup = ref(false);
+const groupCreateError = ref("");
+
+// --- M11 groups: info panel state ---------------------------------------
+const groupPanelOpen = ref(false);
+const groupInviteUsername = ref("");
+const groupActionError = ref("");
+/** user_id of the member whose action is in flight (disables its row). */
+const busyMemberId = ref<string | null>(null);
+/** Pending destructive action awaiting an in-app confirmation. */
+const groupConfirm = ref<{
+  type: "kick" | "role" | "transfer" | "leave";
+  userId?: string;
+  role?: "admin" | "member";
+  message: string;
+} | null>(null);
 
 // --- M8 media / emoji composer state -----------------------------------
 const emojiOpen = ref(false);
@@ -141,6 +181,13 @@ async function logout(): Promise<void> {
 /** Peer messages label with the peer's name; falls back to the raw id. */
 function senderLabel(message: { senderId: string }): string {
   const conv = ws.activeConversation;
+  if (conv !== null && conv.kind === "group") {
+    // Group bubbles are attributed to the actual member (never "peer").
+    return (
+      groups.memberNames[conv.conversationId]?.[message.senderId] ??
+      message.senderId
+    );
+  }
   if (
     conv !== null &&
     message.senderId === conv.peerUserId &&
@@ -151,8 +198,19 @@ function senderLabel(message: { senderId: string }): string {
   return message.senderId;
 }
 
+/** Avatar emoji of a group member in the active conversation (or null). */
+function groupAvatarOf(userId: string): string | null {
+  const id = ws.activeConversationId;
+  if (id === null) return null;
+  return groups.memberAvatars[id]?.[userId] ?? null;
+}
+
 /** Best display label for a conversation's peer (display name when known). */
 function peerLabel(conversation: Conversation): string {
+  if (conversation.kind === "group") {
+    const name = conversation.name?.trim() ?? "";
+    return name.length > 0 ? name : t("group.groupUnknown");
+  }
   if (conversation.peerDisplayName?.trim().length) {
     return conversation.peerDisplayName;
   }
@@ -163,6 +221,11 @@ function peerLabel(conversation: Conversation): string {
 
 /** Navigate to a peer's profile, seeding the transient view from the row. */
 function openPeerProfile(conversation: Conversation): void {
+  // Groups have no peer profile; the avatar opens the group info panel.
+  if (conversation.kind === "group") {
+    openSessionAvatar(conversation);
+    return;
+  }
   profile.seedPeer(conversation.peerUserId, {
     username: conversation.peerUsername,
     uid: conversation.peerUid,
@@ -170,6 +233,18 @@ function openPeerProfile(conversation: Conversation): void {
     avatar: conversation.peerAvatar ?? null,
   });
   void router.push(`/profile/${encodeURIComponent(conversation.peerUserId)}`);
+}
+
+/** Session-row avatar click: peer profile for direct, info panel for groups. */
+function openSessionAvatar(conversation: Conversation): void {
+  if (conversation.kind === "group") {
+    if (ws.activeConversationId !== conversation.conversationId) {
+      ws.openConversation(conversation.conversationId);
+    }
+    openGroupPanel();
+    return;
+  }
+  openPeerProfile(conversation);
 }
 
 /** Navigate to my own profile (nav avatar). */
@@ -255,6 +330,20 @@ watch(
     } catch {
       sasCode.value = null;
     }
+  },
+  { immediate: true },
+);
+
+// M11: fetch authoritative group info (roster + my role) when a group thread
+// becomes active, so the header member count and bubble identity are fresh.
+watch(
+  () => [ws.activeConversationId, ws.activeConversation?.kind] as const,
+  ([id, kind]) => {
+    if (id === null || kind !== "group") {
+      groupPanelOpen.value = false;
+      return;
+    }
+    void groups.fetchInfo(id);
   },
   { immediate: true },
 );
@@ -861,6 +950,19 @@ function formatDuration(durationMs: number | undefined): string {
   return `${mm}:${ss}`;
 }
 
+/**
+ * File-name caption above an audio player. Uploaded audio files show their
+ * (truncated) name; generated recorder names (`voice-….webm`) are hidden —
+ * they carry no information and would only add noise.
+ */
+function audioFileName(media: ChatMessageMedia): string | null {
+  const name = media.fileName?.trim() ?? "";
+  if (name.length === 0 || name.startsWith("voice-")) return null;
+  return name.length > AUDIO_FILE_NAME_MAX
+    ? `${name.slice(0, AUDIO_FILE_NAME_MAX)}…`
+    : name;
+}
+
 /** Pauses and rewinds the shared audio element, clearing player state. */
 function pauseAudio(): void {
   if (audioEl !== null) {
@@ -919,6 +1021,203 @@ function toggleAudio(media: ChatMessageMedia): void {
     playingMediaId.value = null;
   }
 }
+
+// ---------------------------------------------------------------------
+// M11 groups: create dialog, info panel, membership actions
+// ---------------------------------------------------------------------
+
+const myUserId = computed<string>(() => auth.user?.userId ?? "");
+
+/** Authoritative group info for the open thread (null when not a group). */
+const activeGroupInfo = computed<GroupInfo | null>(() =>
+  ws.activeConversation?.kind === "group"
+    ? groups.infoFor(ws.activeConversationId)
+    : null,
+);
+
+/** Friends offered in the create dialog (filtered by the search box). */
+const groupCandidateFriends = computed(() => {
+  const query = groupMemberFilter.value.trim().toLowerCase();
+  if (query.length === 0) return friends.friends;
+  return friends.friends.filter((f) => {
+    const name = (f.display_name ?? f.username).toLowerCase();
+    return name.includes(query) || f.username.toLowerCase().includes(query);
+  });
+});
+
+const groupNameValid = computed(() => {
+  const name = groupNameInput.value.trim();
+  return name.length > 0 && name.length <= GROUP_NAME_MAX;
+});
+
+function openGroupDialog(): void {
+  groupDialogOpen.value = true;
+  groupCreateError.value = "";
+  groupNameInput.value = "";
+  groupMemberFilter.value = "";
+  groupSelected.value = [];
+  if (!friends.loaded) void friends.loadAll();
+}
+
+function closeGroupDialog(): void {
+  groupDialogOpen.value = false;
+}
+
+function toggleGroupMember(username: string): void {
+  groupSelected.value = groupSelected.value.includes(username)
+    ? groupSelected.value.filter((u) => u !== username)
+    : [...groupSelected.value, username];
+}
+
+function isGroupMemberSelected(username: string): boolean {
+  return groupSelected.value.includes(username);
+}
+
+async function submitCreateGroup(): Promise<void> {
+  const name = groupNameInput.value.trim();
+  if (!groupNameValid.value || creatingGroup.value) return;
+  creatingGroup.value = true;
+  groupCreateError.value = "";
+  try {
+    await ws.createGroup(name, groupSelected.value);
+    closeGroupDialog();
+  } catch (error) {
+    groupCreateError.value = groupApiErrorMessage(error, (key) => t(key));
+  } finally {
+    creatingGroup.value = false;
+  }
+}
+
+function openGroupPanel(): void {
+  const id = ws.activeConversationId;
+  if (id === null) return;
+  groupPanelOpen.value = true;
+  groupActionError.value = "";
+  groupInviteUsername.value = "";
+  void groups.fetchInfo(id);
+}
+
+function closeGroupPanel(): void {
+  groupPanelOpen.value = false;
+  groupConfirm.value = null;
+}
+
+function memberLabelOf(member: GroupMember): string {
+  const display = member.display_name?.trim() ?? "";
+  return display.length > 0 ? display : member.username;
+}
+
+function memberRoleLabel(role: GroupRole): string {
+  return t(roleLabelKey(role));
+}
+
+// Role-gated capabilities for the current member (delegated to pure helpers).
+function canKick(member: GroupMember): boolean {
+  const info = activeGroupInfo.value;
+  return (
+    info !== null && canKickMember(info.members, myUserId.value, member.user_id)
+  );
+}
+function canChangeMemberRole(member: GroupMember): boolean {
+  const info = activeGroupInfo.value;
+  return (
+    info !== null && canChangeRole(info.members, myUserId.value, member.user_id)
+  );
+}
+function canTransferTo(member: GroupMember): boolean {
+  const info = activeGroupInfo.value;
+  return (
+    info !== null &&
+    canTransferOwnership(info.members, myUserId.value, member.user_id)
+  );
+}
+const canInvite = computed<boolean>(() => {
+  const info = activeGroupInfo.value;
+  return info !== null && canInviteMembers(info.members, myUserId.value);
+});
+const canLeave = computed<boolean>(() => {
+  const info = activeGroupInfo.value;
+  return info !== null && canLeaveGroup(info.members, myUserId.value);
+});
+
+function askKick(member: GroupMember): void {
+  groupConfirm.value = {
+    type: "kick",
+    userId: member.user_id,
+    message: t("group.confirmKick", { name: memberLabelOf(member) }),
+  };
+}
+
+function askRoleChange(member: GroupMember, role: "admin" | "member"): void {
+  groupConfirm.value = {
+    type: "role",
+    userId: member.user_id,
+    role,
+    message:
+      role === "admin"
+        ? t("group.confirmAppoint", { name: memberLabelOf(member) })
+        : t("group.confirmDemote", { name: memberLabelOf(member) }),
+  };
+}
+
+function askTransfer(member: GroupMember): void {
+  groupConfirm.value = {
+    type: "transfer",
+    userId: member.user_id,
+    message: t("group.confirmTransfer", { name: memberLabelOf(member) }),
+  };
+}
+
+function askLeave(): void {
+  groupConfirm.value = { type: "leave", message: t("group.confirmLeave") };
+}
+
+function cancelGroupConfirm(): void {
+  groupConfirm.value = null;
+}
+
+/** Runs the confirmed destructive action, then relies on refetch for state. */
+async function runGroupConfirm(): Promise<void> {
+  const action = groupConfirm.value;
+  const id = ws.activeConversationId;
+  if (action === null || id === null) return;
+  groupConfirm.value = null;
+  groupActionError.value = "";
+  busyMemberId.value = action.userId ?? null;
+  try {
+    if (action.type === "kick" && action.userId !== undefined) {
+      await groups.kickMember(id, action.userId);
+    } else if (
+      action.type === "role" &&
+      action.userId !== undefined &&
+      action.role !== undefined
+    ) {
+      await groups.changeMemberRole(id, action.userId, action.role);
+    } else if (action.type === "transfer" && action.userId !== undefined) {
+      await groups.transferOwnership(id, action.userId);
+    } else if (action.type === "leave") {
+      await groups.leave(id);
+      closeGroupPanel();
+    }
+  } catch (error) {
+    groupActionError.value = groupApiErrorMessage(error, (key) => t(key));
+  } finally {
+    busyMemberId.value = null;
+  }
+}
+
+async function submitGroupInvite(): Promise<void> {
+  const id = ws.activeConversationId;
+  const username = groupInviteUsername.value.trim();
+  if (id === null || username.length === 0) return;
+  groupActionError.value = "";
+  try {
+    await groups.inviteMember(id, username);
+    groupInviteUsername.value = "";
+  } catch (error) {
+    groupActionError.value = groupApiErrorMessage(error, (key) => t(key));
+  }
+}
 </script>
 
 <template>
@@ -964,11 +1263,11 @@ function toggleAudio(media: ChatMessageMedia): void {
         >
           {{ t("nav.contacts") }}
           <span
-            v-if="friends.pendingCount > 0"
+            v-if="friends.pendingCount + groups.pendingInviteCount > 0"
             data-testid="nav-contacts-badge"
             class="flex h-4 min-w-4 items-center justify-center rounded-full bg-indigo-600 px-1 text-[10px] font-semibold text-white"
           >
-            {{ friends.pendingCount }}
+            {{ friends.pendingCount + groups.pendingInviteCount }}
           </span>
         </router-link>
         <button
@@ -1058,6 +1357,16 @@ function toggleAudio(media: ChatMessageMedia): void {
           {{ conversationError }}
         </p>
 
+        <!-- M11: group creation affordance -->
+        <button
+          type="button"
+          data-testid="new-group-button"
+          class="mb-2 w-full rounded-lg border border-dashed border-neutral-300 px-3 py-1.5 text-xs font-medium text-neutral-600 hover:border-indigo-400 hover:text-indigo-600 dark:border-neutral-700 dark:text-neutral-300 dark:hover:border-indigo-500 dark:hover:text-indigo-400"
+          @click="openGroupDialog()"
+        >
+          {{ t("group.newGroup") }}
+        </button>
+
         <!-- Conversation list -->
         <ul
           v-if="ws.sortedConversations.length > 0"
@@ -1078,12 +1387,23 @@ function toggleAudio(media: ChatMessageMedia): void {
           >
             <Avatar
               class="shrink-0"
-              :username="conversation.peerUsername"
-              :display-name="conversation.peerDisplayName"
-              :avatar="conversation.peerAvatar"
+              :group="conversation.kind === 'group'"
+              :username="
+                conversation.kind === 'group'
+                  ? (conversation.name ?? '')
+                  : conversation.peerUsername
+              "
+              :display-name="
+                conversation.kind === 'group'
+                  ? undefined
+                  : conversation.peerDisplayName
+              "
+              :avatar="
+                conversation.kind === 'group' ? null : conversation.peerAvatar
+              "
               :size="36"
               data-testid="session-avatar"
-              @click="openPeerProfile(conversation)"
+              @click="openSessionAvatar(conversation)"
             />
             <span class="min-w-0 flex-1">
               <span class="flex items-baseline justify-between gap-2">
@@ -1202,15 +1522,40 @@ function toggleAudio(media: ChatMessageMedia): void {
         >
           <Avatar
             class="shrink-0"
-            :username="ws.activeConversation.peerUsername"
-            :display-name="ws.activeConversation.peerDisplayName"
-            :avatar="ws.activeConversation.peerAvatar"
+            :group="ws.activeConversation.kind === 'group'"
+            :username="
+              ws.activeConversation.kind === 'group'
+                ? (ws.activeConversation.name ?? '')
+                : ws.activeConversation.peerUsername
+            "
+            :display-name="
+              ws.activeConversation.kind === 'group'
+                ? undefined
+                : ws.activeConversation.peerDisplayName
+            "
+            :avatar="
+              ws.activeConversation.kind === 'group'
+                ? null
+                : ws.activeConversation.peerAvatar
+            "
             :size="32"
             data-testid="thread-avatar"
-            @click="openPeerProfile(ws.activeConversation)"
+            @click="openSessionAvatar(ws.activeConversation)"
           />
-          <span class="text-sm font-semibold" data-testid="thread-title">
+          <span
+            class="min-w-0 truncate text-sm font-semibold"
+            data-testid="thread-title"
+          >
             {{ peerLabel(ws.activeConversation) }}
+          </span>
+          <span
+            v-if="
+              ws.activeConversation.kind === 'group' && activeGroupInfo !== null
+            "
+            class="shrink-0 text-xs text-neutral-400 dark:text-neutral-500"
+            data-testid="thread-member-count"
+          >
+            {{ t("group.memberCount", { n: activeGroupInfo.member_count }) }}
           </span>
           <svg
             v-if="ws.activeConversation.kind === 'secret'"
@@ -1227,6 +1572,15 @@ function toggleAudio(media: ChatMessageMedia): void {
             <rect x="5" y="11" width="14" height="9" rx="2" />
             <path d="M8 11V7a4 4 0 0 1 8 0v4" />
           </svg>
+          <button
+            v-if="ws.activeConversation.kind === 'group'"
+            type="button"
+            class="ml-auto shrink-0 rounded-lg border border-neutral-300 px-2 py-1 text-xs font-medium text-neutral-600 hover:bg-neutral-100 dark:border-neutral-700 dark:text-neutral-300 dark:hover:bg-neutral-800"
+            data-testid="group-info-button"
+            @click="openGroupPanel()"
+          >
+            {{ t("group.infoButton") }}
+          </button>
         </header>
 
         <!-- M3 safety code row: compare with the peer out-of-band -->
@@ -1280,10 +1634,20 @@ function toggleAudio(media: ChatMessageMedia): void {
               <div class="max-w-[75%]">
                 <div
                   v-if="!message.mine"
-                  class="mb-0.5 text-[11px] text-neutral-400 dark:text-neutral-500"
+                  class="mb-0.5 flex items-center gap-1 text-[11px] text-neutral-400 dark:text-neutral-500"
                   data-testid="message-sender"
                 >
-                  {{ senderLabel(message) }}
+                  <!-- Group bubbles attribute the actual sender (avatar + name). -->
+                  <Avatar
+                    v-if="ws.activeConversation?.kind === 'group'"
+                    class="shrink-0"
+                    :username="message.senderId"
+                    :display-name="senderLabel(message)"
+                    :avatar="groupAvatarOf(message.senderId)"
+                    :size="16"
+                    data-testid="message-sender-avatar"
+                  />
+                  <span>{{ senderLabel(message) }}</span>
                 </div>
                 <!-- M3 undecryptable: localized placeholder replaces content -->
                 <div
@@ -1331,7 +1695,7 @@ function toggleAudio(media: ChatMessageMedia): void {
                   <!-- M9 voice: custom minimal player (no native chrome). -->
                   <div
                     v-else-if="message.media.kind === 'audio'"
-                    class="flex min-w-[180px] max-w-[260px] items-center gap-2 rounded-2xl px-3 py-2"
+                    class="flex min-w-[180px] max-w-[260px] flex-col rounded-2xl px-3 py-2"
                     :class="
                       message.mine
                         ? 'bg-indigo-600 text-white'
@@ -1339,40 +1703,49 @@ function toggleAudio(media: ChatMessageMedia): void {
                     "
                     data-testid="media-audio"
                   >
-                    <button
-                      type="button"
-                      class="shrink-0 rounded-full p-1 text-sm leading-none hover:bg-black/10 dark:hover:bg-white/10"
-                      data-testid="audio-play"
-                      :aria-label="
-                        playingMediaId === message.media.mediaId
-                          ? t('chat.voicePause')
-                          : t('chat.voicePlay')
-                      "
-                      @click="toggleAudio(message.media)"
-                    >
-                      {{
-                        playingMediaId === message.media.mediaId ? "❚❚" : "▶"
-                      }}
-                    </button>
+                    <!-- M11: show the uploaded file name (generated voice-* hidden). -->
                     <span
-                      class="h-1 flex-1 overflow-hidden rounded bg-black/20 dark:bg-white/20"
+                      v-if="audioFileName(message.media) !== null"
+                      class="mb-0.5 block max-w-full truncate text-[10px] opacity-80"
+                      data-testid="audio-filename"
+                      >{{ audioFileName(message.media) }}</span
                     >
+                    <div class="flex items-center gap-2">
+                      <button
+                        type="button"
+                        class="shrink-0 rounded-full p-1 text-sm leading-none hover:bg-black/10 dark:hover:bg-white/10"
+                        data-testid="audio-play"
+                        :aria-label="
+                          playingMediaId === message.media.mediaId
+                            ? t('chat.voicePause')
+                            : t('chat.voicePlay')
+                        "
+                        @click="toggleAudio(message.media)"
+                      >
+                        {{
+                          playingMediaId === message.media.mediaId ? "❚❚" : "▶"
+                        }}
+                      </button>
                       <span
-                        class="block h-1 rounded bg-current transition-[width] duration-150"
-                        :style="{
-                          width:
-                            (playingMediaId === message.media.mediaId
-                              ? audioProgress
-                              : 0) *
-                              100 +
-                            '%',
-                        }"
-                        data-testid="audio-progress"
-                      ></span>
-                    </span>
-                    <span class="shrink-0 text-[11px] tabular-nums">
-                      {{ formatDuration(message.media.durationMs) }}
-                    </span>
+                        class="h-1 flex-1 overflow-hidden rounded bg-black/20 dark:bg-white/20"
+                      >
+                        <span
+                          class="block h-1 rounded bg-current transition-[width] duration-150"
+                          :style="{
+                            width:
+                              (playingMediaId === message.media.mediaId
+                                ? audioProgress
+                                : 0) *
+                                100 +
+                              '%',
+                          }"
+                          data-testid="audio-progress"
+                        ></span>
+                      </span>
+                      <span class="shrink-0 text-[11px] tabular-nums">
+                        {{ formatDuration(message.media.durationMs) }}
+                      </span>
+                    </div>
                   </div>
                   <template v-else>
                     <video
@@ -1806,6 +2179,327 @@ function toggleAudio(media: ChatMessageMedia): void {
           class="max-h-full max-w-full object-contain"
           data-testid="media-lightbox-image"
         />
+      </div>
+
+      <!-- M11 create-group dialog: name + multi-select friends -->
+      <div
+        v-if="groupDialogOpen"
+        class="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4"
+        data-testid="group-create-dialog"
+      >
+        <div
+          class="w-full max-w-sm rounded-xl bg-white p-4 shadow-lg dark:bg-neutral-900"
+        >
+          <h3
+            class="pb-2 text-sm font-semibold"
+            data-testid="group-create-title"
+          >
+            {{ t("group.createTitle") }}
+          </h3>
+          <input
+            v-model="groupNameInput"
+            type="text"
+            :maxlength="GROUP_NAME_MAX"
+            :placeholder="t('group.namePlaceholder')"
+            data-testid="group-name-input"
+            class="w-full rounded-lg border border-neutral-300 bg-transparent px-2 py-1.5 text-sm outline-none focus:border-indigo-500 dark:border-neutral-700"
+          />
+          <input
+            v-model="groupMemberFilter"
+            type="search"
+            :placeholder="t('group.searchFriendsPlaceholder')"
+            data-testid="group-member-search"
+            class="mt-2 w-full rounded-lg border border-neutral-300 bg-transparent px-2 py-1.5 text-sm outline-none focus:border-indigo-500 dark:border-neutral-700"
+          />
+          <p
+            class="px-1 pt-2 text-[11px] text-neutral-400 dark:text-neutral-500"
+            data-testid="group-selected-count"
+          >
+            {{ t("group.selectedCount", { n: groupSelected.length }) }}
+          </p>
+          <ul
+            v-if="groupCandidateFriends.length > 0"
+            class="mt-1 max-h-56 space-y-1 overflow-y-auto"
+            data-testid="group-candidate-list"
+          >
+            <li
+              v-for="friend in groupCandidateFriends"
+              :key="friend.user_id"
+              data-testid="group-candidate"
+              :data-username="friend.username"
+            >
+              <button
+                type="button"
+                class="flex w-full items-center gap-2 rounded-lg p-1.5 text-left text-sm hover:bg-neutral-100 dark:hover:bg-neutral-800"
+                :data-selected="isGroupMemberSelected(friend.username)"
+                @click="toggleGroupMember(friend.username)"
+              >
+                <Avatar
+                  class="shrink-0"
+                  :username="friend.username"
+                  :display-name="friend.display_name"
+                  :avatar="friend.avatar"
+                  :size="28"
+                />
+                <span class="min-w-0 flex-1 truncate">
+                  {{ friend.display_name?.trim() || friend.username }}
+                </span>
+                <span
+                  v-if="isGroupMemberSelected(friend.username)"
+                  class="shrink-0 font-semibold text-indigo-600 dark:text-indigo-400"
+                  >✓</span
+                >
+              </button>
+            </li>
+          </ul>
+          <p
+            v-else-if="friends.loaded && friends.friends.length === 0"
+            class="px-1 py-2 text-xs text-neutral-400 dark:text-neutral-500"
+            data-testid="group-no-friends"
+          >
+            {{ t("group.noFriends") }}
+          </p>
+          <p
+            v-if="groupCreateError.length > 0"
+            class="px-1 pt-2 text-xs text-red-500"
+            data-testid="group-create-error"
+          >
+            {{ groupCreateError }}
+          </p>
+          <div class="flex justify-end gap-2 pt-3">
+            <button
+              type="button"
+              data-testid="group-create-cancel"
+              class="rounded-lg border border-neutral-300 px-3 py-1.5 text-xs font-medium text-neutral-600 hover:bg-neutral-100 dark:border-neutral-700 dark:text-neutral-300 dark:hover:bg-neutral-800"
+              @click="closeGroupDialog()"
+            >
+              {{ t("group.cancel") }}
+            </button>
+            <button
+              type="button"
+              data-testid="group-create-submit"
+              :disabled="!groupNameValid || creatingGroup"
+              class="rounded-lg bg-indigo-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-indigo-500 disabled:cursor-not-allowed disabled:opacity-50"
+              @click="submitCreateGroup()"
+            >
+              {{
+                creatingGroup
+                  ? t("group.createCreating")
+                  : t("group.createSubmit")
+              }}
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <!-- M11 group info panel: roster, role badges, gated actions -->
+      <div
+        v-if="groupPanelOpen && activeGroupInfo !== null"
+        class="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4"
+        data-testid="group-info-panel"
+      >
+        <div
+          class="w-full max-w-sm rounded-xl bg-white p-4 shadow-lg dark:bg-neutral-900"
+        >
+          <div class="flex items-center justify-between pb-2">
+            <h3
+              class="min-w-0 truncate text-sm font-semibold"
+              data-testid="group-info-title"
+            >
+              {{ activeGroupInfo.name }}
+            </h3>
+            <button
+              type="button"
+              class="shrink-0 rounded px-1.5 text-lg leading-none text-neutral-400 hover:bg-neutral-100 hover:text-neutral-700 dark:hover:bg-neutral-800"
+              data-testid="group-info-close"
+              :aria-label="t('group.close')"
+              @click="closeGroupPanel()"
+            >
+              ×
+            </button>
+          </div>
+          <p
+            class="text-xs text-neutral-500 dark:text-neutral-400"
+            data-testid="group-info-meta"
+          >
+            {{ t("group.memberCount", { n: activeGroupInfo.member_count }) }} ·
+            {{
+              t("group.myRole", {
+                role: memberRoleLabel(activeGroupInfo.my_role),
+              })
+            }}
+          </p>
+
+          <!-- Invite row: owner/admin only -->
+          <div v-if="canInvite" class="flex items-center gap-2 pt-2">
+            <input
+              v-model="groupInviteUsername"
+              type="text"
+              :placeholder="t('group.invitePlaceholder')"
+              data-testid="group-invite-input"
+              class="min-w-0 flex-1 rounded-lg border border-neutral-300 bg-transparent px-2 py-1.5 text-sm outline-none focus:border-indigo-500 dark:border-neutral-700"
+              @keydown.enter.prevent="submitGroupInvite()"
+            />
+            <button
+              type="button"
+              data-testid="group-invite-submit"
+              :disabled="groupInviteUsername.trim().length === 0"
+              class="shrink-0 rounded-lg bg-indigo-600 px-2 py-1.5 text-xs font-medium text-white hover:bg-indigo-500 disabled:cursor-not-allowed disabled:opacity-50"
+              @click="submitGroupInvite()"
+            >
+              {{ t("group.invite") }}
+            </button>
+          </div>
+
+          <p
+            v-if="groupActionError.length > 0"
+            class="px-1 pt-2 text-xs text-red-500"
+            data-testid="group-action-error"
+          >
+            {{ groupActionError }}
+          </p>
+
+          <ul
+            class="mt-2 max-h-72 space-y-1 overflow-y-auto"
+            data-testid="group-member-list"
+          >
+            <li
+              v-for="member in activeGroupInfo.members"
+              :key="member.user_id"
+              data-testid="group-member"
+              :data-user-id="member.user_id"
+              :data-role="member.role"
+              class="flex items-center gap-2 rounded-lg p-1.5 hover:bg-neutral-100 dark:hover:bg-neutral-800"
+            >
+              <Avatar
+                class="shrink-0"
+                :username="member.username"
+                :display-name="member.display_name"
+                :avatar="member.avatar"
+                :size="28"
+              />
+              <span class="min-w-0 flex-1 truncate text-sm">
+                {{ memberLabelOf(member) }}
+              </span>
+              <span
+                v-if="member.role === 'owner'"
+                class="shrink-0 text-sm"
+                data-testid="group-member-owner"
+                :title="t('group.roleOwner')"
+                >👑</span
+              >
+              <span
+                v-else-if="member.role === 'admin'"
+                class="shrink-0 rounded bg-amber-100 px-1.5 py-0.5 text-[10px] font-medium text-amber-700 dark:bg-amber-900/40 dark:text-amber-300"
+                data-testid="group-member-admin"
+                >{{ t("group.roleAdmin") }}</span
+              >
+              <template v-if="member.user_id !== myUserId">
+                <button
+                  v-if="canChangeMemberRole(member) && member.role !== 'admin'"
+                  type="button"
+                  data-testid="group-appoint"
+                  :disabled="busyMemberId !== null"
+                  class="shrink-0 rounded px-1.5 py-0.5 text-[11px] text-indigo-600 hover:underline disabled:opacity-50 dark:text-indigo-400"
+                  @click="askRoleChange(member, 'admin')"
+                >
+                  {{ t("group.appointAdmin") }}
+                </button>
+                <button
+                  v-if="canChangeMemberRole(member) && member.role === 'admin'"
+                  type="button"
+                  data-testid="group-demote"
+                  :disabled="busyMemberId !== null"
+                  class="shrink-0 rounded px-1.5 py-0.5 text-[11px] text-indigo-600 hover:underline disabled:opacity-50 dark:text-indigo-400"
+                  @click="askRoleChange(member, 'member')"
+                >
+                  {{ t("group.demoteAdmin") }}
+                </button>
+                <button
+                  v-if="canTransferTo(member)"
+                  type="button"
+                  data-testid="group-transfer"
+                  :disabled="busyMemberId !== null"
+                  class="shrink-0 rounded px-1.5 py-0.5 text-[11px] text-neutral-500 hover:underline disabled:opacity-50 dark:text-neutral-400"
+                  @click="askTransfer(member)"
+                >
+                  {{ t("group.transfer") }}
+                </button>
+                <button
+                  v-if="canKick(member)"
+                  type="button"
+                  data-testid="group-kick"
+                  :disabled="busyMemberId !== null"
+                  class="shrink-0 rounded px-1.5 py-0.5 text-[11px] text-red-500 hover:underline disabled:opacity-50"
+                  @click="askKick(member)"
+                >
+                  {{ t("group.kick") }}
+                </button>
+              </template>
+              <span
+                v-else
+                class="shrink-0 text-[10px] text-neutral-400 dark:text-neutral-500"
+                data-testid="group-member-self"
+                >{{ t("group.you") }}</span
+              >
+            </li>
+          </ul>
+
+          <div class="pt-3">
+            <button
+              v-if="canLeave"
+              type="button"
+              data-testid="group-leave"
+              class="w-full rounded-lg bg-red-600 py-1.5 text-xs font-medium text-white hover:bg-red-500"
+              @click="askLeave()"
+            >
+              {{ t("group.leave") }}
+            </button>
+            <p
+              v-else
+              class="px-1 text-[11px] text-neutral-400 dark:text-neutral-500"
+              data-testid="group-owner-leave-hint"
+            >
+              {{ t("group.ownerLeaveHint") }}
+            </p>
+          </div>
+
+          <!-- In-app confirmation overlay for destructive group actions -->
+          <div
+            v-if="groupConfirm !== null"
+            class="fixed inset-0 z-[60] flex items-center justify-center bg-black/40 p-4"
+            data-testid="group-confirm"
+          >
+            <div
+              class="w-full max-w-xs rounded-xl bg-white p-4 shadow-lg dark:bg-neutral-900"
+            >
+              <p
+                class="pb-3 text-sm text-neutral-700 dark:text-neutral-200"
+                data-testid="group-confirm-message"
+              >
+                {{ groupConfirm.message }}
+              </p>
+              <div class="flex justify-end gap-2">
+                <button
+                  type="button"
+                  data-testid="group-confirm-cancel"
+                  class="rounded-lg border border-neutral-300 px-3 py-1.5 text-xs font-medium text-neutral-600 hover:bg-neutral-100 dark:border-neutral-700 dark:text-neutral-300 dark:hover:bg-neutral-800"
+                  @click="cancelGroupConfirm()"
+                >
+                  {{ t("group.cancel") }}
+                </button>
+                <button
+                  type="button"
+                  data-testid="group-confirm-accept"
+                  class="rounded-lg bg-red-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-red-500"
+                  @click="runGroupConfirm()"
+                >
+                  {{ t("group.confirm") }}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
       </div>
     </template>
   </AppShell>

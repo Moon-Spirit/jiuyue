@@ -63,6 +63,8 @@ export interface ConversationListItem {
   conversation_id: number;
   kind: string;
   peer: ConversationPeer | null;
+  /** Group name for `kind="group"`; null/absent for direct/secret. */
+  name?: string | null;
   last_seq: number;
   last_delivered_seq: number;
 }

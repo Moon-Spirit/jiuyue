@@ -207,12 +207,19 @@ mod tests {
 }
 
 /// GET /api/conversations — conversation memberships of the authenticated
-/// user, newest first. For `direct` conversations `peer` carries the single
-/// other member; other kinds leave it `null` until group support lands.
+/// user, newest first.
+///
+/// * `direct`/`secret`: `peer` carries the single other member and `name` is
+///   always `null`.
+/// * `group` (M11a): `name` carries the group title and `peer` stays `null`
+///   (a group has N members, so there is no single peer); clients fetch the
+///   roster from `GET /api/groups/{conversation_id}`.
 #[derive(Debug, Serialize)]
 pub struct ConversationListItem {
     pub conversation_id: i64,
     pub kind: String,
+    /// M11a group title; `null` for direct/secret conversations.
+    pub name: Option<String>,
     pub peer: Option<PeerInfo>,
     pub last_seq: i64,
     /// Server-side delivery cursor for THIS member; clients bootstrap their
@@ -227,6 +234,7 @@ pub async fn list_conversations(
     type ConvRow = (
         i64,
         String,
+        Option<String>,
         i64,
         i64,
         Option<Uuid>,
@@ -239,6 +247,7 @@ pub async fn list_conversations(
         r#"
         SELECT c.id,
                c.kind,
+               c.name,
                c.last_seq,
                m.last_delivered_seq,
                peer.user_id,
@@ -254,6 +263,7 @@ pub async fn list_conversations(
             FROM conversation_members cm2
             JOIN users u ON u.id = cm2.user_id
             WHERE cm2.conversation_id = c.id AND cm2.user_id <> m.user_id
+              AND c.kind <> 'group'
             LIMIT 1
         ) peer ON TRUE
         WHERE m.user_id = $1
@@ -271,6 +281,7 @@ pub async fn list_conversations(
             |(
                 conversation_id,
                 kind,
+                name,
                 last_seq,
                 last_delivered_seq,
                 peer_id,
@@ -279,10 +290,12 @@ pub async fn list_conversations(
                 peer_display,
                 peer_avatar,
             )| {
-                ConversationListItem {
-                    conversation_id,
-                    kind,
-                    peer: peer_id.map(|user_id| {
+                // Groups have no single peer; the roster comes from
+                // `GET /api/groups/{conversation_id}`.
+                let peer = if kind == "group" {
+                    None
+                } else {
+                    peer_id.map(|user_id| {
                         let username = peer_username.clone().unwrap_or_default();
                         PeerInfo {
                             user_id,
@@ -296,7 +309,13 @@ pub async fn list_conversations(
                             username,
                             avatar: peer_avatar.clone().unwrap_or_default(),
                         }
-                    }),
+                    })
+                };
+                ConversationListItem {
+                    conversation_id,
+                    kind,
+                    name,
+                    peer,
                     last_seq,
                     last_delivered_seq,
                 }

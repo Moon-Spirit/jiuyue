@@ -24,8 +24,11 @@ import errorFrame from "../../../../crates/protocol/tests/golden/error.json";
 import unknownType from "../../../../crates/protocol/tests/golden/unknown_type.json";
 
 import {
+  FRAME_TYPES,
   isE2eeMsg,
   isFrame,
+  isGroupInvited,
+  isGroupUpdated,
   isMediaRef,
   isMsgNew,
   isMsgSend,
@@ -351,7 +354,12 @@ describe("isSyncRes - untagged plain/secret union", () => {
             body: "hi",
             sent_at: "t",
           },
-          { conversation_id: 1, client_msg_id: "c1", ciphertext: "opaque", message_type: 1 },
+          {
+            conversation_id: 1,
+            client_msg_id: "c1",
+            ciphertext: "opaque",
+            message_type: 1,
+          },
         ],
         complete: true,
       }),
@@ -361,6 +369,69 @@ describe("isSyncRes - untagged plain/secret union", () => {
   it("rejects entries that are neither plain nor ciphertext", () => {
     expect(isSyncRes({ messages: [{ hello: 1 }], complete: true })).toBe(false);
     expect(isSyncRes({ messages: [], complete: "yes" })).toBe(false);
-    expect(isE2eeMsg({ conversation_id: 1, client_msg_id: "c1", ciphertext: "c", message_type: 1 })).toBe(true);
+    expect(
+      isE2eeMsg({
+        conversation_id: 1,
+        client_msg_id: "c1",
+        ciphertext: "c",
+        message_type: 1,
+      }),
+    ).toBe(true);
+  });
+});
+
+describe("M11 group frames", () => {
+  const invited = {
+    v: 1,
+    t: "group.invited",
+    d: {
+      invite_id: "inv-1",
+      conversation_id: 7,
+      group_name: "游戏群",
+      from: { user_id: "u1", username: "alice", display_name: "Alice" },
+    },
+  };
+
+  it("group.invited parses and round-trips unchanged", () => {
+    const frame = parseFrame(invited);
+    expect(frame.t).toBe("group.invited");
+    if (frame.t !== "group.invited") throw new Error("unreachable");
+    expect(frame.d.group_name).toBe("游戏群");
+    expect(frame.d.from.display_name).toBe("Alice");
+    expect(serializeFrame(frame)).toEqual(invited);
+  });
+
+  it("group.invited tolerates an absent display_name", () => {
+    const withoutDisplay = {
+      ...invited,
+      d: { ...invited.d, from: { user_id: "u1", username: "alice" } },
+    };
+    expect(isGroupInvited((withoutDisplay as { d: unknown }).d)).toBe(true);
+  });
+
+  it("group.updated parses and round-trips unchanged", () => {
+    const updated = { v: 1, t: "group.updated", d: { conversation_id: 7 } };
+    const frame = parseFrame(updated);
+    expect(frame.t).toBe("group.updated");
+    expect(serializeFrame(frame)).toEqual(updated);
+  });
+
+  it("rejects malformed group payloads", () => {
+    expect(isGroupInvited({ invite_id: "i", conversation_id: 1 })).toBe(false);
+    expect(
+      isGroupInvited({
+        invite_id: "i",
+        conversation_id: 1,
+        group_name: "g",
+        from: { username: "alice" },
+      }),
+    ).toBe(false);
+    expect(isGroupUpdated({ conversation_id: "7" })).toBe(false);
+    expect(isGroupUpdated({})).toBe(false);
+  });
+
+  it("registers both types in FRAME_TYPES", () => {
+    expect(FRAME_TYPES).toContain("group.invited");
+    expect(FRAME_TYPES).toContain("group.updated");
   });
 });
