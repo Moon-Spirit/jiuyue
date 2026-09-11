@@ -12,6 +12,10 @@ use std::sync::Arc;
 pub const DEFAULT_MEDIA_MAX_IMAGE_BYTES: u64 = 15 * 1024 * 1024;
 pub const DEFAULT_MEDIA_MAX_VIDEO_BYTES: u64 = 200 * 1024 * 1024;
 
+/// Default cap for a single group-file upload (bytes) when the env override
+/// is absent (`JIUYUE_GROUP_FILE_MAX_BYTES`).
+pub const DEFAULT_GROUP_FILE_MAX_BYTES: u64 = 200 * 1024 * 1024;
+
 #[derive(Clone)]
 pub struct AppState {
     pub pool: PgPool,
@@ -44,6 +48,11 @@ pub struct AppState {
     /// Maximum accepted video upload size in bytes
     /// (`JIUYUE_MEDIA_MAX_VIDEO_BYTES`, default 200 MiB).
     pub media_max_video_bytes: u64,
+    /// Maximum accepted size of one group-file upload in bytes
+    /// (`JIUYUE_GROUP_FILE_MAX_BYTES`, default 200 MiB). The per-group free
+    /// quota (1 GiB) is a separate, fixed domain constant and is NOT tuned by
+    /// this cap — the cap only bounds a single file, streamed then aborted.
+    pub group_file_max_bytes: u64,
 }
 
 /// Reads a positive `u64` byte cap from the environment; missing, non-numeric
@@ -90,6 +99,10 @@ impl AppState {
             media_max_video_bytes: parse_bytes_env(
                 "JIUYUE_MEDIA_MAX_VIDEO_BYTES",
                 DEFAULT_MEDIA_MAX_VIDEO_BYTES,
+            ),
+            group_file_max_bytes: parse_bytes_env(
+                "JIUYUE_GROUP_FILE_MAX_BYTES",
+                DEFAULT_GROUP_FILE_MAX_BYTES,
             ),
         }
     }

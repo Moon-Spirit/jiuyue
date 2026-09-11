@@ -19,6 +19,13 @@ import type {
   GroupPatch,
   GroupRole,
 } from "../lib/api/groups";
+import {
+  deleteGroupFile as apiDeleteGroupFile,
+  downloadGroupFile as apiDownloadGroupFile,
+  listGroupFiles,
+  uploadGroupFile as apiUploadGroupFile,
+} from "../lib/api/groupFiles";
+import type { GroupFile, GroupFileUploadResult } from "../lib/api/groupFiles";
 import { ApiError } from "../lib/api/client";
 import type { GroupInvited, GroupUpdated } from "../lib/protocol/frames";
 import { useAuthStore } from "./auth";
@@ -35,6 +42,17 @@ function memberLabel(member: {
 function memberAvatar(member: { avatar?: string | null }): string | null {
   const avatar = member.avatar?.trim() ?? "";
   return avatar.length > 0 ? avatar : null;
+}
+
+/** Cached group-files listing + usage for one conversation (M13b). */
+export interface GroupFilesState {
+  usageBytes: number;
+  quotaBytes: number;
+  files: GroupFile[];
+  /** A listing request is in flight. */
+  loading: boolean;
+  /** At least one authoritative listing has been loaded. */
+  loaded: boolean;
 }
 
 /**
@@ -55,6 +73,10 @@ export const useGroupsStore = defineStore("groups", {
     memberNames: {} as Record<number, Record<string, string>>,
     /** conversation_id → user_id → avatar emoji (or null). */
     memberAvatars: {} as Record<number, Record<string, string | null>>,
+    /** conversation_id → cached group files + usage (M13b). */
+    files: {} as Record<number, GroupFilesState>,
+    /** conversation_id whose files view is open; live-refreshed on group.updated. */
+    filesViewId: null as number | null,
     /** Whether the invite list was fetched at least once. */
     invitesLoaded: false,
   }),
@@ -62,6 +84,14 @@ export const useGroupsStore = defineStore("groups", {
   getters: {
     /** Badge count for the nav 通讯录 entry. */
     pendingInviteCount: (state): number => state.invites.length,
+
+    /** Cached group files for a conversation (null when never fetched). */
+    filesFor:
+      (state) =>
+      (conversationId: number | null): GroupFilesState | null => {
+        if (conversationId === null) return null;
+        return state.files[conversationId] ?? null;
+      },
 
     /** Cached group info for a conversation (null when never fetched). */
     infoFor:
@@ -112,6 +142,80 @@ export const useGroupsStore = defineStore("groups", {
       }
     },
 
+    // --- M13b group files -------------------------------------------------
+
+    /** Marks a group's files view as open and loads its listing. */
+    hostFilesView(conversationId: number): void {
+      this.filesViewId = conversationId;
+      void this.fetchFiles(conversationId);
+    },
+
+    /** Marks the files view closed (no live refresh without an open view). */
+    unhostFilesView(): void {
+      this.filesViewId = null;
+    },
+
+    /** GET the group file listing; keeps the last good copy on failure. */
+    async fetchFiles(conversationId: number): Promise<void> {
+      const existing = this.files[conversationId];
+      if (existing !== undefined) {
+        existing.loading = true;
+      } else {
+        this.files[conversationId] = {
+          usageBytes: 0,
+          quotaBytes: 0,
+          files: [],
+          loading: true,
+          loaded: false,
+        };
+      }
+      try {
+        const listing = await listGroupFiles(
+          await this.token(),
+          conversationId,
+        );
+        this.files[conversationId] = {
+          usageBytes: listing.usage_bytes,
+          quotaBytes: listing.quota_bytes,
+          files: listing.files,
+          loading: false,
+          loaded: true,
+        };
+      } catch {
+        const state = this.files[conversationId];
+        if (state !== undefined) state.loading = false;
+      }
+    },
+
+    /** Uploads a file then refreshes the listing + usage. */
+    async uploadFile(
+      conversationId: number,
+      file: File,
+      onProgress?: (percent: number) => void,
+    ): Promise<GroupFileUploadResult> {
+      const result = await apiUploadGroupFile(
+        await this.token(),
+        conversationId,
+        file,
+        onProgress,
+      );
+      await this.fetchFiles(conversationId);
+      return result;
+    },
+
+    /** Deletes a file then refreshes the listing + usage. */
+    async deleteFile(conversationId: number, fileId: string): Promise<void> {
+      await apiDeleteGroupFile(await this.token(), fileId);
+      await this.fetchFiles(conversationId);
+    },
+
+    /** Downloads a file's bytes (name resolved from Content-Disposition). */
+    downloadFile(fileId: string): Promise<{ blob: Blob; name: string }> {
+      return this.token().then((accessToken) =>
+        apiDownloadGroupFile(accessToken, fileId),
+      );
+    },
+
     async loadInvites(): Promise<void> {
       this.invites = await listGroupInvites(await this.token());
       this.invitesLoaded = true;
@@ -144,6 +248,10 @@ export const useGroupsStore = defineStore("groups", {
         this.infos[payload.conversation_id] !== undefined ||
         ws.activeConversationId === payload.conversation_id;
       if (known) void this.fetchInfo(payload.conversation_id);
+      // Keep an open files view live: upload/delete on any device refreshes it.
+      if (this.filesViewId === payload.conversation_id) {
+        void this.fetchFiles(payload.conversation_id);
+      }
       void ws.refreshListing();
     },
 
@@ -236,6 +344,8 @@ export const useGroupsStore = defineStore("groups", {
       delete this.infos[conversationId];
       delete this.memberNames[conversationId];
       delete this.memberAvatars[conversationId];
+      delete this.files[conversationId];
+      if (this.filesViewId === conversationId) this.filesViewId = null;
       const { useWsStore } = await import("./ws");
       useWsStore().forgetConversation(conversationId);
     },
@@ -251,6 +361,8 @@ export const useGroupsStore = defineStore("groups", {
       this.invites = [];
       this.memberNames = {};
       this.memberAvatars = {};
+      this.files = {};
+      this.filesViewId = null;
       this.invitesLoaded = false;
     },
   },

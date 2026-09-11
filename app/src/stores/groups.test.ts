@@ -240,3 +240,79 @@ describe("groups store — 邀请生命周期", () => {
     expect(ws.conversations).toHaveLength(0);
   });
 });
+
+describe("groups store — M13b 群文件缓存与实时刷新", () => {
+  const fileListing = {
+    usage_bytes: 1536,
+    quota_bytes: 1024 * 1024 * 1024,
+    files: [
+      {
+        file_id: "f1",
+        name: "报告.pdf",
+        mime: "application/pdf",
+        bytes: 1536,
+        uploader: { user_id: "u2", username: "alice" },
+        created_at: "2026-09-01T00:00:00Z",
+        expires_at: null,
+      },
+    ],
+  };
+
+  function route(): void {
+    fetchMock.mockImplementation(async (path: string) => {
+      if (path === "/api/groups/5/files") return jsonResponse(200, fileListing);
+      if (path === "/api/conversations") return jsonResponse(200, []);
+      return jsonResponse(200, groupInfo);
+    });
+  }
+
+  it("hostFilesView 拉取并缓存文件列表", async () => {
+    route();
+    const groups = useGroupsStore();
+
+    groups.hostFilesView(5);
+
+    await vi.waitFor(() => {
+      expect(groups.filesFor(5)?.loaded).toBe(true);
+    });
+    expect(groups.filesFor(5)?.files).toHaveLength(1);
+    expect(groups.filesFor(5)?.usageBytes).toBe(1536);
+  });
+
+  it("group.updated 在文件视图打开时重新拉取列表", async () => {
+    route();
+    const groups = useGroupsStore();
+    groups.hostFilesView(5);
+    await vi.waitFor(() => {
+      expect(groups.filesFor(5)?.loaded).toBe(true);
+    });
+    fetchMock.mockClear();
+
+    await groups.onUpdated({ conversation_id: 5 });
+
+    await vi.waitFor(() => {
+      expect(
+        fetchMock.mock.calls.filter(([p]) => p === "/api/groups/5/files")
+          .length,
+      ).toBeGreaterThanOrEqual(1);
+    });
+  });
+
+  it("文件视图关闭后 group.updated 不再拉取列表", async () => {
+    route();
+    const groups = useGroupsStore();
+    groups.hostFilesView(5);
+    await vi.waitFor(() => {
+      expect(groups.filesFor(5)?.loaded).toBe(true);
+    });
+    groups.unhostFilesView();
+    fetchMock.mockClear();
+
+    await groups.onUpdated({ conversation_id: 5 });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(
+      fetchMock.mock.calls.some(([p]) => p === "/api/groups/5/files"),
+    ).toBe(false);
+  });
+});

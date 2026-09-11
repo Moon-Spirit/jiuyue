@@ -28,6 +28,9 @@ async fn main() -> anyhow::Result<()> {
     let redis = redis::aio::ConnectionManager::new(redis_client).await?;
     let state = AppState::new(pool, redis, config.jwt_secret);
 
+    // M13a: hourly sweep of expired group files (first pass ~1 min after boot).
+    jiuyue_server::group_files::spawn_sweeper(state.clone());
+
     // Dev-only CORS: allow localhost origins (Vite dev server / Tauri shell).
     let cors = CorsLayer::new()
         .allow_origin(AllowOrigin::predicate(|origin, _| {

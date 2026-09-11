@@ -47,6 +47,12 @@ import {
   uploadMedia,
 } from "../lib/api/media";
 import type { MediaKind } from "../lib/api/media";
+import {
+  GROUP_FILE_MAX_BYTES,
+  GroupFileError,
+  saveBlobAs,
+} from "../lib/api/groupFiles";
+import type { GroupFile } from "../lib/api/groupFiles";
 import * as olm from "../lib/crypto/olm-lite";
 import { useAuthStore } from "../stores/auth";
 import { useFriendsStore } from "../stores/friends";
@@ -120,6 +126,18 @@ const groupAvatarInputEl = ref<HTMLInputElement | null>(null);
 const titleDialogMember = ref<GroupMember | null>(null);
 const titleDraft = ref("");
 const titleSaving = ref(false);
+
+// --- M13b group files: usage, listing, up/download/delete, drag & drop ---
+const fileUploading = ref(false);
+const fileUploadPercent = ref(0);
+const fileError = ref("");
+/** file_id whose download/delete is in flight (disables its row actions). */
+const fileBusyId = ref<string | null>(null);
+/** File awaiting delete confirmation; null = dialog closed. */
+const fileDeleteTarget = ref<GroupFile | null>(null);
+const groupFileInputEl = ref<HTMLInputElement | null>(null);
+const fileDragActive = ref(false);
+let fileDragDepth = 0;
 
 // --- M8 media / emoji composer state -----------------------------------
 const emojiOpen = ref(false);
@@ -375,6 +393,7 @@ watch(
       groupPanelOpen.value = false;
       groupDescriptionEditing.value = false;
       titleDialogMember.value = null;
+      groups.unhostFilesView();
       return;
     }
     void groups.fetchInfo(id);
@@ -1173,6 +1192,34 @@ const activeGroupInfo = computed<GroupInfo | null>(() =>
     : null,
 );
 
+/** Current member's role in the active group ("member" until info loads). */
+const myGroupRole = computed<GroupRole>(
+  () => activeGroupInfo.value?.my_role ?? "member",
+);
+
+/** Group files state for the active thread (null before the first fetch). */
+const activeGroupFiles = computed(() =>
+  groups.filesFor(ws.activeConversationId),
+);
+const groupFileList = computed<GroupFile[]>(
+  () => activeGroupFiles.value?.files ?? [],
+);
+const groupFileUsage = computed<number>(
+  () => activeGroupFiles.value?.usageBytes ?? 0,
+);
+const groupFileQuota = computed<number>(
+  () => activeGroupFiles.value?.quotaBytes ?? 0,
+);
+const groupFileOverQuota = computed<boolean>(
+  () =>
+    groupFileQuota.value > 0 && groupFileUsage.value >= groupFileQuota.value,
+);
+const groupFileUsagePercent = computed<number>(() => {
+  const quota = groupFileQuota.value;
+  if (quota <= 0) return 0;
+  return Math.min(100, Math.round((groupFileUsage.value / quota) * 100));
+});
+
 /** Friends offered in the create dialog (filtered by the search box). */
 const groupCandidateFriends = computed(() => {
   const query = groupMemberFilter.value.trim().toLowerCase();
@@ -1232,7 +1279,11 @@ function openGroupPanel(): void {
   groupPanelOpen.value = true;
   groupActionError.value = "";
   groupInviteUsername.value = "";
+  fileError.value = "";
+  fileDeleteTarget.value = null;
   void groups.fetchInfo(id);
+  // Files section is visible: subscribe so group.updated keeps it fresh.
+  groups.hostFilesView(id);
 }
 
 function closeGroupPanel(): void {
@@ -1240,6 +1291,11 @@ function closeGroupPanel(): void {
   groupConfirm.value = null;
   groupDescriptionEditing.value = false;
   titleDialogMember.value = null;
+  fileDeleteTarget.value = null;
+  fileError.value = "";
+  fileDragActive.value = false;
+  fileDragDepth = 0;
+  groups.unhostFilesView();
 }
 
 function memberLabelOf(member: GroupMember): string {
@@ -1249,6 +1305,157 @@ function memberLabelOf(member: GroupMember): string {
 
 function memberRoleLabel(role: GroupRole): string {
   return t(roleLabelKey(role));
+}
+
+// ---------------------------------------------------------------------
+// M13b group files: upload / download / delete + drag & drop
+// ---------------------------------------------------------------------
+
+type GroupFileIconKind =
+  "image" | "video" | "audio" | "pdf" | "zip" | "text" | "other";
+
+/** Coarse MIME → icon category used by the file rows. */
+function groupFileIconKind(file: GroupFile): GroupFileIconKind {
+  const mime = file.mime.toLowerCase();
+  if (mime.startsWith("image/")) return "image";
+  if (mime.startsWith("video/")) return "video";
+  if (mime.startsWith("audio/")) return "audio";
+  if (mime === "application/pdf") return "pdf";
+  if (
+    mime === "application/zip" ||
+    mime === "application/x-zip-compressed" ||
+    mime.includes("compressed") ||
+    mime.includes("tar")
+  ) {
+    return "zip";
+  }
+  if (mime.startsWith("text/")) return "text";
+  return "other";
+}
+
+/** Locale short date for a file row (empty when the timestamp is invalid). */
+function groupFileDate(iso: string): string {
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return "";
+  return date.toLocaleDateString();
+}
+
+/** Owner/admin or the original uploader may delete a file. */
+function canDeleteGroupFile(file: GroupFile): boolean {
+  if (file.uploader.user_id === myUserId.value) return true;
+  const role = myGroupRole.value;
+  return role === "owner" || role === "admin";
+}
+
+function groupFileErrorMessage(error: unknown): string {
+  if (error instanceof GroupFileError && error.code === "too_large") {
+    return t("group.filesTooLarge", {
+      limit: formatBytes(GROUP_FILE_MAX_BYTES),
+    });
+  }
+  return t("group.filesUploadFailed");
+}
+
+/** Uploads dropped/picked files sequentially, collecting per-file failures. */
+async function uploadGroupFiles(files: File[]): Promise<void> {
+  const id = ws.activeConversationId;
+  if (id === null || files.length === 0 || fileUploading.value) return;
+  fileError.value = "";
+  fileUploading.value = true;
+  fileUploadPercent.value = 0;
+  const failures: string[] = [];
+  try {
+    for (const file of files) {
+      fileUploadPercent.value = 0;
+      try {
+        await groups.uploadFile(id, file, (percent) => {
+          fileUploadPercent.value = percent;
+        });
+      } catch (error) {
+        failures.push(`${file.name}: ${groupFileErrorMessage(error)}`);
+      }
+    }
+  } finally {
+    fileUploading.value = false;
+    fileUploadPercent.value = 0;
+  }
+  if (failures.length > 0) fileError.value = failures.join(" · ");
+}
+
+function pickGroupFile(): void {
+  fileError.value = "";
+  groupFileInputEl.value?.click();
+}
+
+async function onGroupFilePicked(event: Event): Promise<void> {
+  const input = event.target as HTMLInputElement;
+  const files = Array.from(input.files ?? []);
+  // Reset so picking the same file twice still fires `change`.
+  input.value = "";
+  await uploadGroupFiles(files);
+}
+
+async function downloadGroupFileAction(file: GroupFile): Promise<void> {
+  if (fileBusyId.value !== null) return;
+  fileBusyId.value = file.file_id;
+  fileError.value = "";
+  try {
+    const { blob, name } = await groups.downloadFile(file.file_id);
+    saveBlobAs(blob, name.length > 0 ? name : file.name);
+  } catch {
+    fileError.value = t("group.filesDownloadFailed");
+  } finally {
+    fileBusyId.value = null;
+  }
+}
+
+function askDeleteGroupFile(file: GroupFile): void {
+  fileDeleteTarget.value = file;
+}
+
+function cancelDeleteGroupFile(): void {
+  fileDeleteTarget.value = null;
+}
+
+async function confirmDeleteGroupFile(): Promise<void> {
+  const target = fileDeleteTarget.value;
+  const id = ws.activeConversationId;
+  fileDeleteTarget.value = null;
+  if (target === null || id === null) return;
+  fileBusyId.value = target.file_id;
+  fileError.value = "";
+  try {
+    await groups.deleteFile(id, target.file_id);
+  } catch {
+    fileError.value = t("group.filesDeleteFailed");
+  } finally {
+    fileBusyId.value = null;
+  }
+}
+
+// Drag & drop: a depth counter keeps the highlight stable while the pointer
+// crosses the nested children of the drop zone.
+function onFileDragEnter(): void {
+  fileDragDepth += 1;
+  fileDragActive.value = true;
+}
+
+function onFileDragLeave(): void {
+  fileDragDepth = Math.max(0, fileDragDepth - 1);
+  if (fileDragDepth === 0) fileDragActive.value = false;
+}
+
+function onFileDragOver(): void {
+  // The `.prevent` modifier blocks the browser's default "open the file".
+  fileDragActive.value = true;
+}
+
+async function onFileDrop(event: DragEvent): Promise<void> {
+  fileDragDepth = 0;
+  fileDragActive.value = false;
+  const dropped = event.dataTransfer?.files;
+  if (dropped === undefined || dropped.length === 0) return;
+  await uploadGroupFiles(Array.from(dropped));
 }
 
 // ---------------------------------------------------------------------
@@ -3006,6 +3213,281 @@ async function submitGroupInvite(): Promise<void> {
                 >
               </li>
             </ul>
+
+            <!-- M13b group files: usage, upload + drag & drop, listing -->
+            <section
+              class="relative mt-3 rounded-xl border border-neutral-200 p-2 dark:border-neutral-800"
+              :class="
+                fileDragActive
+                  ? 'border-dashed border-indigo-400 bg-indigo-50/60 dark:bg-indigo-950/20'
+                  : ''
+              "
+              data-testid="group-file-dropzone"
+              @dragenter.prevent="onFileDragEnter"
+              @dragover.prevent="onFileDragOver"
+              @dragleave.prevent="onFileDragLeave"
+              @drop.prevent="onFileDrop"
+            >
+              <div class="flex items-center justify-between gap-2">
+                <h4
+                  class="text-xs font-semibold text-neutral-700 dark:text-neutral-200"
+                  data-testid="group-file-title"
+                >
+                  {{ t("group.filesTitle") }}
+                </h4>
+                <button
+                  type="button"
+                  class="shrink-0 rounded-lg bg-indigo-600 px-2 py-1 text-[11px] font-medium text-white hover:bg-indigo-500"
+                  data-testid="group-file-upload"
+                  @click="pickGroupFile()"
+                >
+                  {{ t("group.filesUpload") }}
+                </button>
+                <input
+                  ref="groupFileInputEl"
+                  type="file"
+                  multiple
+                  class="hidden"
+                  data-testid="group-file-input"
+                  @change="onGroupFilePicked($event)"
+                />
+              </div>
+
+              <!-- Usage bar: used / quota + over-quota hint -->
+              <div class="pt-2" data-testid="group-file-usage">
+                <p class="text-[11px] text-neutral-500 dark:text-neutral-400">
+                  {{
+                    t("group.filesUsage", {
+                      used: formatBytes(groupFileUsage),
+                      quota: formatBytes(groupFileQuota),
+                    })
+                  }}
+                </p>
+                <div
+                  class="mt-1 h-1 overflow-hidden rounded bg-neutral-200 dark:bg-neutral-800"
+                >
+                  <div
+                    class="h-1 rounded bg-indigo-600 transition-[width]"
+                    :style="{ width: groupFileUsagePercent + '%' }"
+                  ></div>
+                </div>
+                <p
+                  v-if="groupFileOverQuota"
+                  class="pt-1 text-[10px] text-amber-600 dark:text-amber-400"
+                  data-testid="group-file-over-quota"
+                >
+                  {{ t("group.filesOverQuota") }}
+                </p>
+              </div>
+
+              <!-- Upload progress (scoped to the drawer) -->
+              <div
+                v-if="fileUploading"
+                class="flex items-center gap-2 pt-2 text-[11px]"
+                data-testid="group-file-upload-progress"
+              >
+                <div
+                  class="h-1 flex-1 overflow-hidden rounded bg-neutral-200 dark:bg-neutral-800"
+                >
+                  <div
+                    class="h-1 rounded bg-indigo-600"
+                    :style="{ width: fileUploadPercent + '%' }"
+                  ></div>
+                </div>
+                <span class="shrink-0 text-neutral-500 dark:text-neutral-400">
+                  {{
+                    t("group.filesUploading", { percent: fileUploadPercent })
+                  }}
+                </span>
+              </div>
+
+              <p
+                v-if="fileError.length > 0"
+                class="pt-2 text-[11px] text-red-500"
+                data-testid="group-file-error"
+              >
+                {{ fileError }}
+              </p>
+
+              <p
+                v-if="groupFileList.length === 0"
+                class="pt-2 text-[11px] italic text-neutral-400 dark:text-neutral-500"
+                data-testid="group-file-empty"
+              >
+                {{ t("group.filesEmpty") }}
+              </p>
+
+              <ul
+                v-else
+                class="mt-2 max-h-56 space-y-1 overflow-y-auto"
+                data-testid="group-file-list"
+              >
+                <li
+                  v-for="file in groupFileList"
+                  :key="file.file_id"
+                  class="flex items-center gap-2 rounded-lg p-1.5 hover:bg-neutral-100 dark:hover:bg-neutral-800"
+                  data-testid="group-file"
+                  :data-file-id="file.file_id"
+                >
+                  <svg
+                    class="h-5 w-5 shrink-0 text-neutral-400 dark:text-neutral-500"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="1.8"
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                    aria-hidden="true"
+                  >
+                    <template v-if="groupFileIconKind(file) === 'image'">
+                      <rect x="3" y="3" width="18" height="18" rx="2" />
+                      <circle cx="8.5" cy="8.5" r="1.5" />
+                      <path d="m21 15-5-5L5 21" />
+                    </template>
+                    <template v-else-if="groupFileIconKind(file) === 'video'">
+                      <rect x="2" y="5" width="14" height="14" rx="2" />
+                      <path d="m16 10 6-3v10l-6-3z" />
+                    </template>
+                    <template v-else-if="groupFileIconKind(file) === 'audio'">
+                      <path d="M9 18V5l12-2v13" />
+                      <circle cx="6" cy="18" r="3" />
+                      <circle cx="18" cy="16" r="3" />
+                    </template>
+                    <template v-else-if="groupFileIconKind(file) === 'pdf'">
+                      <path
+                        d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"
+                      />
+                      <path d="M14 2v6h6" />
+                      <path d="M9 13h1.5a1.5 1.5 0 0 1 0 3H9v2" />
+                    </template>
+                    <template v-else-if="groupFileIconKind(file) === 'zip'">
+                      <path
+                        d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"
+                      />
+                      <path d="M14 2v6h6" />
+                      <path d="M12 4v2M12 9v2M12 14v2" />
+                    </template>
+                    <template v-else-if="groupFileIconKind(file) === 'text'">
+                      <path
+                        d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"
+                      />
+                      <path d="M14 2v6h6" />
+                      <path d="M8 13h8M8 17h5" />
+                    </template>
+                    <template v-else>
+                      <path
+                        d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"
+                      />
+                      <path d="M14 2v6h6" />
+                    </template>
+                  </svg>
+                  <div class="min-w-0 flex-1">
+                    <p
+                      class="truncate text-xs text-neutral-800 dark:text-neutral-100"
+                      data-testid="group-file-name"
+                      :title="file.name"
+                    >
+                      {{ file.name }}
+                    </p>
+                    <p
+                      class="flex items-center gap-1.5 text-[10px] text-neutral-400 dark:text-neutral-500"
+                    >
+                      <span data-testid="group-file-size">{{
+                        formatBytes(file.bytes)
+                      }}</span>
+                      <span>·</span>
+                      <span
+                        class="truncate"
+                        data-testid="group-file-uploader"
+                        >{{
+                          file.uploader.display_name?.trim() ||
+                          file.uploader.username
+                        }}</span
+                      >
+                      <span>·</span>
+                      <span data-testid="group-file-date">{{
+                        groupFileDate(file.created_at)
+                      }}</span>
+                      <span
+                        v-if="file.expires_at"
+                        class="shrink-0 rounded bg-amber-100 px-1 py-0.5 font-medium text-amber-700 dark:bg-amber-900/40 dark:text-amber-300"
+                        data-testid="group-file-expiry"
+                        :title="groupFileDate(file.expires_at)"
+                        >{{ t("group.filesExpiryBadge") }}</span
+                      >
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    class="shrink-0 rounded px-1.5 py-0.5 text-[11px] text-indigo-600 hover:underline disabled:opacity-50 dark:text-indigo-400"
+                    data-testid="group-file-download"
+                    :disabled="fileBusyId !== null"
+                    @click="downloadGroupFileAction(file)"
+                  >
+                    {{ t("group.filesDownload") }}
+                  </button>
+                  <button
+                    v-if="canDeleteGroupFile(file)"
+                    type="button"
+                    class="shrink-0 rounded px-1.5 py-0.5 text-[11px] text-red-500 hover:underline disabled:opacity-50"
+                    data-testid="group-file-delete"
+                    :disabled="fileBusyId !== null"
+                    @click="askDeleteGroupFile(file)"
+                  >
+                    {{ t("group.filesDelete") }}
+                  </button>
+                </li>
+              </ul>
+
+              <!-- Drop hint overlay (pointer-events-none keeps dragleave stable) -->
+              <div
+                v-if="fileDragActive"
+                class="pointer-events-none absolute inset-0 z-10 flex items-center justify-center rounded-xl border-2 border-dashed border-indigo-400 bg-white/85 text-xs font-medium text-indigo-600 dark:bg-neutral-900/85 dark:text-indigo-300"
+                data-testid="group-file-drop-hint"
+              >
+                {{ t("group.filesDropHint") }}
+              </div>
+            </section>
+
+            <!-- Confirm overlay for deleting a group file -->
+            <div
+              v-if="fileDeleteTarget !== null"
+              class="fixed inset-0 z-[60] flex items-center justify-center bg-black/40 p-4"
+              data-testid="group-file-delete-confirm"
+            >
+              <div
+                class="w-full max-w-xs rounded-xl bg-white p-4 shadow-lg dark:bg-neutral-900"
+              >
+                <p
+                  class="pb-3 text-sm text-neutral-700 dark:text-neutral-200"
+                  data-testid="group-file-delete-message"
+                >
+                  {{
+                    t("group.filesDeleteConfirm", {
+                      name: fileDeleteTarget.name,
+                    })
+                  }}
+                </p>
+                <div class="flex justify-end gap-2">
+                  <button
+                    type="button"
+                    data-testid="group-file-delete-cancel"
+                    class="rounded-lg border border-neutral-300 px-3 py-1.5 text-xs font-medium text-neutral-600 hover:bg-neutral-100 dark:border-neutral-700 dark:text-neutral-300 dark:hover:bg-neutral-800"
+                    @click="cancelDeleteGroupFile()"
+                  >
+                    {{ t("group.cancel") }}
+                  </button>
+                  <button
+                    type="button"
+                    data-testid="group-file-delete-accept"
+                    class="rounded-lg bg-red-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-red-500"
+                    @click="confirmDeleteGroupFile()"
+                  >
+                    {{ t("group.confirm") }}
+                  </button>
+                </div>
+              </div>
+            </div>
 
             <div class="pt-3">
               <button

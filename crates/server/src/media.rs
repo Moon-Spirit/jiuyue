@@ -215,7 +215,7 @@ fn ext_for_mime(mime: &str) -> Option<&'static str> {
 /// encode UTF-8 names because header values are Latin-1 only), then strips
 /// path separators and control characters, caps at 120 chars, falls back to
 /// `"file"` when empty.
-fn sanitize_file_name(raw: Option<&str>) -> String {
+pub(crate) fn sanitize_file_name(raw: Option<&str>) -> String {
     let Some(raw) = raw else {
         return "file".to_owned();
     };

@@ -20,6 +20,12 @@
 //! | POST   | `/{id}/transfer`                          | owner hands ownership to a member → 200                         |
 //! | POST   | `/{id}/leave`                             | member leaves; owner must transfer first → 204/422              |
 //!
+//! M13a group-file storage is routed here and implemented in
+//! [`crate::group_files`]: `POST|GET /{id}/files` (upload/list),
+//! `GET /files/{file_id}` (download) and
+//! `POST /files/{file_id}/delete` (uploader/owner/admin). See that module for
+//! the 1 GiB free-quota → 7-day temporary pricing rule and the expiry sweeper.
+//!
 //! Non-members never learn whether a group exists: every group-scoped read or
 //! mutation answers a plain 404 for a non-member (and for a conversation that
 //! is not a group). Authenticated-but-underprivileged members get 403.
@@ -64,6 +70,21 @@ pub fn router() -> Router<AppState> {
         .route("/invites/{invite_id}/accept", post(accept_invite))
         .route("/invites/{invite_id}/decline", post(decline_invite))
         .route("/{conversation_id}", get(get_group).patch(update_group))
+        // M13a group files. `/{conversation_id}/files` and the literal
+        // `/files/{file_id}` are structurally distinct (matchit prefers the
+        // literal `files` branch), so the two path families coexist.
+        .route(
+            "/{conversation_id}/files",
+            get(crate::group_files::list_files).post(crate::group_files::upload_file),
+        )
+        .route(
+            "/files/{file_id}",
+            get(crate::group_files::download_file),
+        )
+        .route(
+            "/files/{file_id}/delete",
+            post(crate::group_files::delete_file),
+        )
         .route("/{conversation_id}/invites", post(invite_member))
         .route("/{conversation_id}/members/{user_id}/kick", post(kick_member))
         .route("/{conversation_id}/members/{user_id}/role", post(set_role))
@@ -107,7 +128,7 @@ async fn identity_of(state: &AppState, user_id: Uuid) -> Result<UserIdentity, Ap
 /// Returns the requester's role when they are a member of a `kind='group'`
 /// conversation, `None` otherwise (non-member OR non-group). Callers map
 /// `None` to a plain 404 so the endpoint is never an existence oracle.
-async fn group_role(
+pub(crate) async fn group_role(
     state: &AppState,
     conversation_id: i64,
     user_id: Uuid,

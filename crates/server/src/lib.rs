@@ -12,6 +12,7 @@ pub mod crypto;
 pub mod e2ee;
 pub mod error;
 pub mod friends;
+pub mod group_files;
 pub mod groups;
 pub mod groups_titles;
 pub mod media;
