@@ -15,16 +15,28 @@ import Avatar from "../components/Avatar.vue";
 import LanguageToggle from "../components/LanguageToggle.vue";
 import ThemeToggle from "../components/ThemeToggle.vue";
 import { apiErrorMessage } from "../lib/api/messages";
-import { groupApiErrorMessage } from "../lib/api/groups";
+import {
+  GROUP_DESCRIPTION_MAX,
+  GROUP_TITLE_MAX,
+  groupApiErrorMessage,
+} from "../lib/api/groups";
 import type { GroupInfo, GroupMember, GroupRole } from "../lib/api/groups";
 import {
   canChangeRole,
   canInviteMembers,
   canKickMember,
   canLeaveGroup,
+  canSetMemberTitle,
   canTransferOwnership,
   roleLabelKey,
 } from "../lib/groupRoles";
+import { fileToAvatarDataUrl } from "../lib/avatarImage";
+import { groupTierTitleKey } from "../lib/groupLevels";
+import { APP_VERSION } from "../lib/version";
+import { persistLocale } from "../i18n";
+import type { AppLocale } from "../i18n";
+import { useTheme } from "../composables/useTheme";
+import type { ThemePreference } from "../composables/useTheme";
 import { apiBase } from "../lib/apiConfig";
 import { EMOJIS } from "../lib/emoji";
 import {
@@ -51,6 +63,7 @@ const ws = useWsStore();
 const friends = useFriendsStore();
 const groups = useGroupsStore();
 const profile = useProfileStore();
+const { preference: themePreference } = useTheme();
 /** Own instance, captured for cross-breakpoint DOM measurement at runtime. */
 const viewInstance = getCurrentInstance();
 
@@ -94,6 +107,19 @@ const groupConfirm = ref<{
   role?: "admin" | "member";
   message: string;
 } | null>(null);
+
+// --- M12b app settings dialog -------------------------------------------
+const settingsOpen = ref(false);
+
+// --- M12b group settings: description, avatar, member titles ------------
+const groupDescriptionEditing = ref(false);
+const groupDescriptionDraft = ref("");
+const groupDescriptionSaving = ref(false);
+const groupAvatarInputEl = ref<HTMLInputElement | null>(null);
+/** Member whose custom title is being edited; null = dialog closed. */
+const titleDialogMember = ref<GroupMember | null>(null);
+const titleDraft = ref("");
+const titleSaving = ref(false);
 
 // --- M8 media / emoji composer state -----------------------------------
 const emojiOpen = ref(false);
@@ -347,6 +373,8 @@ watch(
   ([id, kind]) => {
     if (id === null || kind !== "group") {
       groupPanelOpen.value = false;
+      groupDescriptionEditing.value = false;
+      titleDialogMember.value = null;
       return;
     }
     void groups.fetchInfo(id);
@@ -641,6 +669,8 @@ function onGlobalKeydown(event: KeyboardEvent): void {
   if (event.key !== "Escape") return;
   emojiOpen.value = false;
   lightboxMedia.value = null;
+  settingsOpen.value = false;
+  titleDialogMember.value = null;
 }
 
 function pickImage(): void {
@@ -1208,6 +1238,8 @@ function openGroupPanel(): void {
 function closeGroupPanel(): void {
   groupPanelOpen.value = false;
   groupConfirm.value = null;
+  groupDescriptionEditing.value = false;
+  titleDialogMember.value = null;
 }
 
 function memberLabelOf(member: GroupMember): string {
@@ -1217,6 +1249,227 @@ function memberLabelOf(member: GroupMember): string {
 
 function memberRoleLabel(role: GroupRole): string {
   return t(roleLabelKey(role));
+}
+
+// ---------------------------------------------------------------------
+// M12b app settings: theme / language / version / sponsor
+// ---------------------------------------------------------------------
+
+const themeOptions = computed<{ value: ThemePreference; label: string }[]>(
+  () => [
+    { value: "light", label: t("settings.themeLight") },
+    { value: "dark", label: t("settings.themeDark") },
+    { value: "system", label: t("settings.themeSystem") },
+  ],
+);
+const appVersion: string = APP_VERSION;
+
+function openSettings(): void {
+  settingsOpen.value = true;
+}
+
+function closeSettings(): void {
+  settingsOpen.value = false;
+}
+
+function setTheme(value: ThemePreference): void {
+  themePreference.value = value;
+}
+
+function setLocale(value: AppLocale): void {
+  locale.value = value;
+  persistLocale(value);
+}
+
+// ---------------------------------------------------------------------
+// M12b group settings: description, avatar, member titles
+// ---------------------------------------------------------------------
+
+/** Owner/admin gate for group profile settings (description + avatar). */
+const canEditGroup = computed<boolean>(() => {
+  const info = activeGroupInfo.value;
+  return info !== null && canInviteMembers(info.members, myUserId.value);
+});
+
+const groupDescriptionText = computed<string>(
+  () => activeGroupInfo.value?.description?.trim() ?? "",
+);
+
+const groupDescriptionTooLong = computed<boolean>(
+  () => groupDescriptionDraft.value.length > GROUP_DESCRIPTION_MAX,
+);
+
+const groupHasAvatar = computed<boolean>(
+  () => (activeGroupInfo.value?.avatar ?? "").trim().length > 0,
+);
+
+function startDescriptionEdit(): void {
+  groupDescriptionDraft.value = activeGroupInfo.value?.description ?? "";
+  groupDescriptionEditing.value = true;
+  groupActionError.value = "";
+}
+
+function cancelDescriptionEdit(): void {
+  groupDescriptionEditing.value = false;
+}
+
+async function saveDescription(): Promise<void> {
+  const id = ws.activeConversationId;
+  if (
+    id === null ||
+    groupDescriptionSaving.value ||
+    groupDescriptionTooLong.value
+  ) {
+    return;
+  }
+  groupDescriptionSaving.value = true;
+  groupActionError.value = "";
+  try {
+    await groups.updateGroup(id, {
+      description: groupDescriptionDraft.value.trim(),
+    });
+    groupDescriptionEditing.value = false;
+  } catch (error) {
+    groupActionError.value = groupApiErrorMessage(error, (key) => t(key));
+  } finally {
+    groupDescriptionSaving.value = false;
+  }
+}
+
+function pickGroupAvatar(): void {
+  groupActionError.value = "";
+  groupAvatarInputEl.value?.click();
+}
+
+/** Picked group avatar → compress to a 256px JPEG data URL → PATCH avatar. */
+async function onGroupAvatarFile(event: Event): Promise<void> {
+  const input = event.target as HTMLInputElement;
+  const file = input.files?.[0] ?? null;
+  // Reset so picking the same file twice still fires `change`.
+  input.value = "";
+  const id = ws.activeConversationId;
+  if (file === null || id === null) return;
+  try {
+    const dataUrl = await fileToAvatarDataUrl(file);
+    if (dataUrl === null) return;
+    groupActionError.value = "";
+    await groups.updateGroup(id, { avatar: dataUrl });
+  } catch (error) {
+    groupActionError.value = groupApiErrorMessage(error, (key) => t(key));
+  }
+}
+
+async function removeGroupAvatar(): Promise<void> {
+  const id = ws.activeConversationId;
+  if (id === null) return;
+  groupActionError.value = "";
+  try {
+    await groups.updateGroup(id, { avatar: "" });
+  } catch (error) {
+    groupActionError.value = groupApiErrorMessage(error, (key) => t(key));
+  }
+}
+
+interface MemberTitleBadge {
+  text: string;
+  kind: "custom" | "role" | "tier";
+}
+
+/**
+ * Display title for a member: custom_title → role label (owner/admin) → tier
+ * title. Preferring the local resolution keeps role/tier badges localized to
+ * the current UI locale; the server-resolved `title` is the fallback.
+ */
+function memberTitleInfo(member: GroupMember): MemberTitleBadge | null {
+  const custom = member.custom_title?.trim() ?? "";
+  if (custom.length > 0) return { text: custom, kind: "custom" };
+  if (member.role === "owner" || member.role === "admin") {
+    return { text: t(roleLabelKey(member.role)), kind: "role" };
+  }
+  if (typeof member.group_level === "number" && member.group_level > 0) {
+    return { text: t(groupTierTitleKey(member.group_level)), kind: "tier" };
+  }
+  const resolved = member.title?.trim() ?? "";
+  return resolved.length > 0 ? { text: resolved, kind: "tier" } : null;
+}
+
+/** Color chip class for a member's title (custom violet, role indigo/amber, tier neutral). */
+function memberTitleClass(member: GroupMember): string {
+  const info = memberTitleInfo(member);
+  if (info === null) return "";
+  if (info.kind === "custom") {
+    return "bg-violet-100 text-violet-700 dark:bg-violet-900/40 dark:text-violet-300";
+  }
+  if (info.kind === "role") {
+    return member.role === "owner"
+      ? "bg-indigo-100 text-indigo-700 dark:bg-indigo-900/40 dark:text-indigo-300"
+      : "bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300";
+  }
+  return "bg-neutral-100 text-neutral-600 dark:bg-neutral-800 dark:text-neutral-300";
+}
+
+/** "Lv.N" label for a member's group level (null when unknown). */
+function memberLevelLabel(member: GroupMember): string | null {
+  if (typeof member.group_level !== "number" || member.group_level <= 0) {
+    return null;
+  }
+  return t("group.levelLabel", { level: member.group_level });
+}
+
+function canSetTitle(member: GroupMember): boolean {
+  const info = activeGroupInfo.value;
+  return (
+    info !== null &&
+    canSetMemberTitle(info.members, myUserId.value, member.user_id)
+  );
+}
+
+function openTitleDialog(member: GroupMember): void {
+  titleDialogMember.value = member;
+  titleDraft.value = member.custom_title?.trim() ?? "";
+  groupActionError.value = "";
+}
+
+function closeTitleDialog(): void {
+  titleDialogMember.value = null;
+}
+
+async function saveTitle(): Promise<void> {
+  const member = titleDialogMember.value;
+  const id = ws.activeConversationId;
+  if (member === null || id === null || titleSaving.value) return;
+  const title = titleDraft.value.trim();
+  titleSaving.value = true;
+  groupActionError.value = "";
+  try {
+    await groups.setMemberTitle(
+      id,
+      member.user_id,
+      title.length > 0 ? title : null,
+    );
+    titleDialogMember.value = null;
+  } catch (error) {
+    groupActionError.value = groupApiErrorMessage(error, (key) => t(key));
+  } finally {
+    titleSaving.value = false;
+  }
+}
+
+async function clearTitle(): Promise<void> {
+  const member = titleDialogMember.value;
+  const id = ws.activeConversationId;
+  if (member === null || id === null || titleSaving.value) return;
+  titleSaving.value = true;
+  groupActionError.value = "";
+  try {
+    await groups.setMemberTitle(id, member.user_id, null);
+    titleDraft.value = "";
+    titleDialogMember.value = null;
+  } catch (error) {
+    groupActionError.value = groupApiErrorMessage(error, (key) => t(key));
+  } finally {
+    titleSaving.value = false;
+  }
 }
 
 // Role-gated capabilities for the current member (delegated to pure helpers).
@@ -1378,6 +1631,30 @@ async function submitGroupInvite(): Promise<void> {
             {{ friends.pendingCount + groups.pendingInviteCount }}
           </span>
         </router-link>
+        <button
+          type="button"
+          class="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-lg text-neutral-600 hover:bg-neutral-100 hover:text-neutral-900 lg:mt-auto lg:w-full dark:text-neutral-300 dark:hover:bg-neutral-800 dark:hover:text-white"
+          data-testid="settings-button"
+          :title="t('settings.button')"
+          :aria-label="t('settings.button')"
+          @click="openSettings()"
+        >
+          <svg
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.8"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            class="h-5 w-5"
+            aria-hidden="true"
+          >
+            <circle cx="12" cy="12" r="3" />
+            <path
+              d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1Z"
+            />
+          </svg>
+        </button>
         <button
           type="button"
           data-testid="logout-button"
@@ -2437,35 +2714,156 @@ async function submitGroupInvite(): Promise<void> {
             role="dialog"
             aria-modal="true"
           >
-            <div class="flex items-center justify-between pb-2">
-              <h3
-                class="min-w-0 truncate text-sm font-semibold"
-                data-testid="group-info-title"
-              >
-                {{ activeGroupInfo.name }}
-              </h3>
+            <div class="flex items-start gap-3 pb-2">
               <button
+                v-if="canEditGroup"
                 type="button"
-                class="shrink-0 rounded px-1.5 text-lg leading-none text-neutral-400 hover:bg-neutral-100 hover:text-neutral-700 dark:hover:bg-neutral-800"
-                data-testid="group-info-close"
-                :aria-label="t('group.close')"
-                @click="closeGroupPanel()"
+                class="relative shrink-0 rounded-full"
+                data-testid="group-avatar-edit"
+                :title="t('group.avatarUpload')"
+                :aria-label="t('group.avatarUpload')"
+                @click="pickGroupAvatar()"
               >
-                ×
+                <Avatar
+                  group
+                  :username="activeGroupInfo.name"
+                  :avatar="activeGroupInfo.avatar"
+                  :size="44"
+                />
               </button>
+              <Avatar
+                v-else
+                group
+                :username="activeGroupInfo.name"
+                :avatar="activeGroupInfo.avatar"
+                :size="44"
+                data-testid="group-avatar"
+              />
+              <input
+                v-if="canEditGroup"
+                ref="groupAvatarInputEl"
+                type="file"
+                accept="image/png,image/jpeg,image/webp"
+                class="hidden"
+                data-testid="group-avatar-input"
+                @change="onGroupAvatarFile($event)"
+              />
+              <div class="min-w-0 flex-1">
+                <div class="flex items-center justify-between gap-2">
+                  <h3
+                    class="min-w-0 truncate text-sm font-semibold"
+                    data-testid="group-info-title"
+                  >
+                    {{ activeGroupInfo.name }}
+                  </h3>
+                  <button
+                    type="button"
+                    class="shrink-0 rounded px-1.5 text-lg leading-none text-neutral-400 hover:bg-neutral-100 hover:text-neutral-700 dark:hover:bg-neutral-800"
+                    data-testid="group-info-close"
+                    :aria-label="t('group.close')"
+                    @click="closeGroupPanel()"
+                  >
+                    ×
+                  </button>
+                </div>
+                <p
+                  class="text-xs text-neutral-500 dark:text-neutral-400"
+                  data-testid="group-info-meta"
+                >
+                  {{
+                    t("group.memberCount", { n: activeGroupInfo.member_count })
+                  }}
+                  ·
+                  {{
+                    t("group.myRole", {
+                      role: memberRoleLabel(activeGroupInfo.my_role),
+                    })
+                  }}
+                </p>
+
+                <!-- Editable group description (owner/admin) / read-only otherwise -->
+                <div v-if="groupDescriptionEditing">
+                  <textarea
+                    v-model="groupDescriptionDraft"
+                    :maxlength="GROUP_DESCRIPTION_MAX"
+                    rows="2"
+                    :placeholder="t('group.descriptionPlaceholder')"
+                    data-testid="group-description-input"
+                    class="mt-1 w-full resize-none rounded-lg border border-neutral-300 bg-transparent px-2 py-1.5 text-xs outline-none focus:border-indigo-500 dark:border-neutral-700"
+                  ></textarea>
+                  <div class="mt-1 flex items-center justify-end gap-2">
+                    <span
+                      class="mr-auto text-[10px]"
+                      :class="
+                        groupDescriptionTooLong
+                          ? 'text-red-500'
+                          : 'text-neutral-400 dark:text-neutral-500'
+                      "
+                      data-testid="group-description-counter"
+                      >{{
+                        t("group.descriptionCounter", {
+                          n: groupDescriptionDraft.length,
+                        })
+                      }}</span
+                    >
+                    <button
+                      type="button"
+                      data-testid="group-description-cancel"
+                      class="rounded border border-neutral-300 px-2 py-0.5 text-[11px] font-medium text-neutral-600 hover:bg-neutral-100 dark:border-neutral-700 dark:text-neutral-300 dark:hover:bg-neutral-800"
+                      @click="cancelDescriptionEdit()"
+                    >
+                      {{ t("group.cancel") }}
+                    </button>
+                    <button
+                      type="button"
+                      data-testid="group-description-save"
+                      :disabled="
+                        groupDescriptionSaving || groupDescriptionTooLong
+                      "
+                      class="rounded bg-indigo-600 px-2 py-0.5 text-[11px] font-medium text-white hover:bg-indigo-500 disabled:cursor-not-allowed disabled:opacity-50"
+                      @click="saveDescription()"
+                    >
+                      {{ t("group.titleSave") }}
+                    </button>
+                  </div>
+                </div>
+                <template v-else>
+                  <p
+                    v-if="groupDescriptionText.length > 0"
+                    class="mt-1 whitespace-pre-wrap text-xs text-neutral-500 dark:text-neutral-400"
+                    data-testid="group-description"
+                  >
+                    {{ groupDescriptionText }}
+                  </p>
+                  <p
+                    v-else-if="canEditGroup"
+                    class="mt-1 text-xs italic text-neutral-400 dark:text-neutral-500"
+                    data-testid="group-description-empty"
+                  >
+                    {{ t("group.descriptionEmpty") }}
+                  </p>
+                  <div v-if="canEditGroup" class="mt-1 flex items-center gap-3">
+                    <button
+                      type="button"
+                      data-testid="group-description-edit"
+                      class="text-[11px] font-medium text-indigo-600 hover:underline dark:text-indigo-400"
+                      @click="startDescriptionEdit()"
+                    >
+                      {{ t("group.editDescription") }}
+                    </button>
+                    <button
+                      v-if="groupHasAvatar"
+                      type="button"
+                      data-testid="group-avatar-remove"
+                      class="text-[11px] font-medium text-red-500 hover:underline"
+                      @click="removeGroupAvatar()"
+                    >
+                      {{ t("group.avatarRemove") }}
+                    </button>
+                  </div>
+                </template>
+              </div>
             </div>
-            <p
-              class="text-xs text-neutral-500 dark:text-neutral-400"
-              data-testid="group-info-meta"
-            >
-              {{ t("group.memberCount", { n: activeGroupInfo.member_count }) }}
-              ·
-              {{
-                t("group.myRole", {
-                  role: memberRoleLabel(activeGroupInfo.my_role),
-                })
-              }}
-            </p>
 
             <!-- Invite row: owner/admin only -->
             <div v-if="canInvite" class="flex items-center gap-2 pt-2">
@@ -2519,6 +2917,19 @@ async function submitGroupInvite(): Promise<void> {
                   {{ memberLabelOf(member) }}
                 </span>
                 <span
+                  v-if="memberTitleInfo(member) !== null"
+                  class="shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium"
+                  :class="memberTitleClass(member)"
+                  data-testid="group-member-title"
+                  >{{ memberTitleInfo(member)?.text }}</span
+                >
+                <span
+                  v-if="memberLevelLabel(member) !== null"
+                  class="shrink-0 text-[10px] tabular-nums text-neutral-400 dark:text-neutral-500"
+                  data-testid="group-member-level"
+                  >{{ memberLevelLabel(member) }}</span
+                >
+                <span
                   v-if="member.role === 'owner'"
                   class="shrink-0 text-sm"
                   data-testid="group-member-owner"
@@ -2532,6 +2943,16 @@ async function submitGroupInvite(): Promise<void> {
                   >{{ t("group.roleAdmin") }}</span
                 >
                 <template v-if="member.user_id !== myUserId">
+                  <button
+                    v-if="canSetTitle(member)"
+                    type="button"
+                    data-testid="group-member-title-edit"
+                    :disabled="busyMemberId !== null"
+                    class="shrink-0 rounded px-1.5 py-0.5 text-[11px] text-violet-600 hover:underline disabled:opacity-50 dark:text-violet-400"
+                    @click="openTitleDialog(member)"
+                  >
+                    {{ t("group.setTitle") }}
+                  </button>
                   <button
                     v-if="
                       canChangeMemberRole(member) && member.role !== 'admin'
@@ -2640,9 +3061,180 @@ async function submitGroupInvite(): Promise<void> {
                 </div>
               </div>
             </div>
+
+            <!-- M12b member-title dialog (owner only, never on the owner) -->
+            <div
+              v-if="titleDialogMember !== null"
+              class="fixed inset-0 z-[60] flex items-center justify-center bg-black/40 p-4"
+              data-testid="group-title-dialog"
+            >
+              <div
+                class="w-full max-w-xs rounded-xl bg-white p-4 shadow-lg dark:bg-neutral-900"
+              >
+                <h3
+                  class="pb-2 text-sm font-semibold"
+                  data-testid="group-title-title"
+                >
+                  {{ t("group.setTitle") }}
+                </h3>
+                <p class="pb-1 text-xs text-neutral-500 dark:text-neutral-400">
+                  {{ memberLabelOf(titleDialogMember) }}
+                </p>
+                <input
+                  v-model="titleDraft"
+                  type="text"
+                  :maxlength="GROUP_TITLE_MAX"
+                  :placeholder="t('group.titlePlaceholder')"
+                  data-testid="group-title-input"
+                  class="w-full rounded-lg border border-neutral-300 bg-transparent px-2 py-1.5 text-sm outline-none focus:border-indigo-500 dark:border-neutral-700"
+                />
+                <p
+                  class="pt-1 text-right text-[10px] text-neutral-400 dark:text-neutral-500"
+                >
+                  {{ t("group.titleCounter", { n: titleDraft.length }) }}
+                </p>
+                <div class="flex justify-end gap-2 pt-2">
+                  <button
+                    type="button"
+                    data-testid="group-title-clear"
+                    :disabled="titleSaving"
+                    class="mr-auto rounded-lg border border-neutral-300 px-3 py-1.5 text-xs font-medium text-red-500 hover:bg-neutral-100 disabled:opacity-50 dark:border-neutral-700 dark:hover:bg-neutral-800"
+                    @click="clearTitle()"
+                  >
+                    {{ t("group.titleClear") }}
+                  </button>
+                  <button
+                    type="button"
+                    data-testid="group-title-cancel"
+                    class="rounded-lg border border-neutral-300 px-3 py-1.5 text-xs font-medium text-neutral-600 hover:bg-neutral-100 dark:border-neutral-700 dark:text-neutral-300 dark:hover:bg-neutral-800"
+                    @click="closeTitleDialog()"
+                  >
+                    {{ t("group.cancel") }}
+                  </button>
+                  <button
+                    type="button"
+                    data-testid="group-title-save"
+                    :disabled="titleSaving"
+                    class="rounded-lg bg-indigo-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-indigo-500 disabled:cursor-not-allowed disabled:opacity-50"
+                    @click="saveTitle()"
+                  >
+                    {{ t("group.titleSave") }}
+                  </button>
+                </div>
+              </div>
+            </div>
           </div>
         </div>
       </Transition>
+
+      <!-- M12b app settings: centered modal over a frosted backdrop -->
+      <div
+        v-if="settingsOpen"
+        class="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4 backdrop-blur-md"
+        data-testid="settings-dialog"
+        @click.self="closeSettings()"
+      >
+        <div
+          class="w-full max-w-xs rounded-xl bg-white p-4 shadow-lg dark:bg-neutral-900"
+          role="dialog"
+          aria-modal="true"
+        >
+          <div class="flex items-center justify-between pb-2">
+            <h3 class="text-sm font-semibold" data-testid="settings-title">
+              {{ t("settings.title") }}
+            </h3>
+            <button
+              type="button"
+              class="shrink-0 rounded px-1.5 text-lg leading-none text-neutral-400 hover:bg-neutral-100 hover:text-neutral-700 dark:hover:bg-neutral-800"
+              data-testid="settings-close"
+              :aria-label="t('settings.title')"
+              @click="closeSettings()"
+            >
+              ×
+            </button>
+          </div>
+
+          <!-- Theme -->
+          <div class="pt-1">
+            <p
+              class="pb-1 text-xs font-medium text-neutral-500 dark:text-neutral-400"
+            >
+              {{ t("settings.theme") }}
+            </p>
+            <div
+              class="flex overflow-hidden rounded-lg border border-neutral-300 text-xs dark:border-neutral-700"
+            >
+              <button
+                v-for="option in themeOptions"
+                :key="option.value"
+                type="button"
+                class="flex-1 px-2 py-1.5 font-medium transition-colors"
+                :class="
+                  themePreference === option.value
+                    ? 'bg-indigo-600 text-white'
+                    : 'text-neutral-500 hover:bg-neutral-100 dark:text-neutral-400 dark:hover:bg-neutral-800'
+                "
+                :data-testid="`settings-theme-${option.value}`"
+                @click="setTheme(option.value)"
+              >
+                {{ option.label }}
+              </button>
+            </div>
+          </div>
+
+          <!-- Language -->
+          <div class="pt-3">
+            <p
+              class="pb-1 text-xs font-medium text-neutral-500 dark:text-neutral-400"
+            >
+              {{ t("settings.language") }}
+            </p>
+            <div
+              class="flex overflow-hidden rounded-lg border border-neutral-300 text-xs dark:border-neutral-700"
+            >
+              <button
+                type="button"
+                class="flex-1 px-2 py-1.5 font-medium transition-colors"
+                :class="
+                  locale === 'zh-CN'
+                    ? 'bg-indigo-600 text-white'
+                    : 'text-neutral-500 hover:bg-neutral-100 dark:text-neutral-400 dark:hover:bg-neutral-800'
+                "
+                data-testid="settings-locale-zh"
+                @click="setLocale('zh-CN')"
+              >
+                中文
+              </button>
+              <button
+                type="button"
+                class="flex-1 border-l border-neutral-300 px-2 py-1.5 font-medium transition-colors dark:border-neutral-700"
+                :class="
+                  locale === 'en'
+                    ? 'bg-indigo-600 text-white'
+                    : 'text-neutral-500 hover:bg-neutral-100 dark:text-neutral-400 dark:hover:bg-neutral-800'
+                "
+                data-testid="settings-locale-en"
+                @click="setLocale('en')"
+              >
+                English
+              </button>
+            </div>
+          </div>
+
+          <p
+            class="pt-3 text-[11px] text-neutral-400 dark:text-neutral-500"
+            data-testid="settings-version"
+          >
+            {{ t("settings.version", { version: appVersion }) }}
+          </p>
+          <p
+            class="pt-1 text-[11px] text-neutral-500 dark:text-neutral-400"
+            data-testid="settings-sponsor"
+          >
+            {{ t("settings.sponsor") }}
+          </p>
+        </div>
+      </div>
     </template>
   </AppShell>
 </template>

@@ -17,6 +17,14 @@ export interface GroupMember {
   role: GroupRole;
   /** RFC 3339 timestamp, passed through verbatim. */
   joined_at: string;
+  /** XP this member contributed to the group (additive field). */
+  group_xp?: number;
+  /** Group level derived from `group_xp` (additive field). */
+  group_level?: number;
+  /** Server-resolved display title (custom → role → tier). */
+  title?: string;
+  /** Owner-assigned custom title, or empty/null when unset. */
+  custom_title?: string | null;
 }
 
 /** POST /api/groups → 201 { conversation_id, name, member_count, invited } */
@@ -31,10 +39,29 @@ export interface CreateGroupResult {
 export interface GroupInfo {
   conversation_id: number;
   name: string;
+  /** Group description; empty when unset (additive field). */
+  description?: string;
+  /** Group avatar data URL; null/empty when unset (additive field). */
+  avatar?: string | null;
   my_role: GroupRole;
   member_count: number;
   members: GroupMember[];
 }
+
+/** Editable subset of a group (every field optional). */
+export interface GroupPatch {
+  /** Owner only (server-enforced). */
+  name?: string;
+  /** Owner/admin; ≤200 chars, empty clears. */
+  description?: string;
+  /** Owner/admin; data URL ≤256KB, empty clears. */
+  avatar?: string;
+}
+
+/** Body limits the group PATCH endpoint validates against (mirrors the 422s). */
+export const GROUP_DESCRIPTION_MAX = 200;
+/** Max custom-title length (owner-assigned member titles). */
+export const GROUP_TITLE_MAX = 16;
 
 /** The inviter reference carried by a pending group invite. */
 export interface GroupInviteFrom {
@@ -84,6 +111,38 @@ export function getGroup(
   return apiRequest<GroupInfo>(
     `/api/groups/${encodeURIComponent(String(conversationId))}`,
     { method: "GET", accessToken },
+  );
+}
+
+/**
+ * PATCH /api/groups/{id} { name?, description?, avatar? } (owner/admin) → 200.
+ * Only the keys present in `patch` are sent, so a description-only save never
+ * clobbers the avatar (and vice versa).
+ */
+export function patchGroup(
+  accessToken: string,
+  conversationId: number,
+  patch: GroupPatch,
+): Promise<GroupInfo> {
+  return apiRequest<GroupInfo>(
+    `/api/groups/${encodeURIComponent(String(conversationId))}`,
+    { method: "PATCH", body: patch, accessToken },
+  );
+}
+
+/**
+ * POST /api/groups/{id}/members/{userId}/title { title } (owner) → 200.
+ * `null` (or an empty string, normalized by the caller) clears the title.
+ */
+export function setGroupMemberTitle(
+  accessToken: string,
+  conversationId: number,
+  userId: string,
+  title: string | null,
+): Promise<void> {
+  return apiRequest<void>(
+    `/api/groups/${encodeURIComponent(String(conversationId))}/members/${encodeURIComponent(userId)}/title`,
+    { method: "POST", body: { title }, accessToken },
   );
 }
 

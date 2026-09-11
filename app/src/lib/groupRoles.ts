@@ -67,6 +67,22 @@ export function canTransferOwnership(
   return me.role === "owner";
 }
 
+/**
+ * Owner-only: assign a custom title to another member. The owner's own title
+ * is fixed (群主) and can never be overwritten, so self is excluded.
+ */
+export function canSetMemberTitle(
+  members: GroupMember[],
+  myId: string,
+  targetUserId: string,
+): boolean {
+  if (targetUserId === myId) return false;
+  const me = myMembership(members, myId);
+  const target = members.find((m) => m.user_id === targetUserId);
+  if (me === null || target === undefined) return false;
+  return me.role === "owner" && target.role !== "owner";
+}
+
 /** Owner and admins can invite new members. */
 export function canInviteMembers(
   members: GroupMember[],

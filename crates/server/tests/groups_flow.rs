@@ -26,7 +26,7 @@ use serde_json::{Value, json};
 use sqlx::{Connection, PgConnection, PgPool};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::LazyLock;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tower::ServiceExt;
@@ -343,6 +343,89 @@ async fn leave(t: &TestApp, access: &str, conversation_id: i64) -> (StatusCode, 
     .await
 }
 
+/// PATCHes group settings (`name` / `description` / `avatar`).
+async fn patch_group(
+    t: &TestApp,
+    access: &str,
+    conversation_id: i64,
+    body: Value,
+) -> (StatusCode, Value) {
+    send_http(
+        &t.app,
+        "PATCH",
+        &format!("/api/groups/{conversation_id}"),
+        Some(access),
+        Some(body),
+    )
+    .await
+}
+
+/// Sets (or clears, via `null`) a member's custom title.
+async fn set_title(
+    t: &TestApp,
+    access: &str,
+    conversation_id: i64,
+    user_id: Uuid,
+    title: Value,
+) -> (StatusCode, Value) {
+    send_http(
+        &t.app,
+        "POST",
+        &format!("/api/groups/{conversation_id}/members/{user_id}/title"),
+        Some(access),
+        Some(json!({ "title": title })),
+    )
+    .await
+}
+
+/// Creates the direct conversation `creator -> peer_username` over HTTP;
+/// returns the numeric conversation id.
+async fn create_direct(t: &TestApp, creator_access: &str, peer_username: &str) -> i64 {
+    let (status, body) = send_http(
+        &t.app,
+        "POST",
+        "/api/conversations",
+        Some(creator_access),
+        Some(json!({ "peer_username": peer_username })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    body["conversation_id"]
+        .as_i64()
+        .expect("conversation_id")
+}
+
+/// Reads a member's group economy row: `(group_xp, group_level, msg_xp_today)`.
+async fn member_economy(t: &TestApp, conversation_id: i64, user_id: Uuid) -> (i64, i32, i32) {
+    sqlx::query_as(
+        "SELECT group_xp, group_level, msg_xp_today FROM conversation_members \
+         WHERE conversation_id = $1 AND user_id = $2",
+    )
+    .bind(conversation_id)
+    .bind(user_id)
+    .fetch_one(&t.pool)
+    .await
+    .expect("member economy row")
+}
+
+/// Polls `cond` until true or `timeout` elapses (fire-and-forget XP tasks).
+async fn eventually<F, Fut>(mut cond: F, timeout: Duration, what: &str)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let deadline = Instant::now() + timeout;
+    loop {
+        if cond().await {
+            return;
+        }
+        if Instant::now() >= deadline {
+            panic!("timed out waiting for {what}");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 /// Invites `username` and returns the created `invite_id` string.
 async fn invite_ok(t: &TestApp, access: &str, conversation_id: i64, username: &str) -> String {
     let (status, body) = invite(t, access, conversation_id, username).await;
@@ -449,8 +532,34 @@ async fn ws_send_text_message(ws: &mut WsClient, conversation_id: i64, body: &st
     }
 }
 
-fn expect_msg_new(frame: Frame) -> MsgNew {
-    match frame.payload {
+/// Sends one FORWARDED `msg.send` (forward flag set, deliberately non-empty
+/// body) and returns the acked message_id.
+async fn ws_send_forward_message(
+    ws: &mut WsClient,
+    conversation_id: i64,
+    forward_of_message_id: Uuid,
+    body: &str,
+) -> Uuid {
+    let client_msg_id = Uuid::now_v7();
+    let frame = Frame {
+        v: PROTOCOL_VERSION,
+        payload: Payload::MsgSend(MsgSend {
+            conversation_id,
+            client_msg_id,
+            body: body.to_owned(),
+            reply_to: None,
+            media: None,
+            forward_of_message_id: Some(forward_of_message_id),
+        }),
+    };
+    ws_send_text(ws, &serde_json::to_string(&frame).unwrap()).await;
+    match ws_next_frame(ws).await.payload {
+        Payload::MsgAck(MsgAck { message_id, .. }) => message_id,
+        other => panic!("expected msg.ack, got {other:?}"),
+    }
+}
+
+fn expect_msg_new(frame: Frame) -> MsgNew {    match frame.payload {
         Payload::MsgNew(msg) => msg,
         other => panic!("expected msg.new, got {other:?}"),
     }
@@ -1081,3 +1190,426 @@ async fn role_transfer_and_kick_broadcast_group_updated() {
 
     assert!(list_conversations(&t, &c_access).await.is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// Tests: M12a group settings (name / description / avatar)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn group_settings_permissions_and_get_reflection() {
+    let _guard = GATE.lock().await;
+    let t = test_app().await;
+    let (_owner_id, owner_access) = register_user(&t, "gs-a@example.com", "gsa").await;
+    let (admin_id, admin_access) = register_user(&t, "gs-b@example.com", "gsb").await;
+    let (_member_id, member_access) = register_user(&t, "gs-c@example.com", "gsc").await;
+    let (_outsider_id, outsider_access) = register_user(&t, "gs-d@example.com", "gsd").await;
+
+    let conversation_id = group_with_members(
+        &t,
+        &owner_access,
+        "gsa",
+        &[
+            ("gsb", admin_access.as_str()),
+            ("gsc", member_access.as_str()),
+        ],
+    )
+    .await;
+    let (status, body) = set_role(&t, &owner_access, conversation_id, admin_id, "admin").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let mut ws_owner = ws_connect(&t, &owner_access).await;
+
+    // Owner renames (trimmed) → ok, and every member gets group.updated.
+    let (status, body) = patch_group(
+        &t,
+        &owner_access,
+        conversation_id,
+        json!({ "name": "  新群名  " }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["ok"], json!(true));
+    expect_group_updated(ws_next_frame(&mut ws_owner).await, conversation_id);
+
+    // Admin cannot rename.
+    let (status, body) = patch_group(
+        &t,
+        &admin_access,
+        conversation_id,
+        json!({ "name": "admin-rename" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+
+    // Admin CAN set description + avatar.
+    let avatar = "data:image/png;base64,aGVsbG8=";
+    let (status, body) = patch_group(
+        &t,
+        &admin_access,
+        conversation_id,
+        json!({ "description": "群简介", "avatar": avatar }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // Plain member cannot edit.
+    let (status, body) = patch_group(
+        &t,
+        &member_access,
+        conversation_id,
+        json!({ "description": "nope" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+
+    // Non-member sees a plain 404 (no oracle).
+    let (status, _) = patch_group(
+        &t,
+        &outsider_access,
+        conversation_id,
+        json!({ "description": "sneaky" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // GET reflects the committed profile.
+    let (status, body) = get_group(&t, &member_access, conversation_id).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["name"], "新群名");
+    assert_eq!(body["description"], "群简介");
+    assert_eq!(body["avatar"], avatar);
+}
+
+#[tokio::test]
+async fn group_settings_validate_description_and_avatar() {
+    let _guard = GATE.lock().await;
+    let t = test_app().await;
+    let (_owner_id, owner_access) = register_user(&t, "gv-a@example.com", "gva").await;
+
+    let created = create_group(&t, &owner_access, "校验组", &[]).await;
+    let conversation_id = created["conversation_id"].as_i64().unwrap();
+
+    // Description at the 200-char limit is accepted; 201 is rejected.
+    let ok_desc = "字".repeat(200);
+    let (status, body) = patch_group(
+        &t,
+        &owner_access,
+        conversation_id,
+        json!({ "description": ok_desc }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let too_long = "字".repeat(201);
+    let (status, body) = patch_group(
+        &t,
+        &owner_access,
+        conversation_id,
+        json!({ "description": too_long }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+
+    // Bad avatar shapes are rejected: not a data URL, wrong mime, oversize.
+    for bad in [
+        json!("not-a-data-url"),
+        json!("data:image/gif;base64,AAAA"),
+        json!(format!("data:image/png;base64,{}", "A".repeat(256 * 1024 + 1))),
+    ] {
+        let (status, body) = patch_group(
+            &t,
+            &owner_access,
+            conversation_id,
+            json!({ "avatar": bad }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    }
+
+    // Empty avatar clears it.
+    let (status, body) = patch_group(&t, &owner_access, conversation_id, json!({ "avatar": "" })).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, body) = get_group(&t, &owner_access, conversation_id).await;
+    assert_eq!(body["avatar"], "");
+    assert_eq!(body["description"], ok_desc, "description persisted");
+}
+
+// ---------------------------------------------------------------------------
+// Tests: M12a member titles
+// ---------------------------------------------------------------------------
+
+/// Convenience: the member object for `user_id` from a GET group body.
+fn member_of(body: &Value, user_id: Uuid) -> Value {
+    body["members"]
+        .as_array()
+        .expect("members")
+        .iter()
+        .find(|m| m["user_id"] == json!(user_id))
+        .cloned()
+        .expect("member present")
+}
+
+#[tokio::test]
+async fn group_title_owner_controls_member_titles() {
+    let _guard = GATE.lock().await;
+    let t = test_app().await;
+    let (owner_id, owner_access) = register_user(&t, "gt2-a@example.com", "gt2a").await;
+    let (admin_id, admin_access) = register_user(&t, "gt2-b@example.com", "gt2b").await;
+    let (member_id, member_access) = register_user(&t, "gt2-c@example.com", "gt2c").await;
+
+    let conversation_id = group_with_members(
+        &t,
+        &owner_access,
+        "gt2a",
+        &[
+            ("gt2b", admin_access.as_str()),
+            ("gt2c", member_access.as_str()),
+        ],
+    )
+    .await;
+    let (status, body) = set_role(&t, &owner_access, conversation_id, admin_id, "admin").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let mut ws_member = ws_connect(&t, &member_access).await;
+
+    // Owner sets a custom title → ok; members are notified; GET shows both
+    // the resolved `title` and the raw `custom_title`.
+    let (status, body) = set_title(
+        &t,
+        &owner_access,
+        conversation_id,
+        member_id,
+        json!("挖矿达人"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["ok"], json!(true));
+    expect_group_updated(ws_next_frame(&mut ws_member).await, conversation_id);
+
+    let (_, group) = get_group(&t, &owner_access, conversation_id).await;
+    let member = member_of(&group, member_id);
+    assert_eq!(member["title"], "挖矿达人");
+    assert_eq!(member["custom_title"], "挖矿达人");
+
+    // Exactly 16 characters is accepted; 17 is rejected.
+    let ok16 = "a".repeat(16);
+    let (status, body) =
+        set_title(&t, &owner_access, conversation_id, member_id, json!(ok16)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let too17 = "a".repeat(17);
+    let (status, body) =
+        set_title(&t, &owner_access, conversation_id, member_id, json!(too17)).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+
+    // Null clears (stored NULL → tier title returns).
+    let (status, body) = set_title(&t, &owner_access, conversation_id, member_id, json!(null)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, group) = get_group(&t, &owner_access, conversation_id).await;
+    let member = member_of(&group, member_id);
+    assert!(member["custom_title"].is_null());
+    assert_eq!(member["title"], "木头", "level-1 member falls back to tier");
+
+    // Cannot title the owner's own row.
+    let (status, body) = set_title(
+        &t,
+        &owner_access,
+        conversation_id,
+        owner_id,
+        json!("老板"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+
+    // Non-owner (even admin) cannot set titles.
+    let (status, body) = set_title(
+        &t,
+        &admin_access,
+        conversation_id,
+        member_id,
+        json!("越权"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+
+    // Unknown target → 404.
+    let (status, _) = set_title(
+        &t,
+        &owner_access,
+        conversation_id,
+        Uuid::now_v7(),
+        json!("幽灵"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn group_title_display_resolution_precedence() {
+    let _guard = GATE.lock().await;
+    let t = test_app().await;
+    let (owner_id, owner_access) = register_user(&t, "gt3-a@example.com", "gt3a").await;
+    let (admin_id, admin_access) = register_user(&t, "gt3-b@example.com", "gt3b").await;
+    let (member_id, member_access) = register_user(&t, "gt3-c@example.com", "gt3c").await;
+
+    let conversation_id = group_with_members(
+        &t,
+        &owner_access,
+        "gt3a",
+        &[
+            ("gt3b", admin_access.as_str()),
+            ("gt3c", member_access.as_str()),
+        ],
+    )
+    .await;
+    let (status, body) = set_role(&t, &owner_access, conversation_id, admin_id, "admin").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // Defaults: owner → 群主, admin → 管理员, member → tier title.
+    let (_, group) = get_group(&t, &member_access, conversation_id).await;
+    assert_eq!(member_of(&group, owner_id)["title"], "群主");
+    assert_eq!(member_of(&group, admin_id)["title"], "管理员");
+    assert_eq!(member_of(&group, member_id)["title"], "木头");
+    assert!(member_of(&group, admin_id)["custom_title"].is_null());
+
+    // Custom overrides the ROLE label for an admin too (custom → role → tier).
+    let (status, _) = set_title(
+        &t,
+        &owner_access,
+        conversation_id,
+        admin_id,
+        json!("管理员老王"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = set_title(
+        &t,
+        &owner_access,
+        conversation_id,
+        member_id,
+        json!("新人"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (_, group) = get_group(&t, &member_access, conversation_id).await;
+    let admin = member_of(&group, admin_id);
+    assert_eq!(admin["title"], "管理员老王");
+    assert_eq!(admin["custom_title"], "管理员老王");
+    let member = member_of(&group, member_id);
+    assert_eq!(member["title"], "新人");
+    assert_eq!(member["custom_title"], "新人");
+    // Owner is never custom-titled.
+    let owner = member_of(&group, owner_id);
+    assert_eq!(owner["title"], "群主");
+    assert!(owner["custom_title"].is_null());
+
+    // Clearing the admin's title restores the role label.
+    let (status, _) = set_title(&t, &owner_access, conversation_id, admin_id, json!(null)).await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, group) = get_group(&t, &owner_access, conversation_id).await;
+    assert_eq!(member_of(&group, admin_id)["title"], "管理员");
+}
+
+// ---------------------------------------------------------------------------
+// Tests: M12a group XP economy
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn group_xp_accrues_and_daily_cap_stops_awards() {
+    let _guard = GATE.lock().await;
+    let t = test_app().await;
+    let (owner_id, owner_access) = register_user(&t, "gx2-a@example.com", "gx2a").await;
+    let (member_id, member_access) = register_user(&t, "gx2-b@example.com", "gx2b").await;
+
+    let conversation_id = group_with_members(
+        &t,
+        &owner_access,
+        "gx2a",
+        &[("gx2b", member_access.as_str())],
+    )
+    .await;
+
+    let mut ws_member = ws_connect(&t, &member_access).await;
+
+    // Five plaintext sends = 50 group XP = exactly the level-2 threshold.
+    for i in 0..5 {
+        ws_send_text_message(&mut ws_member, conversation_id, &format!("消息 {i}")).await;
+    }
+    eventually(
+        || async {
+            let (xp, level, today) = member_economy(&t, conversation_id, member_id).await;
+            xp == 50 && level == 2 && today == 50
+        },
+        Duration::from_secs(5),
+        "member group_xp to reach 50 / level 2",
+    )
+    .await;
+
+    // The owner (who sent nothing) earned nothing.
+    let (owner_xp, _owner_level, _) = member_economy(&t, conversation_id, owner_id).await;
+    assert_eq!(owner_xp, 0);
+
+    // Daily cap: force today's budget to the 200 ceiling, then one more send
+    // must be a no-op (this replaces sending 20+ messages in the test).
+    let today = time::OffsetDateTime::now_utc().date();
+    sqlx::query(
+        "UPDATE conversation_members SET msg_xp_today = 200, msg_xp_date = $3 \
+         WHERE conversation_id = $1 AND user_id = $2",
+    )
+    .bind(conversation_id)
+    .bind(member_id)
+    .bind(today)
+    .execute(&t.pool)
+    .await
+    .expect("force daily budget to cap");
+
+    ws_send_text_message(&mut ws_member, conversation_id, "封顶后").await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let (xp, level, today_xp) = member_economy(&t, conversation_id, member_id).await;
+    assert_eq!(xp, 50, "capped award must not grow group_xp");
+    assert_eq!(level, 2);
+    assert_eq!(today_xp, 200, "budget stays at the cap");
+}
+
+#[tokio::test]
+async fn group_xp_skips_forwarded_and_direct_messages() {
+    let _guard = GATE.lock().await;
+    let t = test_app().await;
+    let (_owner_id, owner_access) = register_user(&t, "gx3-a@example.com", "gx3a").await;
+    let (member_id, member_access) = register_user(&t, "gx3-b@example.com", "gx3b").await;
+
+    let conversation_id = group_with_members(
+        &t,
+        &owner_access,
+        "gx3a",
+        &[("gx3b", member_access.as_str())],
+    )
+    .await;
+
+    let mut ws_member = ws_connect(&t, &member_access).await;
+
+    // One plaintext send earns 10; a forwarded send (even with a non-empty
+    // body) earns 0.
+    let (_, source_message_id) =
+        ws_send_text_message(&mut ws_member, conversation_id, "原始消息").await;
+    eventually(
+        || async { member_economy(&t, conversation_id, member_id).await.0 == 10 },
+        Duration::from_secs(5),
+        "member group_xp to reach 10",
+    )
+    .await;
+
+    ws_send_forward_message(&mut ws_member, conversation_id, source_message_id, "转发也不涨").await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let (xp, _level, today_xp) = member_economy(&t, conversation_id, member_id).await;
+    assert_eq!(xp, 10, "forwarded messages award no group XP");
+    assert_eq!(today_xp, 10, "forwarded sends consume no daily budget");
+
+    // Direct conversations award no GROUP xp at all.
+    let direct_id = create_direct(&t, &member_access, "gx3a").await;
+    ws_send_text_message(&mut ws_member, direct_id, "私聊消息").await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let (direct_xp, direct_level, _) = member_economy(&t, direct_id, member_id).await;
+    assert_eq!(direct_xp, 0, "direct chats earn no group XP");
+    assert_eq!(direct_level, 1);
+}
+

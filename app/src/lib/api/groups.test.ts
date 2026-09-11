@@ -10,7 +10,9 @@ import {
   kickGroupMember,
   leaveGroup,
   listGroupInvites,
+  patchGroup,
   setGroupMemberRole,
+  setGroupMemberTitle,
   transferGroupOwnership,
 } from "./groups";
 import { i18n } from "../../i18n";
@@ -128,6 +130,46 @@ describe("groups API — 建群与成员管理", () => {
       String((fetchMock.mock.calls[3]?.[1] as RequestInit).body),
     );
     expect(transferBody).toEqual({ user_id: "u3" });
+  });
+
+  it("patchGroup PATCHes only the provided settings fields", async () => {
+    fetchMock.mockResolvedValue(
+      jsonResponse(200, {
+        conversation_id: 5,
+        name: "团队",
+        description: "新简介",
+        avatar: "",
+        my_role: "owner",
+        member_count: 1,
+        members: [],
+      }),
+    );
+
+    await patchGroup("tok", 5, { description: "新简介", avatar: "" });
+
+    const [path, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(path).toBe("/api/groups/5");
+    expect(init.method).toBe("PATCH");
+    expect(JSON.parse(String(init.body))).toEqual({
+      description: "新简介",
+      avatar: "",
+    });
+    expect((init.headers as Headers).get("Authorization")).toBe("Bearer tok");
+  });
+
+  it("setGroupMemberTitle POSTs the custom title, null clearing it", async () => {
+    fetchMock.mockResolvedValue(new Response(null, { status: 200 }));
+
+    await setGroupMemberTitle("tok", 5, "u2", "大佬");
+    await setGroupMemberTitle("tok", 5, "u2", null);
+
+    const [path, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(path).toBe("/api/groups/5/members/u2/title");
+    expect(init.method).toBe("POST");
+    expect(JSON.parse(String(init.body))).toEqual({ title: "大佬" });
+
+    const [, clearInit] = fetchMock.mock.calls[1] as [string, RequestInit];
+    expect(JSON.parse(String(clearInit.body))).toEqual({ title: null });
   });
 });
 

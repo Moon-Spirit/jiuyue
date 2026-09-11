@@ -7,13 +7,16 @@ import {
   kickGroupMember,
   leaveGroup as apiLeaveGroup,
   listGroupInvites,
+  patchGroup,
   setGroupMemberRole,
+  setGroupMemberTitle,
   transferGroupOwnership,
 } from "../lib/api/groups";
 import type {
   GroupInfo,
   GroupInvite,
   GroupMember,
+  GroupPatch,
   GroupRole,
 } from "../lib/api/groups";
 import { ApiError } from "../lib/api/client";
@@ -197,6 +200,33 @@ export const useGroupsStore = defineStore("groups", {
       userId: string,
     ): Promise<void> {
       await transferGroupOwnership(await this.token(), conversationId, userId);
+      await this.fetchInfo(conversationId);
+    },
+
+    /**
+     * PATCH group settings (name / description / avatar) then refetch the
+     * authoritative info. Errors propagate so the caller can surface them.
+     */
+    async updateGroup(
+      conversationId: number,
+      patch: GroupPatch,
+    ): Promise<GroupInfo | null> {
+      await patchGroup(await this.token(), conversationId, patch);
+      return this.fetchInfo(conversationId);
+    },
+
+    /** Owner assigns (or clears) another member's custom title, then refetches. */
+    async setMemberTitle(
+      conversationId: number,
+      userId: string,
+      title: string | null,
+    ): Promise<void> {
+      await setGroupMemberTitle(
+        await this.token(),
+        conversationId,
+        userId,
+        title,
+      );
       await this.fetchInfo(conversationId);
     },
 

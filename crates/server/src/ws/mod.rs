@@ -519,6 +519,19 @@ async fn handle_frame(
                     // sends an empty body).
                     if outcome.media.is_none() && send.forward_of_message_id.is_none() {
                         spawn_message_xp(state, sender_id, send.conversation_id, &send.body);
+                        // M12a group XP: plaintext text sends in a `kind='group'`
+                        // conversation earn +10 group-local XP (daily cap 200).
+                        // The media/forward guard above already excludes media
+                        // and forwards; the spawn fn additionally short-circuits
+                        // empty bodies and forwards, and the award fn re-checks
+                        // the conversation kind. Never fails the acked send.
+                        spawn_group_message_xp(
+                            state,
+                            sender_id,
+                            send.conversation_id,
+                            &send.body,
+                            send.forward_of_message_id.is_some(),
+                        );
                     }
                 }
                 Flow::Continue
@@ -1584,6 +1597,38 @@ fn spawn_message_xp(state: &AppState, sender_id: Uuid, conversation_id: i64, bod
 /// Cuts a plaintext string to at most `max` chars (char-boundary safe).
 fn truncate_chars(s: &str, max: usize) -> String {
     s.chars().take(max).collect()
+}
+
+/// Fire-and-forget group-local messaging-XP award (M12a). Mirrors
+/// [`spawn_message_xp`]: spawned after the send committed + acked, so a
+/// failure here is a logged no-op and never fails the send path.
+///
+/// A forwarded message carries no new content, and a media/empty message has
+/// no plaintext to measure — both earn 0 and skip the DB round-trip. The
+/// award fn itself re-checks that the conversation is a group and applies the
+/// per-day cap.
+fn spawn_group_message_xp(
+    state: &AppState,
+    sender_id: Uuid,
+    conversation_id: i64,
+    body: &str,
+    forwarded: bool,
+) {
+    if forwarded || body.chars().count() == 0 {
+        return;
+    }
+    let pool = state.pool.clone();
+    tokio::spawn(async move {
+        let result = crate::groups::award_group_message_xp(&pool, sender_id, conversation_id).await;
+        if let Err(err) = result {
+            tracing::warn!(
+                %sender_id,
+                %conversation_id,
+                error = %format!("{err:#}"),
+                "group message xp award failed"
+            );
+        }
+    });
 }
 
 /// Rejection type for member-gated ephemeral frames (`read.update`, `typing`).

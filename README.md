@@ -8,6 +8,10 @@
 [![Database](https://img.shields.io/badge/db-PostgreSQL%2016%20%2B%20Redis-4169E1?logo=postgresql&logoColor=white)](deploy/)
 [![Status](https://img.shields.io/badge/status-MVP%20active-brightgreen)](#)
 
+> **本项目由 Lecway | 联维云 独家赞助**
+>
+> **Exclusively sponsored by Lecway | 联维云**
+
 - 前端：Vite 7 + Vue 3 + TypeScript + Pinia + Tailwind CSS v4
 - 壳：Tauri 2（Windows / macOS / Linux，iOS / Android 规划）
 - 后端：Rust（axum + tokio）+ PostgreSQL 16 + Redis
@@ -57,3 +61,9 @@ cd app && pnpm typecheck && pnpm test
 | `migrations/`     | PostgreSQL 迁移（sqlx）                                 |
 | `docs/`           | 规格 / 任务票 / 调研报告                                |
 | `deploy/`         | Docker Compose 与本机开发脚本                           |
+
+## 赞助
+
+本项目由 **Lecway | 联维云** 独家赞助。
+
+Exclusively sponsored by **Lecway | 联维云**.

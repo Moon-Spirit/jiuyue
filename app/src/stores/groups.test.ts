@@ -79,6 +79,44 @@ describe("groups store — 群信息缓存与成员身份映射", () => {
     const paths = fetchMock.mock.calls.map(([p]) => p);
     expect(paths).toEqual(["/api/groups/5/members/u2/kick", "/api/groups/5"]);
   });
+
+  it("updateGroup 先 PATCH 设置再重新拉取群信息", async () => {
+    fetchMock.mockResolvedValue(jsonResponse(200, groupInfo));
+    const groups = useGroupsStore();
+
+    await groups.updateGroup(5, { description: "新简介" });
+
+    const calls = fetchMock.mock.calls.map(
+      ([p, i]) => [p, (i as RequestInit).method] as const,
+    );
+    expect(calls).toEqual([
+      ["/api/groups/5", "PATCH"],
+      ["/api/groups/5", "GET"],
+    ]);
+    const body = JSON.parse(
+      String((fetchMock.mock.calls[0]?.[1] as RequestInit).body),
+    );
+    expect(body).toEqual({ description: "新简介" });
+  });
+
+  it("setMemberTitle 先 POST 头衔再重新拉取群信息", async () => {
+    fetchMock.mockResolvedValue(jsonResponse(200, groupInfo));
+    const groups = useGroupsStore();
+
+    await groups.setMemberTitle(5, "u2", "大佬");
+
+    const calls = fetchMock.mock.calls.map(
+      ([p, i]) => [p, (i as RequestInit).method] as const,
+    );
+    expect(calls).toEqual([
+      ["/api/groups/5/members/u2/title", "POST"],
+      ["/api/groups/5", "GET"],
+    ]);
+    const body = JSON.parse(
+      String((fetchMock.mock.calls[0]?.[1] as RequestInit).body),
+    );
+    expect(body).toEqual({ title: "大佬" });
+  });
 });
 
 describe("groups store — 邀请生命周期", () => {

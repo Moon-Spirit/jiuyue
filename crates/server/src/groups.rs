@@ -32,6 +32,10 @@
 
 use crate::auth::extract::AuthUser;
 use crate::error::{AppError, ConflictKind};
+use crate::groups_titles::{
+    CUSTOM_TITLE_MAX_CHARS, GROUP_XP_DAILY_CAP, GROUP_XP_PER_MESSAGE, group_level_from_xp,
+    resolve_member_title,
+};
 use crate::state::AppState;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, State};
@@ -41,12 +45,16 @@ use axum::{Json, Router};
 use jiuyue_protocol::{GroupInvited, Payload, UserIdentity};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use time::Date;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use uuid::Uuid;
 
 /// Group names are trimmed and capped at this many characters.
 const GROUP_NAME_MAX_CHARS: usize = 32;
+
+/// Group descriptions are capped at this many characters (profile bio parity).
+const GROUP_DESCRIPTION_MAX_CHARS: usize = 200;
 
 /// Group routes nested under `/api/groups`.
 pub fn router() -> Router<AppState> {
@@ -55,10 +63,14 @@ pub fn router() -> Router<AppState> {
         .route("/invites", get(list_my_invites))
         .route("/invites/{invite_id}/accept", post(accept_invite))
         .route("/invites/{invite_id}/decline", post(decline_invite))
-        .route("/{conversation_id}", get(get_group))
+        .route("/{conversation_id}", get(get_group).patch(update_group))
         .route("/{conversation_id}/invites", post(invite_member))
         .route("/{conversation_id}/members/{user_id}/kick", post(kick_member))
         .route("/{conversation_id}/members/{user_id}/role", post(set_role))
+        .route(
+            "/{conversation_id}/members/{user_id}/title",
+            post(set_member_title),
+        )
         .route("/{conversation_id}/transfer", post(transfer_ownership))
         .route("/{conversation_id}/leave", post(leave_group))
 }
@@ -134,6 +146,22 @@ async fn group_name(state: &AppState, conversation_id: i64) -> Result<Option<Str
         .fetch_optional(&state.pool)
         .await
         .map_err(AppError::internal)
+}
+
+/// Loads the group profile triple `(name, description, avatar)` for a
+/// `kind='group'` conversation; `None` for a non-group or missing row.
+async fn group_profile(
+    state: &AppState,
+    conversation_id: i64,
+) -> Result<Option<(Option<String>, String, String)>, AppError> {
+    sqlx::query_as(
+        "SELECT name, description, avatar FROM conversations \
+         WHERE id = $1 AND kind = 'group'",
+    )
+    .bind(conversation_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(AppError::internal)
 }
 
 // ---------------------------------------------------------------------------
@@ -277,12 +305,24 @@ pub struct GroupMemberItem {
     pub avatar: String,
     pub role: String,
     pub joined_at: String,
+    /// Group-local XP total and level (M12a); level is the domain curve applied
+    /// to `group_xp`.
+    pub group_xp: i64,
+    pub group_level: i64,
+    /// Resolved display title: custom (if set) → role label → level tier.
+    pub title: String,
+    /// Raw stored custom title, `null` when the member has none.
+    pub custom_title: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct GetGroupResponse {
     pub conversation_id: i64,
     pub name: Option<String>,
+    /// Group blurb (empty when unset).
+    pub description: String,
+    /// Group avatar data-URL (empty when unset).
+    pub avatar: String,
     pub my_role: String,
     pub member_count: i64,
     pub members: Vec<GroupMemberItem>,
@@ -293,8 +333,8 @@ pub async fn get_group(
     user: AuthUser,
     Path(conversation_id): Path<i64>,
 ) -> Result<Json<GetGroupResponse>, AppError> {
-    let name = group_name(&state, conversation_id).await?;
-    let Some(name) = name else {
+    let profile = group_profile(&state, conversation_id).await?;
+    let Some((name, description, avatar)) = profile else {
         return Err(AppError::ResourceNotFound);
     };
     let my_role = member_role(&state, conversation_id, user.0).await?;
@@ -302,9 +342,20 @@ pub async fn get_group(
         return Err(AppError::ResourceNotFound);
     };
 
-    type Row = (Uuid, String, String, String, String, OffsetDateTime);
+    type Row = (
+        Uuid,
+        String,
+        String,
+        String,
+        String,
+        OffsetDateTime,
+        Option<String>,
+        i64,
+        i32,
+    );
     let rows: Vec<Row> = sqlx::query_as(
-        "SELECT cm.user_id, u.username, u.display_name, u.avatar, cm.role, cm.joined_at \
+        "SELECT cm.user_id, u.username, u.display_name, u.avatar, cm.role, cm.joined_at, \
+                cm.custom_title, cm.group_xp, cm.group_level \
          FROM conversation_members cm \
          JOIN users u ON u.id = cm.user_id \
          WHERE cm.conversation_id = $1 \
@@ -318,7 +369,11 @@ pub async fn get_group(
 
     let member_count = rows.len() as i64;
     let mut members = Vec::with_capacity(rows.len());
-    for (user_id, username, display_name, avatar, role, joined_at) in rows {
+    for (user_id, username, display_name, avatar, role, joined_at, custom_title, group_xp, raw_level)
+        in rows
+    {
+        let group_level = i64::from(raw_level);
+        let title = resolve_member_title(custom_title.as_deref(), &role, group_level);
         members.push(GroupMemberItem {
             user_id,
             display_name: crate::profile::effective_display_name(&display_name, &username),
@@ -326,16 +381,209 @@ pub async fn get_group(
             avatar,
             role,
             joined_at: rfc3339(joined_at)?,
+            group_xp,
+            group_level,
+            title,
+            custom_title,
         });
     }
 
     Ok(Json(GetGroupResponse {
         conversation_id,
-        name: Some(name),
+        name,
+        description,
+        avatar,
         my_role,
         member_count,
         members,
     }))
+}
+
+// ---------------------------------------------------------------------------
+// PATCH /{conversation_id} — update group name / description / avatar
+// ---------------------------------------------------------------------------
+
+/// Group settings PATCH body: every field optional; only present fields
+/// change. Empty `description`/`avatar` clears them; `name` must stay
+/// non-empty.
+#[derive(Debug, Deserialize, Default)]
+pub struct UpdateGroupRequest {
+    /// Trimmed, 1..=32 characters. Owner only.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// ≤200 characters; empty clears. Owner or admin.
+    #[serde(default)]
+    pub description: Option<String>,
+    /// `data:image/{png|jpeg|webp};base64,…` (same rule as user avatars);
+    /// empty clears. Owner or admin.
+    #[serde(default)]
+    pub avatar: Option<String>,
+}
+
+/// Generic `{ "ok": true }` acknowledgement for group setting/title writes.
+#[derive(Debug, Serialize)]
+pub struct GroupOkResponse {
+    pub ok: bool,
+}
+
+pub async fn update_group(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(conversation_id): Path<i64>,
+    payload: Result<Json<UpdateGroupRequest>, JsonRejection>,
+) -> Result<Json<GroupOkResponse>, AppError> {
+    let Json(req) = payload.map_err(|rejection| AppError::BadRequest(rejection.body_text()))?;
+
+    let requester_role = group_role(&state, conversation_id, user.0).await?;
+    let Some(requester_role) = requester_role else {
+        return Err(AppError::ResourceNotFound);
+    };
+
+    // Name is owner-only; description/avatar are owner OR admin.
+    if req.name.is_some() && requester_role != "owner" {
+        return Err(AppError::Forbidden(
+            "only the group owner may rename the group".to_owned(),
+        ));
+    }
+    if (req.description.is_some() || req.avatar.is_some())
+        && requester_role != "owner"
+        && requester_role != "admin"
+    {
+        return Err(AppError::Forbidden(
+            "only the owner or an admin may edit the group profile".to_owned(),
+        ));
+    }
+
+    let Some((cur_name, cur_description, cur_avatar)) =
+        group_profile(&state, conversation_id).await?
+    else {
+        return Err(AppError::ResourceNotFound);
+    };
+
+    let name = match req.name {
+        Some(raw) => {
+            let trimmed = raw.trim().to_owned();
+            if trimmed.is_empty() || trimmed.chars().count() > GROUP_NAME_MAX_CHARS {
+                return Err(AppError::Validation(format!(
+                    "group name must be 1..={GROUP_NAME_MAX_CHARS} characters"
+                )));
+            }
+            Some(trimmed)
+        }
+        None => cur_name,
+    };
+
+    let description = match req.description {
+        Some(raw) => {
+            if raw.chars().count() > GROUP_DESCRIPTION_MAX_CHARS {
+                return Err(AppError::Validation(format!(
+                    "description must be at most {GROUP_DESCRIPTION_MAX_CHARS} characters"
+                )));
+            }
+            raw
+        }
+        None => cur_description,
+    };
+
+    let avatar = match req.avatar {
+        Some(raw) => {
+            // Empty clears; anything else must be a valid custom data-URL.
+            if !raw.is_empty() && !crate::profile::is_valid_custom_avatar(&raw) {
+                return Err(AppError::Validation(
+                    "avatar must be a data:image/(png|jpeg|webp);base64 URL, or empty to clear"
+                        .to_owned(),
+                ));
+            }
+            raw
+        }
+        None => cur_avatar,
+    };
+
+    sqlx::query(
+        "UPDATE conversations SET name = $1, description = $2, avatar = $3 \
+         WHERE id = $4 AND kind = 'group'",
+    )
+    .bind(&name)
+    .bind(&description)
+    .bind(&avatar)
+    .bind(conversation_id)
+    .execute(&state.pool)
+    .await
+    .map_err(AppError::internal)?;
+
+    crate::ws::broadcast_group_updated(&state, conversation_id).await;
+    tracing::info!(%conversation_id, actor = %user.0, "group settings updated");
+    Ok(Json(GroupOkResponse { ok: true }))
+}
+
+// ---------------------------------------------------------------------------
+// POST /{conversation_id}/members/{user_id}/title — owner sets a custom title
+// ---------------------------------------------------------------------------
+
+/// Body for the title endpoint: `null` (or omitted/empty) clears the title.
+#[derive(Debug, Deserialize, Default)]
+pub struct SetTitleRequest {
+    #[serde(default)]
+    pub title: Option<String>,
+}
+
+pub async fn set_member_title(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path((conversation_id, target_id)): Path<(i64, Uuid)>,
+    payload: Result<Json<SetTitleRequest>, JsonRejection>,
+) -> Result<Json<GroupOkResponse>, AppError> {
+    let Json(req) = payload.map_err(|rejection| AppError::BadRequest(rejection.body_text()))?;
+
+    let requester_role = group_role(&state, conversation_id, user.0).await?;
+    let Some(requester_role) = requester_role else {
+        return Err(AppError::ResourceNotFound);
+    };
+    if requester_role != "owner" {
+        return Err(AppError::Forbidden(
+            "only the group owner may set member titles".to_owned(),
+        ));
+    }
+
+    let target_role = member_role(&state, conversation_id, target_id).await?;
+    let Some(target_role) = target_role else {
+        return Err(AppError::ResourceNotFound);
+    };
+    // The owner's own row always displays as 群主; a custom title is rejected.
+    if target_role == "owner" {
+        return Err(AppError::Validation(
+            "cannot set a custom title on the group owner".to_owned(),
+        ));
+    }
+
+    // Trim; empty/null clears (stored as NULL).
+    let title = req
+        .title
+        .map(|raw| raw.trim().to_owned())
+        .filter(|trimmed| !trimmed.is_empty());
+    if title
+        .as_ref()
+        .is_some_and(|t| t.chars().count() > CUSTOM_TITLE_MAX_CHARS)
+    {
+        return Err(AppError::Validation(format!(
+            "title must be at most {CUSTOM_TITLE_MAX_CHARS} characters"
+        )));
+    }
+
+    sqlx::query(
+        "UPDATE conversation_members SET custom_title = $1 \
+         WHERE conversation_id = $2 AND user_id = $3",
+    )
+    .bind(title.as_deref())
+    .bind(conversation_id)
+    .bind(target_id)
+    .execute(&state.pool)
+    .await
+    .map_err(AppError::internal)?;
+
+    crate::ws::broadcast_group_updated(&state, conversation_id).await;
+    tracing::info!(%conversation_id, actor = %user.0, target = %target_id, "group member title set");
+    Ok(Json(GroupOkResponse { ok: true }))
 }
 
 // ---------------------------------------------------------------------------
@@ -832,4 +1080,85 @@ pub async fn leave_group(
     crate::ws::broadcast_group_updated(&state, conversation_id).await;
     tracing::info!(%conversation_id, user = %user.0, "group member left");
     Ok(StatusCode::NO_CONTENT)
+}
+
+// ---------------------------------------------------------------------------
+// Group XP economy (called from the WS layer; best-effort)
+// ---------------------------------------------------------------------------
+
+/// Group-local messaging XP: +[`GROUP_XP_PER_MESSAGE`] for one plaintext text
+/// message sent in a `kind='group'` conversation, capped at
+/// [`GROUP_XP_DAILY_CAP`] per `(conversation, user)` per UTC day.
+///
+/// Mirrors the global `xp_accounts` writer pattern: the member row is locked
+/// `FOR UPDATE`, the daily budget rolls over when `msg_xp_date` is not today,
+/// and `group_level` is recomputed through the shared domain curve inside the
+/// same UPDATE. Secret/direct conversations award nothing (early return).
+/// Called as a fire-and-forget task after the send commits + acks, so any
+/// failure here degrades to a logged no-op and never fails the send.
+pub(crate) async fn award_group_message_xp(
+    pool: &sqlx::PgPool,
+    user_id: Uuid,
+    conversation_id: i64,
+) -> anyhow::Result<()> {
+    let kind: Option<String> = sqlx::query_scalar("SELECT kind FROM conversations WHERE id = $1")
+        .bind(conversation_id)
+        .fetch_optional(pool)
+        .await?;
+    let Some(kind) = kind else {
+        return Ok(()); // conversation vanished — nothing to do
+    };
+    if kind != "group" {
+        return Ok(()); // direct/secret chats earn no group XP
+    }
+
+    let today = OffsetDateTime::now_utc().date();
+    let mut tx = pool.begin().await?;
+    // Lazily nothing to create: membership rows exist for every member. Look
+    // the row up under a lock so concurrent sends serialize on one writer.
+    let row: Option<(i64, Option<Date>, i32)> = sqlx::query_as(
+        "SELECT group_xp, msg_xp_date, msg_xp_today FROM conversation_members \
+         WHERE conversation_id = $1 AND user_id = $2 FOR UPDATE",
+    )
+    .bind(conversation_id)
+    .bind(user_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some((group_xp, msg_xp_date, msg_xp_today)) = row else {
+        tx.commit().await?;
+        return Ok(()); // sender is no longer a member — award nothing
+    };
+
+    let used_today = if msg_xp_date == Some(today) {
+        i64::from(msg_xp_today)
+    } else {
+        0
+    };
+    let available = GROUP_XP_DAILY_CAP - used_today;
+    if available <= 0 {
+        tx.commit().await?;
+        return Ok(()); // daily cap reached
+    }
+    let actual = GROUP_XP_PER_MESSAGE.min(available);
+    let new_xp = group_xp + actual;
+    let new_level = group_level_from_xp(new_xp);
+    let new_today = (used_today + actual) as i32;
+
+    sqlx::query(
+        "UPDATE conversation_members \
+         SET group_xp = $1, group_level = $2, msg_xp_date = $3, msg_xp_today = $4 \
+         WHERE conversation_id = $5 AND user_id = $6",
+    )
+    .bind(new_xp)
+    .bind(new_level)
+    .bind(today)
+    .bind(new_today)
+    .bind(conversation_id)
+    .bind(user_id)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+
+    tracing::debug!(%user_id, %conversation_id, actual, new_xp, new_level, "group xp awarded");
+    Ok(())
 }

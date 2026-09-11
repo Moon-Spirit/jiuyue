@@ -66,7 +66,7 @@ fn is_valid_avatar(value: &str) -> bool {
 /// Custom uploads arrive as `data:image/{png|jpeg|webp};base64,…` strings.
 /// The decoder is lenient (a few hundred KB), so validation is a shape check
 /// plus a payload-size cap rather than a full re-decode.
-fn is_valid_custom_avatar(value: &str) -> bool {
+pub(crate) fn is_valid_custom_avatar(value: &str) -> bool {
     let Some(rest) = value.strip_prefix("data:image/") else {
         return false;
     };

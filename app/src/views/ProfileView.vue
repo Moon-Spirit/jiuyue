@@ -3,6 +3,7 @@ import { computed, onMounted, ref, watch } from "vue";
 import { useI18n } from "vue-i18n";
 import { useRoute, useRouter } from "vue-router";
 import Avatar from "../components/Avatar.vue";
+import { fileToAvatarDataUrl } from "../lib/avatarImage";
 import { AVATAR_EMOJIS } from "../lib/avatars";
 import { displayNameOf } from "../lib/identity";
 import { bandOf, progressInLevel, xpToNext } from "../lib/levels";
@@ -148,43 +149,6 @@ async function onAvatarFile(event: Event): Promise<void> {
     // Unsupported/undecodable image: silently keep the current draft. The
     // picker stays open so the user can retry with another file.
   }
-}
-
-const AVATAR_MAX_EDGE = 256;
-const AVATAR_JPEG_QUALITY = 0.85;
-
-function fileToAvatarDataUrl(file: File): Promise<string | null> {
-  return new Promise((resolve) => {
-    const url = URL.createObjectURL(file);
-    const image = new Image();
-    image.onload = () => {
-      try {
-        const scale = Math.min(
-          1,
-          AVATAR_MAX_EDGE / Math.max(image.naturalWidth, image.naturalHeight),
-        );
-        const canvas = document.createElement("canvas");
-        canvas.width = Math.max(1, Math.round(image.naturalWidth * scale));
-        canvas.height = Math.max(1, Math.round(image.naturalHeight * scale));
-        const ctx = canvas.getContext("2d");
-        if (ctx === null) {
-          resolve(null);
-          return;
-        }
-        ctx.drawImage(image, 0, 0, canvas.width, canvas.height);
-        resolve(canvas.toDataURL("image/jpeg", AVATAR_JPEG_QUALITY));
-      } catch {
-        resolve(null);
-      } finally {
-        URL.revokeObjectURL(url);
-      }
-    };
-    image.onerror = () => {
-      URL.revokeObjectURL(url);
-      resolve(null);
-    };
-    image.src = url;
-  });
 }
 
 async function saveEdits(): Promise<void> {
