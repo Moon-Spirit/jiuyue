@@ -12,22 +12,22 @@
 //! assertions pin the actual protocol shapes.
 
 use axum::{
+    Router,
     body::Body,
     http::{Request, StatusCode},
-    Router,
 };
 use futures_util::{SinkExt, StreamExt};
 use http_body_util::BodyExt;
-use jiuyue_protocol::{ErrorCode, Frame, MsgAck, MsgNew, MsgSend, Payload, PROTOCOL_VERSION};
+use jiuyue_protocol::{ErrorCode, Frame, MsgAck, MsgNew, MsgSend, PROTOCOL_VERSION, Payload};
 use jiuyue_server::crypto::BodyCipher;
 use jiuyue_server::state::AppState;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sqlx::{Connection, PgConnection, PgPool};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::LazyLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
-use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 use tokio::sync::Mutex;
 use tokio_tungstenite::tungstenite::Error as WsError;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
@@ -250,7 +250,8 @@ async fn ws_next_raw(ws: &mut WsClient) -> Option<WsMessage> {
 async fn ws_next_frame(ws: &mut WsClient) -> Frame {
     let msg = ws_next_raw(ws).await.expect("stream must stay open");
     let text = msg.to_text().expect("text frame").to_owned();
-    serde_json::from_str::<Frame>(&text).expect("wire frame must decode into jiuyue_protocol::Frame")
+    serde_json::from_str::<Frame>(&text)
+        .expect("wire frame must decode into jiuyue_protocol::Frame")
 }
 
 fn expect_error_code(frame: Frame, expected: ErrorCode) -> jiuyue_protocol::ErrorPayload {
@@ -296,7 +297,11 @@ async fn happy_path_direct_message_delivers_ack_and_live_msg_new() {
     assert!(conversation_id > 0);
     assert_eq!(conv["created"], json!(true));
     assert_eq!(conv["peer"]["user_id"], json!(b_id.to_string()));
-    assert_eq!(conv["peer"]["uid"], json!(b_uid), "create response carries the peer's uid");
+    assert_eq!(
+        conv["peer"]["uid"],
+        json!(b_uid),
+        "create response carries the peer's uid"
+    );
     assert_eq!(conv["peer"]["username"], json!("ben"));
 
     // B's create-or-get lands on the same row, flagged created=false.
@@ -304,7 +309,11 @@ async fn happy_path_direct_message_delivers_ack_and_live_msg_new() {
     assert_eq!(conv_again["conversation_id"], json!(conversation_id));
     assert_eq!(conv_again["created"], json!(false));
     assert_eq!(conv_again["peer"]["user_id"], json!(a_id.to_string()));
-    assert_eq!(conv_again["peer"]["uid"], json!(a_uid), "create-or-get carries the peer's uid");
+    assert_eq!(
+        conv_again["peer"]["uid"],
+        json!(a_uid),
+        "create-or-get carries the peer's uid"
+    );
 
     let mut ws_a = ws_connect(&t, &a_access).await;
     let mut ws_b = ws_connect(&t, &b_access).await;
@@ -318,6 +327,7 @@ async fn happy_path_direct_message_delivers_ack_and_live_msg_new() {
             client_msg_id,
             body: "\u{5728}\u{5417}\u{ff1f}".to_owned(),
             reply_to: None,
+            media: None,
         }),
     };
     ws_send_text(
@@ -335,10 +345,7 @@ async fn happy_path_direct_message_delivers_ack_and_live_msg_new() {
             duplicate,
         }) => {
             assert_eq!(got_cmid, client_msg_id);
-            assert_eq!(
-                seq, 1,
-                "first message in a fresh conversation gets seq 1"
-            );
+            assert_eq!(seq, 1, "first message in a fresh conversation gets seq 1");
             assert!(!duplicate);
             message_id
         }
@@ -375,6 +382,7 @@ async fn happy_path_direct_message_delivers_ack_and_live_msg_new() {
             client_msg_id: Uuid::now_v7(),
             body: "second".to_owned(),
             reply_to: None,
+            media: None,
         }),
     };
     ws_send_text(
@@ -415,6 +423,7 @@ async fn duplicate_client_msg_id_is_idempotent_down_to_one_db_row() {
                 client_msg_id,
                 body: "exactly once".to_owned(),
                 reply_to: None,
+                media: None,
             }),
         };
         ws_send_text(
@@ -483,6 +492,7 @@ async fn body_is_ciphertext_at_rest_and_decrypts_back_to_plaintext() {
             client_msg_id: Uuid::now_v7(),
             body: plaintext.to_owned(),
             reply_to: None,
+            media: None,
         }),
     };
     ws_send_text(
@@ -500,7 +510,8 @@ async fn body_is_ciphertext_at_rest_and_decrypts_back_to_plaintext() {
             .expect("fetch stored message");
     assert_eq!(key_id, "v1", "at-rest scheme tag");
     assert_ne!(
-        body_enc, plaintext.as_bytes(),
+        body_enc,
+        plaintext.as_bytes(),
         "DB column must be ciphertext"
     );
     assert!(
@@ -515,7 +526,9 @@ async fn body_is_ciphertext_at_rest_and_decrypts_back_to_plaintext() {
 }
 
 fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
-    haystack.windows(needle.len()).any(|window| window == needle)
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
 }
 
 #[tokio::test]
@@ -537,6 +550,7 @@ async fn non_member_cannot_send_and_connection_is_closed() {
             client_msg_id: Uuid::now_v7(),
             body: "let me in".to_owned(),
             reply_to: None,
+            media: None,
         }),
     };
     ws_send_text(
@@ -697,6 +711,7 @@ async fn unknown_frame_type_is_answered_without_closing() {
             client_msg_id: Uuid::now_v7(),
             body: "still here".to_owned(),
             reply_to: None,
+            media: None,
         }),
     };
     ws_send_text(
@@ -719,19 +734,25 @@ async fn conversation_list_returns_memberships_with_peer_info() {
     let conv = create_conversation(&t, &a_access, "listb").await;
 
     // Creator sees the conversation with peer info pointing at listb.
-    let (status, body) = send_http(&t.app, "GET", "/api/conversations", Some(&a_access), None).await;
+    let (status, body) =
+        send_http(&t.app, "GET", "/api/conversations", Some(&a_access), None).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let items = body.as_array().expect("array body");
     assert_eq!(items.len(), 1, "{body}");
     assert_eq!(items[0]["conversation_id"], conv["conversation_id"]);
     assert_eq!(items[0]["kind"], "direct");
     assert_eq!(items[0]["peer"]["username"], "listb");
-    assert_eq!(items[0]["peer"]["uid"], json!(b_uid), "list peer block carries uid");
+    assert_eq!(
+        items[0]["peer"]["uid"],
+        json!(b_uid),
+        "list peer block carries uid"
+    );
     assert_eq!(items[0]["last_seq"], 0);
     assert_eq!(items[0]["last_delivered_seq"], 0);
 
     // The peer sees the same conversation with the creator as peer.
-    let (status, body) = send_http(&t.app, "GET", "/api/conversations", Some(&b_access), None).await;
+    let (status, body) =
+        send_http(&t.app, "GET", "/api/conversations", Some(&b_access), None).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let items = body.as_array().expect("array body");
     assert_eq!(items.len(), 1, "{body}");
@@ -739,7 +760,8 @@ async fn conversation_list_returns_memberships_with_peer_info() {
 
     // A user without conversations gets an empty array, not an error.
     let (_c_id, c_access) = register_user(&t, "list-c@example.com", "listc").await;
-    let (status, body) = send_http(&t.app, "GET", "/api/conversations", Some(&c_access), None).await;
+    let (status, body) =
+        send_http(&t.app, "GET", "/api/conversations", Some(&c_access), None).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body.as_array().map(Vec::len), Some(0), "{body}");
 

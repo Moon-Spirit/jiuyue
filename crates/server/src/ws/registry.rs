@@ -175,7 +175,10 @@ mod tests {
         );
 
         // Unknown user and unknown excluded device behave sanely.
-        assert_eq!(registry.deliver_to_excluding(Uuid::now_v7(), sending_device, &frame), 0);
+        assert_eq!(
+            registry.deliver_to_excluding(Uuid::now_v7(), sending_device, &frame),
+            0
+        );
         assert_eq!(
             registry.deliver_to_excluding(user, Uuid::now_v7(), &frame),
             1,
@@ -197,6 +200,10 @@ mod tests {
         assert_eq!(registry.user_device_count(user), 2);
 
         registry.unregister(user, Uuid::now_v7());
-        assert_eq!(registry.user_device_count(user), 2, "unknown device unregister is a no-op");
+        assert_eq!(
+            registry.user_device_count(user),
+            2,
+            "unknown device unregister is a no-op"
+        );
     }
 }

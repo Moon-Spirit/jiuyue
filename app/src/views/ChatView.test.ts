@@ -645,3 +645,200 @@ describe("ChatView — unread and composer", () => {
     });
   });
 });
+
+describe("ChatView — M8 media & emoji", () => {
+  const imageMedia = {
+    mediaId: "mid-img",
+    kind: "image" as const,
+    mime: "image/png",
+    bytes: 2048,
+    fileName: "p.png",
+    width: 800,
+    height: 600,
+  };
+  const videoMedia = {
+    mediaId: "mid-vid",
+    kind: "video" as const,
+    mime: "video/mp4",
+    bytes: 5_000_000,
+    fileName: "v.mp4",
+    width: 1280,
+    height: 720,
+  };
+
+  async function mountWithMedia(): Promise<{
+    wrapper: VueWrapper;
+    ws: ReturnType<typeof useWsStore>;
+  }> {
+    const pinia = createPinia();
+    setActivePinia(pinia);
+    useAuthStore().user = { userId: "7", username: "me", uid: 1000007 };
+    const ws = useWsStore();
+    ws.conversations.push(
+      conversation(1, {
+        peerUsername: "alice",
+        lastMessagePreview: "",
+        lastMessageKind: "image",
+      }),
+    );
+    ws.messagesByConversation[1] = [
+      message({
+        messageId: "m-img",
+        seq: 1,
+        senderId: "alice",
+        body: "",
+        media: imageMedia,
+        sentAt: isoAt(-60_000),
+      }),
+      message({
+        messageId: "m-vid",
+        seq: 2,
+        senderId: "7",
+        body: "",
+        media: videoMedia,
+        mine: true,
+        status: "delivered",
+        sentAt: isoAt(-30_000),
+      }),
+    ];
+    ws.openConversation(1);
+    ws.status = "open";
+
+    const wrapper = await mountView(pinia);
+    return { wrapper, ws };
+  }
+
+  it("renders image and video bubbles with natural sizing metadata", async () => {
+    const { wrapper } = await mountWithMedia();
+    const main = mainPane(wrapper);
+
+    const img = main.find('[data-testid="media-image"]');
+    expect(img.exists()).toBe(true);
+    expect(img.attributes("src")).toBe("/api/media/mid-img");
+    expect(img.attributes("width")).toBe("800");
+    expect(img.attributes("height")).toBe("600");
+
+    const video = main.find('[data-testid="media-video"]');
+    expect(video.exists()).toBe(true);
+    expect(video.attributes("controls")).toBeDefined();
+    expect(video.attributes("preload")).toBe("metadata");
+    expect(video.attributes("src")).toBe("/api/media/mid-vid");
+    // Video file-size caption.
+    expect(main.find('[data-testid="media-size"]').text()).toBe("4.8 MB");
+
+    // Media bubbles never render the plain-text bubble.
+    expect(main.findAll('[data-testid="message-bubble"]')).toHaveLength(0);
+  });
+
+  it("lazily sizes video via width/height and keeps the image zoomable", async () => {
+    const { wrapper } = await mountWithMedia();
+    const img = mainPane(wrapper).find('[data-testid="media-image"]');
+    expect(img.classes()).toContain("cursor-zoom-in");
+  });
+
+  it("opens the lightbox on image click and closes it on overlay click", async () => {
+    const { wrapper } = await mountWithMedia();
+    const main = mainPane(wrapper);
+
+    expect(main.find('[data-testid="media-lightbox"]').exists()).toBe(false);
+
+    await main.find('[data-testid="media-image"]').trigger("click");
+    const lightbox = wrapper.find('[data-testid="media-lightbox"]');
+    expect(lightbox.exists()).toBe(true);
+    expect(
+      lightbox.find('[data-testid="media-lightbox-image"]').attributes("src"),
+    ).toBe("/api/media/mid-img");
+
+    await lightbox.trigger("click");
+    expect(wrapper.find('[data-testid="media-lightbox"]').exists()).toBe(false);
+  });
+
+  it("closes the lightbox on Escape", async () => {
+    const { wrapper } = await mountWithMedia();
+    await mainPane(wrapper)
+      .find('[data-testid="media-image"]')
+      .trigger("click");
+    expect(wrapper.find('[data-testid="media-lightbox"]').exists()).toBe(true);
+
+    document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" }));
+    await wrapper.vm.$nextTick();
+    expect(wrapper.find('[data-testid="media-lightbox"]').exists()).toBe(false);
+  });
+
+  it("shows a localized media placeholder in the session preview", async () => {
+    const { wrapper } = await mountWithMedia();
+    expect(
+      sessionsPane(wrapper).find('[data-testid="session-preview"]').text(),
+    ).toBe("[图片]");
+  });
+
+  it("toggles the emoji panel, appends choices to the draft, and closes on backdrop", async () => {
+    const { wrapper } = await mountWithMedia();
+    const main = mainPane(wrapper);
+
+    expect(main.find('[data-testid="emoji-panel"]').exists()).toBe(false);
+    await main.find('[data-testid="emoji-toggle"]').trigger("click");
+
+    const panel = main.find('[data-testid="emoji-panel"]');
+    expect(panel.exists()).toBe(true);
+    const choices = panel.findAll('[data-testid="emoji-choice"]');
+    expect(choices.length).toBeGreaterThanOrEqual(60);
+
+    const first = choices[0]!;
+    const firstText = first.text();
+    await first.trigger("click");
+    const input = main.find('[data-testid="composer-input"]')
+      .element as HTMLTextAreaElement;
+    expect(input.value).toBe(firstText);
+    // Panel stays open for multiple inserts.
+    expect(main.find('[data-testid="emoji-panel"]').exists()).toBe(true);
+
+    const second = main
+      .find('[data-testid="emoji-panel"]')
+      .findAll('[data-testid="emoji-choice"]')[1]!;
+    await second.trigger("click");
+    expect(input.value).toBe(firstText + second.text());
+
+    await main.find('[data-testid="emoji-backdrop"]').trigger("click");
+    expect(main.find('[data-testid="emoji-panel"]').exists()).toBe(false);
+  });
+
+  it("rejects an oversized image locally before any upload", async () => {
+    const { wrapper, ws } = await mountWithMedia();
+    ws.status = "open";
+    await wrapper.vm.$nextTick();
+    const main = mainPane(wrapper);
+
+    const file = new File(["x"], "big.png", { type: "image/png" });
+    Object.defineProperty(file, "size", { value: 16 * 1024 * 1024 });
+    const input = main.find('[data-testid="image-file-input"]')
+      .element as HTMLInputElement;
+    Object.defineProperty(input, "files", {
+      value: [file],
+      configurable: true,
+    });
+
+    await main.find('[data-testid="image-file-input"]').trigger("change");
+    await wrapper.vm.$nextTick();
+
+    const error = main.find('[data-testid="upload-error"]');
+    expect(error.exists()).toBe(true);
+    expect(error.text()).toContain("15 MB");
+  });
+
+  it("triggers a hidden file input from the attach buttons", async () => {
+    const { wrapper } = await mountWithMedia();
+    const main = mainPane(wrapper);
+
+    // The shell re-instantiates each slot per breakpoint, so the ref resolves
+    // to one of several hidden inputs — spy at the prototype level instead.
+    const clickSpy = vi.spyOn(HTMLInputElement.prototype, "click");
+
+    await main.find('[data-testid="attach-image"]').trigger("click");
+    expect(clickSpy).toHaveBeenCalledTimes(1);
+    await main.find('[data-testid="attach-video"]').trigger("click");
+    expect(clickSpy).toHaveBeenCalledTimes(2);
+
+    clickSpy.mockRestore();
+  });
+});

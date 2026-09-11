@@ -16,18 +16,18 @@
 //!   create/list, friend requests/list, and user search.
 
 use axum::{
+    Router,
     body::Body,
     http::{Request, StatusCode},
-    Router,
 };
 use futures_util::{SinkExt, StreamExt};
 use http_body_util::BodyExt;
-use jiuyue_protocol::{E2eeMsg, Frame, MsgAck, MsgSend, Payload, PROTOCOL_VERSION};
+use jiuyue_protocol::{E2eeMsg, Frame, MsgAck, MsgSend, PROTOCOL_VERSION, Payload};
 use jiuyue_server::state::AppState;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sqlx::{Connection, PgConnection, PgPool};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::LazyLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
@@ -204,8 +204,7 @@ async fn register_user(t: &TestApp, email: &str, username: &str) -> (Uuid, Strin
 }
 
 async fn ws_connect(t: &TestApp, access: &str) -> WsClient {
-    let (status, body) =
-        send_http(&t.app, "POST", "/api/auth/ws-ticket", Some(access), None).await;
+    let (status, body) = send_http(&t.app, "POST", "/api/auth/ws-ticket", Some(access), None).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let ticket = body["ticket"].as_str().expect("ticket").to_owned();
     let url = format!("ws://127.0.0.1:{}/ws?ticket={ticket}&platform=web", t.port);
@@ -252,7 +251,8 @@ async fn ws_next_frame(ws: &mut WsClient) -> Frame {
     let text = ws_next_text(ws, READ_TIMEOUT)
         .await
         .expect("stream must deliver a text frame");
-    serde_json::from_str::<Frame>(&text).expect("wire frame must decode into jiuyue_protocol::Frame")
+    serde_json::from_str::<Frame>(&text)
+        .expect("wire frame must decode into jiuyue_protocol::Frame")
 }
 
 /// Creates a direct conversation over HTTP; returns its id.
@@ -278,6 +278,7 @@ async fn send_and_ack(ws: &mut WsClient, conversation_id: i64, body: &str) -> Uu
             client_msg_id: Uuid::now_v7(),
             body: body.to_owned(),
             reply_to: None,
+            media: None,
         }),
     };
     ws_send_text(ws, &serde_json::to_string(&frame).expect("serialize")).await;
@@ -346,10 +347,16 @@ async fn profile_get_serves_self_and_others_with_username_fallback() {
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
-        assert_eq!(body["user_id"].as_str().expect("user_id"), target_id.to_string());
+        assert_eq!(
+            body["user_id"].as_str().expect("user_id"),
+            target_id.to_string()
+        );
         assert_eq!(body["uid"], json!(uid));
         assert_eq!(body["username"], username);
-        assert_eq!(body["display_name"], username, "empty display_name falls back to username");
+        assert_eq!(
+            body["display_name"], username,
+            "empty display_name falls back to username"
+        );
         assert_eq!(body["bio"], "");
         assert_eq!(body["avatar"], "");
         assert_eq!(body["level"], 1);
@@ -444,8 +451,14 @@ async fn profile_patch_updates_and_clears_fields() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["display_name"], "upalice", "cleared display_name falls back to username");
-    assert_eq!(body["avatar"], "⛏️", "other fields survive a display_name clear");
+    assert_eq!(
+        body["display_name"], "upalice",
+        "cleared display_name falls back to username"
+    );
+    assert_eq!(
+        body["avatar"], "⛏️",
+        "other fields survive a display_name clear"
+    );
 
     // Persistence is visible to a third party reading the profile.
     let (status, body) = send_http(
@@ -503,7 +516,11 @@ async fn profile_patch_validates_lengths_and_avatar_membership() {
             Some(json!({ "avatar": bad })),
         )
         .await;
-        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "avatar {bad:?}: {body}");
+        assert_eq!(
+            status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "avatar {bad:?}: {body}"
+        );
         assert_eq!(body["error"], "validation_error");
     }
 
@@ -575,7 +592,11 @@ async fn custom_data_url_avatars_are_validated_and_roundtrip() {
             Some(json!({ "avatar": bad })),
         )
         .await;
-        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "avatar {bad:?}: {body}");
+        assert_eq!(
+            status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "avatar {bad:?}: {body}"
+        );
     }
 }
 
@@ -657,7 +678,10 @@ async fn daily_login_bonus_grants_20_xp_once_per_utc_day() {
     assert_eq!(body["xp"], 20);
     assert_eq!(body["level"], 1);
     assert_eq!(body["title"], "土块");
-    assert_eq!(body["xp_to_next"], 50, "xp_to_next is the full level requirement (bar denominator)");
+    assert_eq!(
+        body["xp_to_next"], 50,
+        "xp_to_next is the full level requirement (bar denominator)"
+    );
 }
 
 #[tokio::test]
@@ -726,6 +750,7 @@ async fn message_xp_is_10_per_100_chars_and_short_messages_earn_nothing() {
             client_msg_id: Uuid::now_v7(),
             body: "z".repeat(100),
             reply_to: None,
+            media: None,
         }),
     };
     let wire = serde_json::to_string(&frame).expect("serialize");
@@ -805,7 +830,10 @@ async fn message_xp_caps_at_200_per_day() {
     assert_eq!(body["xp"], 220);
     assert_eq!(body["level"], 4);
     assert_eq!(body["title"], "土块", "band 1-5 is 土块");
-    assert_eq!(body["xp_to_next"], 67, "xp_to_next is the full level-4 requirement");
+    assert_eq!(
+        body["xp_to_next"], 67,
+        "xp_to_next is the full level-4 requirement"
+    );
 }
 
 #[tokio::test]
@@ -849,7 +877,11 @@ async fn secret_chat_messages_earn_zero_xp() {
             message_type: 0,
         }),
     };
-    ws_send_text(&mut ws_a, &serde_json::to_string(&frame).expect("serialize")).await;
+    ws_send_text(
+        &mut ws_a,
+        &serde_json::to_string(&frame).expect("serialize"),
+    )
+    .await;
     match ws_next_frame(&mut ws_a).await.payload {
         Payload::MsgAck(_) => {}
         other => panic!("expected msg.ack for e2ee send, got {other:?}"),
@@ -907,7 +939,10 @@ async fn level_is_stored_recomputed_from_accumulated_xp() {
     assert_eq!(body["level"], 4);
     assert_eq!(body["title"], "土块", "220 XP is still band 1-5");
     assert_eq!(body["xp"], 220);
-    assert_eq!(body["xp_to_next"], 67, "xp_to_next is the full level-4 requirement");
+    assert_eq!(
+        body["xp_to_next"], 67,
+        "xp_to_next is the full level-4 requirement"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -949,7 +984,8 @@ async fn conversation_and_search_surfaces_carry_display_name_and_avatar() {
     assert_eq!(body["peer"]["uid"], json!(b_uid));
 
     // Conversation list carries the same block.
-    let (status, body) = send_http(&t.app, "GET", "/api/conversations", Some(&a_access), None).await;
+    let (status, body) =
+        send_http(&t.app, "GET", "/api/conversations", Some(&a_access), None).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let items = body.as_array().expect("array");
     let item = items
@@ -1021,7 +1057,10 @@ async fn friends_surfaces_carry_display_name_and_avatar() {
     assert_eq!(incoming.len(), 1, "{body}");
     assert_eq!(incoming[0]["from"]["user_id"], json!(a_id.to_string()));
     assert_eq!(incoming[0]["from"]["username"], "frava");
-    assert_eq!(incoming[0]["from"]["display_name"], "frava", "empty display falls back to username");
+    assert_eq!(
+        incoming[0]["from"]["display_name"], "frava",
+        "empty display falls back to username"
+    );
     assert_eq!(incoming[0]["from"]["avatar"], "");
 
     // Accept → friend list carries the friend's display_name/avatar.

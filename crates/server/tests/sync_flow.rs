@@ -15,22 +15,22 @@
 //!   stay correct even with sub-second heartbeat intervals.
 
 use axum::{
+    Router,
     body::Body,
     http::{Request, StatusCode},
-    Router,
 };
 use futures_util::{SinkExt, StreamExt};
 use http_body_util::BodyExt;
 use jiuyue_protocol::{
-    Frame, MsgAck, MsgNew, MsgSend, Payload, SyncCursor, SyncReq, PROTOCOL_VERSION,
+    Frame, MsgAck, MsgNew, MsgSend, PROTOCOL_VERSION, Payload, SyncCursor, SyncReq,
 };
 use jiuyue_server::state::AppState;
 use jiuyue_server::ws::HeartbeatConfig;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sqlx::{Connection, PgConnection, PgPool};
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::LazyLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use time::OffsetDateTime;
 use tokio::sync::Mutex;
@@ -274,7 +274,8 @@ async fn ws_next_frame(ws: &mut WsClient) -> Frame {
     let text = ws_next_text(ws, READ_TIMEOUT)
         .await
         .expect("stream must deliver a text frame");
-    serde_json::from_str::<Frame>(&text).expect("wire frame must decode into jiuyue_protocol::Frame")
+    serde_json::from_str::<Frame>(&text)
+        .expect("wire frame must decode into jiuyue_protocol::Frame")
 }
 
 /// Creates the direct conversation `creator -> peer_username` over HTTP.
@@ -302,6 +303,7 @@ async fn send_and_ack(ws: &mut WsClient, conversation_id: i64, body: &str) -> (U
             client_msg_id,
             body: body.to_owned(),
             reply_to: None,
+            media: None,
         }),
     };
     ws_send_text(ws, &serde_json::to_string(&frame).expect("serialize")).await;
@@ -404,7 +406,9 @@ async fn disconnect_mid_send_gap_is_filled_exactly_by_sync_req() {
     let (m1_id, m1_seq) = send_and_ack(&mut ws_a, conversation_id, "m1").await;
     assert_eq!(m1_seq, 1);
     match ws_next_frame(&mut ws_b1).await.payload {
-        Payload::MsgNew(MsgNew { message_id, seq, .. }) => {
+        Payload::MsgNew(MsgNew {
+            message_id, seq, ..
+        }) => {
             assert_eq!((message_id, seq), (m1_id, 1));
         }
         other => panic!("expected baseline msg.new, got {other:?}"),
@@ -518,14 +522,19 @@ async fn self_echo_reaches_senders_other_devices_but_not_the_sending_device() {
     }
     // ...and the peer gets its normal copy.
     match ws_next_frame(&mut ws_b).await.payload {
-        Payload::MsgNew(MsgNew { message_id: got_id, .. }) => assert_eq!(got_id, message_id),
+        Payload::MsgNew(MsgNew {
+            message_id: got_id, ..
+        }) => assert_eq!(got_id, message_id),
         other => panic!("expected msg.new on peer, got {other:?}"),
     }
 
     // The SENDING device must not hear its own message back (it already got
     // the authoritative ack); pings are filtered by the reader helper.
     let stray = ws_next_text(&mut ws_a1, Duration::from_millis(800)).await;
-    assert!(stray.is_none(), "sending device must stay silent, got {stray:?}");
+    assert!(
+        stray.is_none(),
+        "sending device must stay silent, got {stray:?}"
+    );
 }
 
 /// Acceptance 3 — successful live delivery advances the persisted
@@ -547,7 +556,9 @@ async fn delivered_frames_advance_persisted_cursor_and_later_sync_is_empty() {
     let (id1, seq1) = send_and_ack(&mut ws_a, conversation_id, "c1").await;
     let (_id2, seq2) = send_and_ack(&mut ws_a, conversation_id, "c2").await;
     match ws_next_frame(&mut ws_b).await.payload {
-        Payload::MsgNew(MsgNew { message_id, seq, .. }) => {
+        Payload::MsgNew(MsgNew {
+            message_id, seq, ..
+        }) => {
             assert_eq!((message_id, seq), (id1, seq1));
         }
         other => panic!("expected live msg.new, got {other:?}"),
@@ -701,6 +712,7 @@ async fn saturated_recipient_channel_does_not_block_or_break_the_sender() {
                 client_msg_id: Uuid::now_v7(),
                 body: format!("burst-{n}"),
                 reply_to: None,
+                media: None,
             }),
         };
         tokio::time::timeout(
@@ -809,18 +821,21 @@ async fn sync_req_skips_unauthorized_or_unknown_conversations_silently() {
     let _ = send_and_ack(&mut ws_a, conversation_id, "secret").await;
 
     let mut ws_eve = ws_connect(&t, &eve_access).await;
-    send_sync_req(
-        &mut ws_eve,
-        vec![(conversation_id, 0), (9_999_999_999, 0)],
-    )
-    .await;
+    send_sync_req(&mut ws_eve, vec![(conversation_id, 0), (9_999_999_999, 0)]).await;
     let res = expect_sync_res(&mut ws_eve).await;
-    assert!(res.messages.is_empty(), "no rows may leak: {:?}", res.messages);
+    assert!(
+        res.messages.is_empty(),
+        "no rows may leak: {:?}",
+        res.messages
+    );
     assert!(res.complete);
 
     // The connection survives (skip is not an error).
     let still_connected = ws_next_text(&mut ws_eve, Duration::from_millis(300)).await;
-    assert!(still_connected.is_none(), "no error frame expected, got {still_connected:?}");
+    assert!(
+        still_connected.is_none(),
+        "no error frame expected, got {still_connected:?}"
+    );
 }
 
 /// Wire-shape decision check: multiple cursors aggregate into ONE sync.res,

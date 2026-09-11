@@ -50,11 +50,31 @@ export interface AuthTicketRes {
   ticket: string;
 }
 
+/**
+ * M8 media attachment reference. Additive/optional on `msg.send` and
+ * `msg.new`: absent on plain text frames (old frames stay byte-identical),
+ * present only when the message carries an uploaded image or video. The
+ * bytes themselves live behind `GET /api/media/{media_id}`; the wire only
+ * carries the opaque id plus layout metadata (client-supplied width/height).
+ */
+export interface MediaRef {
+  media_id: string;
+  kind: "image" | "video";
+  mime: string;
+  bytes: number;
+  file_name: string;
+  /** Natural pixel dimensions (client-computed, best-effort); absent if unknown. */
+  width?: number;
+  height?: number;
+}
+
 export interface MsgSend {
   conversation_id: number;
   /** Client-generated idempotency key (UUIDv7 string). */
   client_msg_id: string;
   body: string;
+  /** Optional media attachment; `body` stays "" for media messages. */
+  media?: MediaRef;
   /** Optional reply target; must be a message of the same conversation. */
   reply_to?: string;
 }
@@ -76,6 +96,8 @@ export interface MsgNew {
   body: string;
   /** RFC 3339 timestamp string, passed through verbatim. */
   sent_at: string;
+  /** Optional media attachment (absent on plain text messages). */
+  media?: MediaRef;
   /** Reply metadata (null-absent on plain messages). */
   reply_to_message_id?: string;
   reply_to_sender_id?: string;
@@ -270,6 +292,31 @@ function hasOptionalString(d: Record<string, unknown>, key: string): boolean {
   return v === undefined || typeof v === "string";
 }
 
+/** Optional integer: absent (or undefined) is fine; present must be an int. */
+function hasOptionalInt(d: Record<string, unknown>, key: string): boolean {
+  const v = d[key];
+  return v === undefined || (typeof v === "number" && Number.isInteger(v));
+}
+
+/**
+ * Shape guard for an M8 media reference. `width`/`height` are optional and
+ * must be integers when present; all other fields are required.
+ */
+export function isMediaRef(v: unknown): v is MediaRef {
+  if (!isRecord(v)) return false;
+  if (!hasString(v, "media_id")) return false;
+  if (v["kind"] !== "image" && v["kind"] !== "video") return false;
+  if (!hasString(v, "mime")) return false;
+  if (!hasInt(v, "bytes")) return false;
+  if (!hasString(v, "file_name")) return false;
+  return hasOptionalInt(v, "width") && hasOptionalInt(v, "height");
+}
+
+/** Optional media reference: absent is valid; present must match MediaRef. */
+function hasOptionalMedia(d: Record<string, unknown>): boolean {
+  return d["media"] === undefined || isMediaRef(d["media"]);
+}
+
 export function isAuthTicketReq(d: unknown): d is AuthTicketReq {
   return isRecord(d) && Object.keys(d).length === 0;
 }
@@ -284,6 +331,7 @@ export function isMsgSend(d: unknown): d is MsgSend {
     hasInt(d, "conversation_id") &&
     hasString(d, "client_msg_id") &&
     hasString(d, "body") &&
+    hasOptionalMedia(d) &&
     hasOptionalString(d, "reply_to")
   );
 }
@@ -307,6 +355,7 @@ export function isMsgNew(d: unknown): d is MsgNew {
     hasString(d, "sender_id") &&
     hasString(d, "body") &&
     hasString(d, "sent_at") &&
+    hasOptionalMedia(d) &&
     hasOptionalString(d, "reply_to_message_id") &&
     hasOptionalString(d, "reply_to_sender_id") &&
     hasOptionalString(d, "reply_to_body_preview") &&

@@ -24,14 +24,14 @@
 //! cannot decrypt them and must not learn preview text.
 
 use crate::state::AppState;
-use axum::extract::State;
 use axum::Json;
+use axum::extract::State;
 use serde::Serialize;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 use uuid::Uuid;
 
 /// Notification preview length cap (plaintext chars, char-boundary safe).
@@ -233,7 +233,11 @@ impl std::fmt::Debug for ApnsChannel {
 
 impl ApnsChannel {
     /// Test/debug constructor with an injected transport.
-    pub fn new(key_id: impl Into<String>, team_id: impl Into<String>, transport: TransportFn) -> Self {
+    pub fn new(
+        key_id: impl Into<String>,
+        team_id: impl Into<String>,
+        transport: TransportFn,
+    ) -> Self {
         Self {
             key_id: key_id.into(),
             team_id: team_id.into(),
@@ -418,7 +422,11 @@ impl PushService {
     /// Builds from the environment (`JIUYUE_REGION` + channel credentials).
     /// Unconfigured real channels simply don't appear in the candidate list.
     pub fn from_env() -> Self {
-        Self::from_parts(region_from_env(), ApnsChannel::from_env().ok(), FcmChannel::from_env().ok())
+        Self::from_parts(
+            region_from_env(),
+            ApnsChannel::from_env().ok(),
+            FcmChannel::from_env().ok(),
+        )
     }
 
     pub fn from_parts(region: String, apns: Option<ApnsChannel>, fcm: Option<FcmChannel>) -> Self {
@@ -461,7 +469,10 @@ impl PushService {
         envelope: PushEnvelope,
     ) -> Result<(), PushError> {
         for channel in self.candidates() {
-            match channel.deliver(platform, push_token, envelope.clone()).await {
+            match channel
+                .deliver(platform, push_token, envelope.clone())
+                .await
+            {
                 Ok(()) => return Ok(()),
                 Err(err) => {
                     tracing::warn!(
@@ -526,7 +537,9 @@ mod tests {
             Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&captured);
         let transport: TransportFn = Arc::new(move |platform, token, payload| {
-            sink.lock().expect("capture lock").push((platform, token, payload));
+            sink.lock()
+                .expect("capture lock")
+                .push((platform, token, payload));
             Box::pin(async { Ok(()) })
         });
         (transport, captured)
@@ -560,7 +573,10 @@ mod tests {
         assert!(payload["aps"]["alert"]["body"].is_string());
         assert_eq!(payload["aps"]["badge"], 1);
         assert_eq!(payload["conversation_id"], 42);
-        assert!(payload.get("to").is_none(), "APNs shape must not carry FCM fields");
+        assert!(
+            payload.get("to").is_none(),
+            "APNs shape must not carry FCM fields"
+        );
     }
 
     #[tokio::test]
@@ -582,7 +598,10 @@ mod tests {
         assert!(payload["notification"]["body"].is_string());
         assert_eq!(payload["data"]["conversation_id"], "42");
         assert_eq!(payload["data"]["kind"], "message");
-        assert!(payload.get("aps").is_none(), "FCM shape must not carry APNs fields");
+        assert!(
+            payload.get("aps").is_none(),
+            "FCM shape must not carry APNs fields"
+        );
     }
 
     #[tokio::test]
@@ -606,18 +625,31 @@ mod tests {
         }
         let snapshot = mock.snapshot();
         assert_eq!(snapshot.len(), MOCK_RING_CAPACITY);
-        assert_ne!(snapshot[0].token_prefix, "abcdefgh", "oldest entry must be evicted");
+        assert_ne!(
+            snapshot[0].token_prefix, "abcdefgh",
+            "oldest entry must be evicted"
+        );
     }
 
     #[test]
     fn envelope_preview_is_char_truncated() {
         let long_body = "x".repeat(200);
-        let envelope = PushEnvelope::new(Uuid::now_v7(), Uuid::now_v7(), 1, &long_body, PushKind::Message);
-        assert_eq!(envelope.sender_username_preview.chars().count(), PREVIEW_MAX_CHARS);
+        let envelope = PushEnvelope::new(
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            1,
+            &long_body,
+            PushKind::Message,
+        );
+        assert_eq!(
+            envelope.sender_username_preview.chars().count(),
+            PREVIEW_MAX_CHARS
+        );
 
         // Multibyte safety: 50 CJK chars clamp to exactly 40 whole chars.
         let cjk = "字".repeat(50);
-        let envelope = PushEnvelope::new(Uuid::now_v7(), Uuid::now_v7(), 1, &cjk, PushKind::Message);
+        let envelope =
+            PushEnvelope::new(Uuid::now_v7(), Uuid::now_v7(), 1, &cjk, PushKind::Message);
         assert_eq!(envelope.sender_username_preview.chars().count(), 40);
         assert_eq!(envelope.sender_username_preview, "字".repeat(40));
     }
@@ -625,8 +657,14 @@ mod tests {
     #[test]
     fn platform_parse_covers_column_values_and_ignores_web() {
         assert_eq!(PushPlatform::parse("ios"), Some(PushPlatform::Ios));
-        assert_eq!(PushPlatform::parse("android-fcm"), Some(PushPlatform::AndroidFcm));
-        assert_eq!(PushPlatform::parse("android-cn"), Some(PushPlatform::AndroidChina));
+        assert_eq!(
+            PushPlatform::parse("android-fcm"),
+            Some(PushPlatform::AndroidFcm)
+        );
+        assert_eq!(
+            PushPlatform::parse("android-cn"),
+            Some(PushPlatform::AndroidChina)
+        );
         assert_eq!(PushPlatform::parse("web"), None);
         assert_eq!(PushPlatform::parse(""), None);
     }
@@ -652,7 +690,9 @@ mod tests {
         assert!(bad_b64.err().unwrap().contains("base64"));
 
         let ok = ApnsChannel::from_lookup(|name| match name {
-            "JIUYUE_APNS_TOKEN_B64" => Some(base64::engine::general_purpose::STANDARD.encode(b"secret")),
+            "JIUYUE_APNS_TOKEN_B64" => {
+                Some(base64::engine::general_purpose::STANDARD.encode(b"secret"))
+            }
             "JIUYUE_APNS_KEY_ID" => Some("key".into()),
             "JIUYUE_APNS_TEAM_ID" => Some("team".into()),
             _ => None,
@@ -681,7 +721,11 @@ mod tests {
     #[tokio::test]
     async fn service_falls_through_to_mock_when_no_real_channel_configured() {
         let service = PushService::from_parts("global".into(), None, None);
-        assert_eq!(service.candidates().len(), 1, "mock-only when nothing configured");
+        assert_eq!(
+            service.candidates().len(),
+            1,
+            "mock-only when nothing configured"
+        );
 
         let envelope = sample_envelope();
         service
@@ -705,7 +749,10 @@ mod tests {
             .deliver(PushPlatform::AndroidChina, "cn-token", sample_envelope())
             .await
             .expect("deliver");
-        assert!(captured.lock().expect("capture lock").is_empty(), "real channel must be skipped in cn");
+        assert!(
+            captured.lock().expect("capture lock").is_empty(),
+            "real channel must be skipped in cn"
+        );
         assert_eq!(service.mock().snapshot().len(), 1);
     }
 
@@ -749,6 +796,10 @@ mod tests {
         assert_eq!(region_from_raw(Some(String::new())), "global");
         assert_eq!(region_from_raw(Some("cn".into())), "cn");
         assert_eq!(region_from_raw(Some(" global ".into())), "global");
-        assert_eq!(region_from_raw(Some("mars".into())), "global", "unknown values degrade");
+        assert_eq!(
+            region_from_raw(Some("mars".into())),
+            "global",
+            "unknown values degrade"
+        );
     }
 }

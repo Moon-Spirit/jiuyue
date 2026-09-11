@@ -16,19 +16,19 @@
 //! 4. `/api/dev/push-log` returns the recorded entries in dev builds.
 
 use axum::{
+    Router,
     body::Body,
     http::{Request, StatusCode},
-    Router,
 };
 use futures_util::{SinkExt, StreamExt};
 use http_body_util::BodyExt;
-use jiuyue_protocol::{Frame, MsgAck, MsgNew, MsgRecall, MsgSend, Payload, PROTOCOL_VERSION};
-use jiuyue_server::push::{PushKind, PushPlatform, PREVIEW_MAX_CHARS, TOKEN_PREFIX_LEN};
+use jiuyue_protocol::{Frame, MsgAck, MsgNew, MsgRecall, MsgSend, PROTOCOL_VERSION, Payload};
+use jiuyue_server::push::{PREVIEW_MAX_CHARS, PushKind, PushPlatform, TOKEN_PREFIX_LEN};
 use jiuyue_server::state::AppState;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sqlx::{Connection, PgConnection, PgPool};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::LazyLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
@@ -196,7 +196,11 @@ async fn register_user(t: &TestApp, email: &str, username: &str) -> (Uuid, Strin
     )
     .await;
     assert_eq!(status, StatusCode::CREATED, "{reg}");
-    let user_id: Uuid = reg["user_id"].as_str().expect("user_id").parse().expect("uuid");
+    let user_id: Uuid = reg["user_id"]
+        .as_str()
+        .expect("user_id")
+        .parse()
+        .expect("uuid");
     let access = reg["access_token"].as_str().expect("access").to_owned();
     (user_id, access)
 }
@@ -230,10 +234,13 @@ async fn ws_connect(t: &TestApp, access: &str) -> WsClient {
 }
 
 async fn ws_send_text(ws: &mut WsClient, text: &str) {
-    tokio::time::timeout(READ_TIMEOUT, ws.send(WsMessage::Text(text.to_owned().into())))
-        .await
-        .expect("send timeout")
-        .expect("send ok");
+    tokio::time::timeout(
+        READ_TIMEOUT,
+        ws.send(WsMessage::Text(text.to_owned().into())),
+    )
+    .await
+    .expect("send timeout")
+    .expect("send ok");
 }
 
 async fn ws_next_frame(ws: &mut WsClient) -> Frame {
@@ -248,7 +255,12 @@ async fn ws_next_frame(ws: &mut WsClient) -> Frame {
 
 /// Sends one plaintext message over A's socket and returns the ACKed
 /// `(message_id, seq)` after verifying the persist-then-ack contract.
-async fn send_and_ack(ws_a: &mut WsClient, conversation_id: i64, client_msg_id: Uuid, body: &str) -> (Uuid, i64) {
+async fn send_and_ack(
+    ws_a: &mut WsClient,
+    conversation_id: i64,
+    client_msg_id: Uuid,
+    body: &str,
+) -> (Uuid, i64) {
     let send_frame = Frame {
         v: PROTOCOL_VERSION,
         payload: Payload::MsgSend(MsgSend {
@@ -256,9 +268,14 @@ async fn send_and_ack(ws_a: &mut WsClient, conversation_id: i64, client_msg_id: 
             client_msg_id,
             body: body.to_owned(),
             reply_to: None,
+            media: None,
         }),
     };
-    ws_send_text(ws_a, &serde_json::to_string(&send_frame).expect("serialize")).await;
+    ws_send_text(
+        ws_a,
+        &serde_json::to_string(&send_frame).expect("serialize"),
+    )
+    .await;
     let ack = ws_next_frame(ws_a).await;
     match ack.payload {
         Payload::MsgAck(MsgAck {
@@ -330,12 +347,13 @@ async fn offline_member_gets_one_mock_envelope_with_preview_and_conversation() {
 
     // Body longer than the 40-char preview cap, mixing multibyte chars.
     let body = format!("离线推送预览测试：{}", "内容内容".repeat(12));
-    let (message_id, _seq) =
-        send_and_ack(&mut ws_a, conversation_id, Uuid::now_v7(), &body).await;
+    let (message_id, _seq) = send_and_ack(&mut ws_a, conversation_id, Uuid::now_v7(), &body).await;
 
     let expected_preview: String = body.chars().take(PREVIEW_MAX_CHARS).collect();
     let snapshot = wait_for_mock(&t, |entries| {
-        entries.iter().any(|e| e.envelope.conversation_id == conversation_id)
+        entries
+            .iter()
+            .any(|e| e.envelope.conversation_id == conversation_id)
     })
     .await;
 
@@ -343,10 +361,18 @@ async fn offline_member_gets_one_mock_envelope_with_preview_and_conversation() {
         .iter()
         .filter(|e| e.envelope.conversation_id == conversation_id)
         .collect();
-    assert_eq!(matching.len(), 1, "exactly one envelope for the conversation");
+    assert_eq!(
+        matching.len(),
+        1,
+        "exactly one envelope for the conversation"
+    );
     let entry = matching[0];
     assert_eq!(entry.platform, PushPlatform::Ios);
-    assert_eq!(entry.token_prefix, B_TOKEN[..TOKEN_PREFIX_LEN], "only the prefix is retained");
+    assert_eq!(
+        entry.token_prefix,
+        B_TOKEN[..TOKEN_PREFIX_LEN],
+        "only the prefix is retained"
+    );
     assert_eq!(entry.envelope.to_user_id, b_id);
     assert_eq!(entry.envelope.device_id, b_device_id);
     assert_eq!(entry.envelope.kind, PushKind::Message);
@@ -396,7 +422,11 @@ async fn online_members_do_not_generate_pushes() {
     // B receives the live fanout — proof the send pipeline completed.
     let delivered = ws_next_frame(&mut ws_b).await;
     match delivered.payload {
-        Payload::MsgNew(MsgNew { conversation_id: conv, body, .. }) => {
+        Payload::MsgNew(MsgNew {
+            conversation_id: conv,
+            body,
+            ..
+        }) => {
             assert_eq!(conv, conversation_id);
             assert_eq!(body, "online hello");
         }
@@ -407,7 +437,9 @@ async fn online_members_do_not_generate_pushes() {
     tokio::time::sleep(Duration::from_millis(700)).await;
     let snapshot = t.state.push.mock().snapshot();
     assert!(
-        snapshot.iter().all(|e| e.envelope.conversation_id != conversation_id),
+        snapshot
+            .iter()
+            .all(|e| e.envelope.conversation_id != conversation_id),
         "online recipients must never be pushed: {snapshot:?}"
     );
 }
@@ -424,18 +456,28 @@ async fn recalled_messages_add_no_extra_push() {
 
     let mut ws_a = ws_connect(&t, &a_access).await;
 
-    let (message_id, _seq) =
-        send_and_ack(&mut ws_a, conversation_id, Uuid::now_v7(), "will be recalled").await;
+    let (message_id, _seq) = send_and_ack(
+        &mut ws_a,
+        conversation_id,
+        Uuid::now_v7(),
+        "will be recalled",
+    )
+    .await;
 
     let snapshot = wait_for_mock(&t, |entries| {
-        entries.iter().any(|e| e.envelope.conversation_id == conversation_id)
+        entries
+            .iter()
+            .any(|e| e.envelope.conversation_id == conversation_id)
     })
     .await;
     let pushes_before_recall = snapshot
         .iter()
         .filter(|e| e.envelope.conversation_id == conversation_id)
         .count();
-    assert_eq!(pushes_before_recall, 1, "the fresh message itself pushed once");
+    assert_eq!(
+        pushes_before_recall, 1,
+        "the fresh message itself pushed once"
+    );
 
     // Recall inside the policy window; the echoed msg.recalled frame proves
     // the whole recall pipeline (persist + broadcast) has settled.
@@ -446,7 +488,11 @@ async fn recalled_messages_add_no_extra_push() {
             message_id,
         }),
     };
-    ws_send_text(&mut ws_a, &serde_json::to_string(&recall).expect("serialize")).await;
+    ws_send_text(
+        &mut ws_a,
+        &serde_json::to_string(&recall).expect("serialize"),
+    )
+    .await;
     let echoed = ws_next_frame(&mut ws_a).await;
     assert!(
         matches!(echoed.payload, Payload::MsgRecalled(_)),

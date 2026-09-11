@@ -19,13 +19,13 @@
 
 #![allow(dead_code)]
 
-use aes_gcm::{aead::Aead, Aes256Gcm, KeyInit, Nonce};
-use base64::engine::general_purpose::STANDARD as BASE64;
+use aes_gcm::{Aes256Gcm, KeyInit, Nonce, aead::Aead};
 use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use rand::RngCore;
 use vodozemac::{
-    olm::{Account, InboundCreationResult, OlmMessage, SessionConfig},
     Curve25519PublicKey,
+    olm::{Account, InboundCreationResult, OlmMessage, SessionConfig},
 };
 
 /// libolm wire message type: pre-key messages establish a session.
@@ -344,17 +344,23 @@ mod tests {
             .create_outbound_session(&bob.identity_key(), &otks[0].public_key)
             .expect("outbound session");
 
-        assert!(session
-            .decrypt(MESSAGE_TYPE_NORMAL, "not-a-message")
-            .is_err());
+        assert!(
+            session
+                .decrypt(MESSAGE_TYPE_NORMAL, "not-a-message")
+                .is_err()
+        );
         assert!(session.decrypt(99, "whatever").is_err());
 
         let mut stranger = OlmAccount::new();
-        assert!(stranger
-            .create_inbound_and_decrypt(&alice.identity_key(), MESSAGE_TYPE_PRE_KEY, "junk")
-            .is_err());
-        assert!(alice
-            .create_outbound_session(&bob.identity_key(), "not-a-key")
-            .is_err());
+        assert!(
+            stranger
+                .create_inbound_and_decrypt(&alice.identity_key(), MESSAGE_TYPE_PRE_KEY, "junk")
+                .is_err()
+        );
+        assert!(
+            alice
+                .create_outbound_session(&bob.identity_key(), "not-a-key")
+                .is_err()
+        );
     }
 }

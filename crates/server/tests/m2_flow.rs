@@ -7,21 +7,21 @@
 //! ping-filtering frame reader + `eventually` poller).
 
 use axum::{
+    Router,
     body::Body,
     http::{Request, StatusCode},
-    Router,
 };
 use futures_util::{SinkExt, StreamExt};
 use http_body_util::BodyExt;
 use jiuyue_protocol::{
-    ErrorCode, Frame, MsgAck, MsgNew, MsgRecall, MsgRecalled, MsgSend, Payload, ReadReceipt,
-    ReadUpdate, SyncCursor, SyncReq, Typing, TypingState, PROTOCOL_VERSION,
+    ErrorCode, Frame, MsgAck, MsgNew, MsgRecall, MsgRecalled, MsgSend, PROTOCOL_VERSION, Payload,
+    ReadReceipt, ReadUpdate, SyncCursor, SyncReq, Typing, TypingState,
 };
 use jiuyue_server::state::AppState;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sqlx::{Connection, PgConnection, PgPool};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::LazyLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
@@ -195,8 +195,7 @@ async fn register_user(t: &TestApp, email: &str, username: &str) -> (Uuid, Strin
 }
 
 async fn ws_connect(t: &TestApp, access: &str) -> WsClient {
-    let (status, body) =
-        send_http(&t.app, "POST", "/api/auth/ws-ticket", Some(access), None).await;
+    let (status, body) = send_http(&t.app, "POST", "/api/auth/ws-ticket", Some(access), None).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let ticket = body["ticket"].as_str().expect("ticket").to_owned();
     let url = format!("ws://127.0.0.1:{}/ws?ticket={ticket}&platform=web", t.port);
@@ -243,7 +242,8 @@ async fn ws_next_frame(ws: &mut WsClient) -> Frame {
     let text = ws_next_text(ws, READ_TIMEOUT)
         .await
         .expect("stream must deliver a text frame");
-    serde_json::from_str::<Frame>(&text).expect("wire frame must decode into jiuyue_protocol::Frame")
+    serde_json::from_str::<Frame>(&text)
+        .expect("wire frame must decode into jiuyue_protocol::Frame")
 }
 
 fn expect_error_code(frame: Frame, expected: ErrorCode) -> jiuyue_protocol::ErrorPayload {
@@ -289,6 +289,7 @@ async fn send_and_ack_replying_to(
             client_msg_id,
             body: body.to_owned(),
             reply_to,
+            media: None,
         }),
     };
     ws_send_text(ws, &serde_json::to_string(&frame).expect("serialize")).await;
@@ -419,7 +420,10 @@ async fn read_update_persists_cursor_and_notifies_only_the_peer() {
 
     // The reader itself is never echoed its own receipt.
     let echo = ws_next_text(&mut ws_b, SILENCE_PROBE).await;
-    assert!(echo.is_none(), "reader must not receive a receipt, got {echo:?}");
+    assert!(
+        echo.is_none(),
+        "reader must not receive a receipt, got {echo:?}"
+    );
 
     // Cursor persisted with GREATEST semantics: a stale lower update cannot
     // regress it (and still echoes the effective value).
@@ -487,9 +491,7 @@ async fn typing_is_relayed_to_the_peer_with_sender_stamped_and_never_echoed() {
 
     send_typing(&mut ws_a, conversation_id, TypingState::Stop).await;
     match ws_next_frame(&mut ws_b).await.payload {
-        Payload::Typing(Typing {
-            user_id, state, ..
-        }) => {
+        Payload::Typing(Typing { user_id, state, .. }) => {
             assert_eq!(user_id, Some(a_id));
             assert_eq!(state, TypingState::Stop);
         }
@@ -530,9 +532,13 @@ async fn typing_publishes_fire_and_forget_envelope_on_conversation_channel() {
         .await
         .expect("publish must arrive well within the timeout")
         .expect("pubsub stream open");
-    let payload: Value =
-        serde_json::from_str(published.get_payload::<String>().expect("string payload").as_str())
-            .expect("typing envelope is JSON");
+    let payload: Value = serde_json::from_str(
+        published
+            .get_payload::<String>()
+            .expect("string payload")
+            .as_str(),
+    )
+    .expect("typing envelope is JSON");
     assert_eq!(payload["kind"], json!("typing"));
     assert_eq!(payload["user_id"], json!(a_id.to_string()));
     assert_eq!(payload["state"], json!("start"));
@@ -731,9 +737,13 @@ async fn reply_send_validates_target_and_msg_new_carries_quote_metadata() {
     let (quoted_id, _seq) = send_and_ack(&mut ws_a, conversation_id, &long_body).await;
     let _delivery = ws_next_frame(&mut ws_b).await;
 
-    let (reply_id, reply_seq) =
-        send_and_ack_replying_to(&mut ws_a, conversation_id, "here is my answer", Some(quoted_id))
-            .await;
+    let (reply_id, reply_seq) = send_and_ack_replying_to(
+        &mut ws_a,
+        conversation_id,
+        "here is my answer",
+        Some(quoted_id),
+    )
+    .await;
     match ws_next_frame(&mut ws_b).await.payload {
         Payload::MsgNew(MsgNew {
             message_id,
@@ -754,12 +764,11 @@ async fn reply_send_validates_target_and_msg_new_carries_quote_metadata() {
     }
 
     // Reply metadata persisted.
-    let stored: Option<Uuid> =
-        sqlx::query_scalar("SELECT reply_to FROM messages WHERE id = $1")
-            .bind(reply_id)
-            .fetch_one(&t.pool)
-            .await
-            .expect("fetch reply row");
+    let stored: Option<Uuid> = sqlx::query_scalar("SELECT reply_to FROM messages WHERE id = $1")
+        .bind(reply_id)
+        .fetch_one(&t.pool)
+        .await
+        .expect("fetch reply row");
     assert_eq!(stored, Some(quoted_id));
 }
 
@@ -796,9 +805,14 @@ async fn reply_to_foreign_or_unknown_message_is_bad_request_without_persisting()
                 client_msg_id: Uuid::now_v7(),
                 body: "bad reply".to_owned(),
                 reply_to: Some(target),
+                media: None,
             }),
         };
-        ws_send_text(&mut ws_a, &serde_json::to_string(&frame).expect("serialize")).await;
+        ws_send_text(
+            &mut ws_a,
+            &serde_json::to_string(&frame).expect("serialize"),
+        )
+        .await;
         let err = expect_error_code(ws_next_frame(&mut ws_a).await, ErrorCode::BadRequest);
         assert!(
             err.message.contains("reply_to"),

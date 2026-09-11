@@ -26,7 +26,7 @@
 pub mod registry;
 
 // Canonical paths for sibling modules (`state`, tests).
-pub use registry::{ConnRegistry, FrameTx, OutboundFrame, OUTBOUND_CHANNEL_CAPACITY};
+pub use registry::{ConnRegistry, FrameTx, OUTBOUND_CHANNEL_CAPACITY, OutboundFrame};
 
 use crate::auth::ws_ticket;
 use crate::error::AppError;
@@ -37,15 +37,15 @@ use axum::extract::{Query, State};
 use axum::response::{IntoResponse, Response};
 use futures_util::{SinkExt, StreamExt};
 use jiuyue_protocol::{
-    E2eeMsg, ErrorCode, ErrorPayload, Frame, MsgAck, MsgNew, MsgRecall, MsgRecalled, MsgSend,
-    Payload, ProfileUpdated, ReadReceipt, ReadUpdate, SyncMessage, SyncReq, SyncRes, Typing,
-    TypingState, PROTOCOL_VERSION,
+    E2eeMsg, ErrorCode, ErrorPayload, Frame, MediaRef, MsgAck, MsgNew, MsgRecall, MsgRecalled,
+    MsgSend, PROTOCOL_VERSION, Payload, ProfileUpdated, ReadReceipt, ReadUpdate, SyncMessage,
+    SyncReq, SyncRes, Typing, TypingState,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
@@ -96,8 +96,7 @@ impl HeartbeatConfig {
         }
         let fallback = Self::default();
         Self {
-            ping_every: parse_secs(ping_secs)
-                .map_or(fallback.ping_every, Duration::from_secs),
+            ping_every: parse_secs(ping_secs).map_or(fallback.ping_every, Duration::from_secs),
             idle_timeout: parse_secs(timeout_secs)
                 .map_or(fallback.idle_timeout, Duration::from_secs),
         }
@@ -151,18 +150,16 @@ pub async fn ws_handler(
 /// session row — the devices table has no natural key for a true upsert, and
 /// per-connection rows keep the registry's `(user_id, device_id)` keys unique
 /// even when one user connects several times on the same platform.
-async fn register_device(
-    state: &AppState,
-    user_id: Uuid,
-    platform: &str,
-) -> anyhow::Result<Uuid> {
+async fn register_device(state: &AppState, user_id: Uuid, platform: &str) -> anyhow::Result<Uuid> {
     let device_id = Uuid::now_v7();
-    sqlx::query("INSERT INTO devices (id, user_id, platform, last_seen_at) VALUES ($1, $2, $3, now())")
-        .bind(device_id)
-        .bind(user_id)
-        .bind(platform)
-        .execute(&state.pool)
-        .await?;
+    sqlx::query(
+        "INSERT INTO devices (id, user_id, platform, last_seen_at) VALUES ($1, $2, $3, now())",
+    )
+    .bind(device_id)
+    .bind(user_id)
+    .bind(platform)
+    .execute(&state.pool)
+    .await?;
     Ok(device_id)
 }
 
@@ -450,14 +447,33 @@ async fn handle_frame(
                 };
                 let _ = out_tx.send(serialize_frame(&ack)).await;
                 if !outcome.duplicate {
-                    fanout_msg_new(state, sender_id, sender_device_id, &send.body, &outcome).await;
+                    // Media messages carry no text body; the attachment rides
+                    // in `outcome.media` on the `msg.new` frame instead.
+                    let body_for_fanout = if outcome.media.is_some() {
+                        ""
+                    } else {
+                        send.body.as_str()
+                    };
+                    fanout_msg_new(
+                        state,
+                        sender_id,
+                        sender_device_id,
+                        body_for_fanout,
+                        &outcome,
+                    )
+                    .await;
                     // M7 XP economy: fresh sends earn +10 XP per full 100
                     // characters (daily cap 200; secret chats excluded inside
                     // the award fn). The character COUNT is the only thing
                     // that leaves this frame — never the body. Best-effort
                     // post-commit spawn: an XP outage must never fail the
                     // already-acked send path.
-                    spawn_message_xp(state, sender_id, send.conversation_id, &send.body);
+                    //
+                    // M8 media messages award NO XP: there is no character
+                    // count to measure, so the award call is skipped outright.
+                    if send.media.is_none() {
+                        spawn_message_xp(state, sender_id, send.conversation_id, &send.body);
+                    }
                 }
                 Flow::Continue
             }
@@ -469,7 +485,10 @@ async fn handle_frame(
             }
             Err(SendRejection::Unauthorized(reason)) => {
                 let _ = out_tx
-                    .send(serialize_frame(&error_frame(ErrorCode::Unauthorized, reason)))
+                    .send(serialize_frame(&error_frame(
+                        ErrorCode::Unauthorized,
+                        reason,
+                    )))
                     .await;
                 // Authorization failures kill the connection: the ticket
                 // proved who you are, but you reached for someone else's
@@ -526,7 +545,10 @@ async fn handle_frame(
             }
             Err(SendRejection::Unauthorized(reason)) => {
                 let _ = out_tx
-                    .send(serialize_frame(&error_frame(ErrorCode::Unauthorized, reason)))
+                    .send(serialize_frame(&error_frame(
+                        ErrorCode::Unauthorized,
+                        reason,
+                    )))
                     .await;
                 // Same policy as msg.send: reaching for a foreign
                 // conversation kills the connection.
@@ -726,6 +748,9 @@ struct SendOutcome {
     /// Resolved reply-quote metadata for the fresh insert (duplicates never
     /// refanout, so they carry none).
     reply: Option<ReplyMeta>,
+    /// Resolved media attachment (M8) for the fresh insert; `None` for text
+    /// messages and for duplicates.
+    media: Option<MediaRef>,
 }
 
 /// Server-resolved quote metadata carried on `msg.new` so receivers can
@@ -764,6 +789,9 @@ impl From<time::error::Format> for SendRejection {
     }
 }
 
+/// `(message_id, sender_id, body_enc, recalled_at, kind)` of a reply target.
+type ReplyTargetRow = (Uuid, Uuid, Vec<u8>, Option<OffsetDateTime>, String);
+
 /// Persist-then-ack pipeline for one `msg.send` frame.
 ///
 /// One transaction:
@@ -798,40 +826,85 @@ async fn process_msg_send(
         ));
     }
 
+    // M8 media attachment: the referenced `media` row must exist and belong
+    // to the sender. The authoritative metadata is rebuilt from the DB row
+    // (only width/height are client-supplied hints); a missing id and someone
+    // else's id collapse into the same rejection so sends are not an
+    // existence oracle. This runs BEFORE the seq transaction.
+    let media: Option<MediaRef> = match &send.media {
+        Some(reference) => {
+            let row: Option<(Uuid, String, String, i64, String)> = sqlx::query_as(
+                "SELECT owner_id, kind, mime, bytes, file_name FROM media WHERE id = $1",
+            )
+            .bind(reference.media_id)
+            .fetch_optional(&state.pool)
+            .await?;
+            let Some((owner_id, kind, mime, bytes, file_name)) = row else {
+                return Err(SendRejection::BadRequest("media_not_found"));
+            };
+            if owner_id != sender_id {
+                return Err(SendRejection::BadRequest("media_not_found"));
+            }
+            Some(MediaRef {
+                media_id: reference.media_id,
+                kind,
+                mime,
+                bytes,
+                file_name,
+                width: reference.width,
+                height: reference.height,
+            })
+        }
+        None => None,
+    };
+
     // Reply target validation: must exist AND belong to the same
     // conversation. Resolved once here (inside the tx) and reused for the
-    // quote metadata after a fresh insert.
+    // quote metadata after a fresh insert. `kind` rides along so a media
+    // quote target contributes no bogus JSON preview.
     let mut tx = state.pool.begin().await?;
-    let reply_target: Option<(Uuid, Uuid, Vec<u8>, Option<OffsetDateTime>)> =
-        match send.reply_to {
-            Some(reply_to) => {
-                let row: Option<(Uuid, Uuid, Vec<u8>, Option<OffsetDateTime>)> =
-                    sqlx::query_as(
-                        "SELECT id, sender_id, body_enc, recalled_at FROM messages \
-                         WHERE id = $1 AND conversation_id = $2",
-                    )
-                    .bind(reply_to)
-                    .bind(send.conversation_id)
-                    .fetch_optional(&mut *tx)
-                    .await?;
-                if row.is_none() {
-                    let _ = tx.rollback().await;
-                    return Err(SendRejection::BadRequest(
-                        "reply_to must reference an existing message in the same conversation",
-                    ));
-                }
-                row
-            }
-            None => None,
-        };
-
-    // Encrypt at rest before the heavy transaction work (no DB time spent in crypto).
-    let body_enc = state.cipher.encrypt(&send.body)?;
-    let allocated_seq: Option<i64> =
-        sqlx::query_scalar("UPDATE conversations SET last_seq = last_seq + 1 WHERE id = $1 RETURNING last_seq")
+    let reply_target: Option<ReplyTargetRow> = match send.reply_to {
+        Some(reply_to) => {
+            let row: Option<ReplyTargetRow> = sqlx::query_as(
+                "SELECT id, sender_id, body_enc, recalled_at, kind FROM messages \
+                 WHERE id = $1 AND conversation_id = $2",
+            )
+            .bind(reply_to)
             .bind(send.conversation_id)
             .fetch_optional(&mut *tx)
             .await?;
+            if row.is_none() {
+                let _ = tx.rollback().await;
+                return Err(SendRejection::BadRequest(
+                    "reply_to must reference an existing message in the same conversation",
+                ));
+            }
+            row
+        }
+        None => None,
+    };
+
+    // Encrypt at rest before the heavy transaction work (no DB time spent in
+    // crypto). Media messages store the serialized MediaRef envelope through
+    // the SAME at-rest cipher as text bodies — the replay path decrypts and
+    // decodes it back into the typed attachment.
+    let body_enc = match &media {
+        Some(reference) => {
+            let envelope = serde_json::to_string(reference)
+                .map_err(|err| SendRejection::Internal(err.into()))?;
+            state.cipher.encrypt(&envelope)?
+        }
+        None => state.cipher.encrypt(&send.body)?,
+    };
+    let message_kind = media
+        .as_ref()
+        .map_or("text", |reference| reference.kind.as_str());
+    let allocated_seq: Option<i64> = sqlx::query_scalar(
+        "UPDATE conversations SET last_seq = last_seq + 1 WHERE id = $1 RETURNING last_seq",
+    )
+    .bind(send.conversation_id)
+    .fetch_optional(&mut *tx)
+    .await?;
     let Some(seq) = allocated_seq else {
         // Conversation vanished between the membership check and now (or the
         // id never existed): same authorization answer either way.
@@ -848,8 +921,8 @@ async fn process_msg_send(
     // server-side attribution path.
     let forwarded_from_username: Option<String> = None;
     let fresh: Option<(Uuid, i64, OffsetDateTime)> = sqlx::query_as(
-        "INSERT INTO messages (id, conversation_id, seq, sender_id, client_msg_id, key_id, body_enc, reply_to, forwarded_from_username) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+        "INSERT INTO messages (id, conversation_id, seq, sender_id, client_msg_id, key_id, body_enc, reply_to, forwarded_from_username, kind) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
          ON CONFLICT (conversation_id, client_msg_id) DO NOTHING \
          RETURNING id, seq, sent_at",
     )
@@ -862,6 +935,7 @@ async fn process_msg_send(
     .bind(&body_enc)
     .bind(send.reply_to)
     .bind(&forwarded_from_username)
+    .bind(message_kind)
     .fetch_optional(&mut *tx)
     .await?;
 
@@ -871,14 +945,17 @@ async fn process_msg_send(
         // RECALLED target never contributes its content ("never sent
         // again") — only its id/sender ride along.
         let reply = reply_target.map(
-            |(reply_id, reply_sender_id, reply_body_enc, recalled_at)| {
-                let body_preview = if recalled_at.is_some() {
+            |(reply_id, reply_sender_id, reply_body_enc, recalled_at, reply_kind)| {
+                // A recalled target never contributes content ("never sent
+                // again"); a MEDIA target stores an encrypted MediaRef
+                // envelope rather than text, so it must not leak a JSON
+                // preview either.
+                let is_media = matches!(reply_kind.as_str(), "image" | "video");
+                let body_preview = if recalled_at.is_some() || is_media {
                     None
                 } else {
                     match state.cipher.decrypt(&reply_body_enc) {
-                        Ok(plaintext) => {
-                            Some(truncate_chars(&plaintext, REPLY_PREVIEW_MAX_CHARS))
-                        }
+                        Ok(plaintext) => Some(truncate_chars(&plaintext, REPLY_PREVIEW_MAX_CHARS)),
                         Err(err) => {
                             tracing::warn!(%reply_id, error = %err, "reply preview decrypt failed");
                             None
@@ -900,6 +977,7 @@ async fn process_msg_send(
             sent_at_rfc3339: sent_at.format(&Rfc3339)?,
             duplicate: false,
             reply,
+            media,
         });
     }
 
@@ -920,6 +998,7 @@ async fn process_msg_send(
         sent_at_rfc3339: sent_at.format(&Rfc3339)?,
         duplicate: true,
         reply: None,
+        media: None,
     })
 }
 
@@ -967,13 +1046,13 @@ async fn fanout_msg_new(
             sent_at: outcome.sent_at_rfc3339.clone(),
             reply_to_message_id: outcome.reply.as_ref().map(|r| r.message_id),
             reply_to_sender_id: outcome.reply.as_ref().map(|r| r.sender_id),
-            reply_to_body_preview: outcome
-                .reply
-                .as_ref()
-                .and_then(|r| r.body_preview.clone()),
+            reply_to_body_preview: outcome.reply.as_ref().and_then(|r| r.body_preview.clone()),
             // Always None today (see the DECISION comment in process_msg_send).
             forwarded_from_username: None,
             recalled: false,
+            // M8: the resolved attachment for media messages; `None` for text
+            // so the wire shape stays byte-compatible.
+            media: outcome.media.clone(),
         }),
     };
     let wire = serialize_frame(&msg_new);
@@ -1126,11 +1205,12 @@ async fn process_e2ee_send(
     }
 
     let mut tx = state.pool.begin().await?;
-    let allocated_seq: Option<i64> =
-        sqlx::query_scalar("UPDATE conversations SET last_seq = last_seq + 1 WHERE id = $1 RETURNING last_seq")
-            .bind(send.conversation_id)
-            .fetch_optional(&mut *tx)
-            .await?;
+    let allocated_seq: Option<i64> = sqlx::query_scalar(
+        "UPDATE conversations SET last_seq = last_seq + 1 WHERE id = $1 RETURNING last_seq",
+    )
+    .bind(send.conversation_id)
+    .fetch_optional(&mut *tx)
+    .await?;
     let Some(seq) = allocated_seq else {
         let _ = tx.rollback().await;
         return Err(SendRejection::Unauthorized("conversation does not exist"));
@@ -1268,12 +1348,7 @@ async fn fanout_e2ee(
 /// monotonically (`GREATEST`). Failures are logged, never fatal — the cursor
 /// is a recovery hint, and a stale one only means extra rows replayed by the
 /// next `sync.req`.
-fn spawn_advance_delivered_cursor(
-    state: &AppState,
-    conversation_id: i64,
-    user_id: Uuid,
-    seq: i64,
-) {
+fn spawn_advance_delivered_cursor(state: &AppState, conversation_id: i64, user_id: Uuid, seq: i64) {
     let pool = state.pool.clone();
     tokio::spawn(async move {
         let result = sqlx::query(
@@ -1321,9 +1396,13 @@ fn spawn_message_xp(state: &AppState, sender_id: Uuid, conversation_id: i64, bod
     let pool = state.pool.clone();
     let char_count = body.chars().count();
     tokio::spawn(async move {
-        let result =
-            crate::profile::award_message_xp_for_chars(&pool, sender_id, conversation_id, char_count)
-                .await;
+        let result = crate::profile::award_message_xp_for_chars(
+            &pool,
+            sender_id,
+            conversation_id,
+            char_count,
+        )
+        .await;
         if let Err(err) = result {
             tracing::warn!(
                 %sender_id,
@@ -1426,7 +1505,11 @@ async fn fanout_read_receipt(
 /// (never echoed to the typer), plus a fire-and-forget Redis publish on
 /// `conv:{id}` so a future multi-instance deployment can bridge relays.
 /// Nothing is persisted anywhere — typing is strictly ephemeral.
-async fn relay_typing(state: &AppState, sender_id: Uuid, typing: &Typing) -> Result<(), MemberRejection> {
+async fn relay_typing(
+    state: &AppState,
+    sender_id: Uuid,
+    typing: &Typing,
+) -> Result<(), MemberRejection> {
     let member: Option<i64> = sqlx::query_scalar(
         "SELECT 1::int8 FROM conversation_members WHERE conversation_id = $1 AND user_id = $2",
     )
@@ -1447,12 +1530,11 @@ async fn relay_typing(state: &AppState, sender_id: Uuid, typing: &Typing) -> Res
         }),
     });
 
-    let members: Vec<Uuid> = sqlx::query_scalar(
-        "SELECT user_id FROM conversation_members WHERE conversation_id = $1",
-    )
-    .bind(typing.conversation_id)
-    .fetch_all(&state.pool)
-    .await?;
+    let members: Vec<Uuid> =
+        sqlx::query_scalar("SELECT user_id FROM conversation_members WHERE conversation_id = $1")
+            .bind(typing.conversation_id)
+            .fetch_all(&state.pool)
+            .await?;
     for user_id in members.into_iter().filter(|id| *id != sender_id) {
         let delivered = state.registry.deliver_to(user_id, &frame);
         tracing::debug!(%user_id, delivered, conversation_id = typing.conversation_id, "typing relay");
@@ -1624,9 +1706,9 @@ async fn broadcast_msg_recalled(state: &AppState, conversation_id: i64, message_
 const SYNC_BATCH_LIMIT: i64 = 200;
 
 /// One tombstone-aware sync row: the message columns plus the LEFT-JOINed
-/// reply-target columns (`r.sender_id`, `r.body_enc`, `r.recalled_at`) and
-/// the trailing `m.client_msg_id` / `m.key_id` / `m.kind` triple used to
-/// route secret-chat rows into `SyncMessage::Encrypted` entries.
+/// reply-target columns (`r.sender_id`, `r.body_enc`, `r.recalled_at`,
+/// `r.kind`) and the trailing `m.client_msg_id` / `m.key_id` / `m.kind`
+/// triple used to route secret-chat and media rows.
 type SyncMessageRow = (
     Uuid,
     i64,
@@ -1640,6 +1722,7 @@ type SyncMessageRow = (
     Option<Uuid>,
     Option<Vec<u8>>,
     Option<OffsetDateTime>,
+    Option<String>,
     Uuid,
     String,
     String,
@@ -1647,7 +1730,7 @@ type SyncMessageRow = (
 
 const SYNC_MESSAGE_QUERY: &str = "SELECT m.id, m.conversation_id, m.seq, m.sender_id, m.sent_at, \
      m.body_enc, m.recalled_at, m.reply_to, m.forwarded_from_username, \
-     r.sender_id, r.body_enc, r.recalled_at, \
+     r.sender_id, r.body_enc, r.recalled_at, r.kind, \
      m.client_msg_id, m.key_id, m.kind \
      FROM messages m \
      LEFT JOIN messages r ON r.id = m.reply_to \
@@ -1696,11 +1779,11 @@ async fn process_sync_req(
         // resolves reply-quote metadata in the same round trip; a RECALLED
         // quote target contributes no preview (content "never sent again").
         let rows: Vec<SyncMessageRow> = sqlx::query_as(SYNC_MESSAGE_QUERY)
-        .bind(cursor.conversation_id)
-        .bind(cursor.last_delivered_seq)
-        .bind(SYNC_BATCH_LIMIT)
-        .fetch_all(&state.pool)
-        .await?;
+            .bind(cursor.conversation_id)
+            .bind(cursor.last_delivered_seq)
+            .bind(SYNC_BATCH_LIMIT)
+            .fetch_all(&state.pool)
+            .await?;
 
         complete &= rows.len() < usize::try_from(SYNC_BATCH_LIMIT).unwrap_or(usize::MAX);
         for (
@@ -1716,6 +1799,7 @@ async fn process_sync_req(
             reply_sender_id,
             reply_body_enc,
             reply_recalled_at,
+            reply_kind,
             client_msg_id,
             key_id,
             kind,
@@ -1745,6 +1829,7 @@ async fn process_sync_req(
                         reply_to_body_preview: None,
                         forwarded_from_username,
                         recalled: true,
+                        media: None,
                     })
                 } else {
                     SyncMessage::Encrypted(E2eeMsg {
@@ -1755,6 +1840,50 @@ async fn process_sync_req(
                     })
                 };
                 messages.push((conversation_id, seq, entry));
+                continue;
+            }
+
+            // M8 media rows (kind 'image'|'video') store the encrypted
+            // MediaRef envelope in `body_enc` through the SAME at-rest cipher
+            // as text bodies; replay decrypts it back into the typed
+            // attachment and serves an empty body. A recalled media tombstone
+            // seals the attachment too (refs are content). The reply fields
+            // are carried verbatim: they describe the QUOTED message.
+            if matches!(kind.as_str(), "image" | "video") {
+                let media = if recalled {
+                    None
+                } else {
+                    let envelope = state.cipher.decrypt(&body_enc)?;
+                    match serde_json::from_str::<MediaRef>(&envelope) {
+                        Ok(reference) => Some(reference),
+                        Err(err) => {
+                            tracing::warn!(
+                                %message_id,
+                                error = %err,
+                                "media envelope decode failed on sync"
+                            );
+                            None
+                        }
+                    }
+                };
+                messages.push((
+                    conversation_id,
+                    seq,
+                    SyncMessage::Plain(MsgNew {
+                        message_id,
+                        conversation_id,
+                        seq,
+                        sender_id,
+                        body: String::new(),
+                        sent_at: sent_at_rfc3339,
+                        reply_to_message_id: reply_to,
+                        reply_to_sender_id: None,
+                        reply_to_body_preview: None,
+                        forwarded_from_username,
+                        recalled,
+                        media,
+                    }),
+                ));
                 continue;
             }
 
@@ -1773,7 +1902,11 @@ async fn process_sync_req(
                 (reply_to, reply_sender_id, reply_body_enc, reply_recalled_at)
             {
                 reply_to_sender_id = Some(r_sender);
+                // A media quote target has no plaintext preview (its body_enc
+                // is an encrypted MediaRef envelope, not text).
+                let reply_is_media = matches!(reply_kind.as_deref(), Some("image" | "video"));
                 if r_recalled.is_none()
+                    && !reply_is_media
                     && let Ok(plaintext) = state.cipher.decrypt(&r_body)
                 {
                     reply_to_body_preview =
@@ -1797,6 +1930,7 @@ async fn process_sync_req(
                     reply_to_body_preview,
                     forwarded_from_username,
                     recalled,
+                    media: None,
                 }),
             ));
         }
@@ -1804,10 +1938,7 @@ async fn process_sync_req(
 
     messages.sort_by_key(|(conversation_id, seq, _)| (*conversation_id, *seq));
     Ok(SyncRes {
-        messages: messages
-            .into_iter()
-            .map(|(_, _, entry)| entry)
-            .collect(),
+        messages: messages.into_iter().map(|(_, _, entry)| entry).collect(),
         complete,
     })
 }
@@ -1851,7 +1982,11 @@ mod heartbeat_config_tests {
     fn invalid_or_zero_env_values_fall_back_to_defaults() {
         for ping in ["abc", "0", "-3", ""] {
             let cfg = HeartbeatConfig::from_env_values(Some(ping.to_owned()), Some("45".into()));
-            assert_eq!(cfg.ping_every, Duration::from_secs(30), "ping {ping:?} must fall back");
+            assert_eq!(
+                cfg.ping_every,
+                Duration::from_secs(30),
+                "ping {ping:?} must fall back"
+            );
             assert_eq!(cfg.idle_timeout, Duration::from_secs(45));
         }
         for timeout in ["not-a-number", "0"] {

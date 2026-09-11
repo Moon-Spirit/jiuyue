@@ -953,3 +953,143 @@ describe("ws store — M2 forwarding", () => {
     expect(profileStore.peers["peer-9"]).toBeUndefined();
   });
 });
+
+describe("ws store — M8 media messages", () => {
+  const imageMedia = {
+    mediaId: "mid-1",
+    kind: "image" as const,
+    mime: "image/png",
+    bytes: 1234,
+    fileName: "a.png",
+    width: 800,
+    height: 600,
+  };
+
+  it("sends a media message as an empty-body msg.send carrying the media ref", async () => {
+    const store = useWsStore();
+    seedConversation(store, 1);
+    const sock = await connectAndOpen();
+
+    const message = store.sendMedia(1, imageMedia);
+
+    expect(message?.body).toBe("");
+    expect(message?.media).toEqual(imageMedia);
+    expect(message?.status).toBe("sending");
+
+    const frame = sentFrames(sock).at(-1);
+    expect(frame?.t).toBe("msg.send");
+    expect(frame?.d["body"]).toBe("");
+    expect(frame?.d["media"]).toEqual({
+      media_id: "mid-1",
+      kind: "image",
+      mime: "image/png",
+      bytes: 1234,
+      file_name: "a.png",
+      width: 800,
+      height: 600,
+    });
+
+    const conv = store.conversations.find((c) => c.conversationId === 1);
+    expect(conv?.lastMessageKind).toBe("image");
+    expect(conv?.lastMessagePreview).toBe("");
+  });
+
+  it("omits unknown dimensions from the outbound ref", async () => {
+    const store = useWsStore();
+    seedConversation(store, 1);
+    const sock = await connectAndOpen();
+
+    store.sendMedia(1, {
+      mediaId: "mid-2",
+      kind: "video",
+      mime: "video/mp4",
+      bytes: 9,
+      fileName: "v.mp4",
+    });
+
+    const media = sentFrames(sock).at(-1)?.d["media"] as Record<
+      string,
+      unknown
+    >;
+    expect(media).toEqual({
+      media_id: "mid-2",
+      kind: "video",
+      mime: "video/mp4",
+      bytes: 9,
+      file_name: "v.mp4",
+    });
+    expect("width" in media).toBe(false);
+    expect("height" in media).toBe(false);
+  });
+
+  it("maps an inbound media msg.new into the local model and preview kind", async () => {
+    const store = useWsStore();
+    seedConversation(store, 1);
+    const sock = await connectAndOpen();
+
+    sock.serverFrame({
+      v: 1,
+      t: "msg.new",
+      d: msgNew({
+        message_id: "m-img",
+        conversation_id: 1,
+        seq: 3,
+        body: "",
+        media: {
+          media_id: "mid-9",
+          kind: "image",
+          mime: "image/jpeg",
+          bytes: 99,
+          file_name: "p.jpg",
+          width: 4,
+          height: 5,
+        },
+      }),
+    });
+
+    const stored = store.messagesByConversation[1]?.at(-1);
+    expect(stored?.media).toEqual({
+      mediaId: "mid-9",
+      kind: "image",
+      mime: "image/jpeg",
+      bytes: 99,
+      fileName: "p.jpg",
+      width: 4,
+      height: 5,
+    });
+    expect(store.conversations[0]?.lastMessageKind).toBe("image");
+  });
+
+  it("refuses media over a secret (e2ee) conversation", async () => {
+    const store = useWsStore();
+    seedConversation(store, 1, { kind: "secret" });
+    await connectAndOpen();
+
+    const result = store.sendMedia(1, imageMedia);
+    expect(result).toBeNull();
+    expect(store.messagesByConversation[1] ?? []).toHaveLength(0);
+  });
+
+  it("restores a persisted media message with its attachment", async () => {
+    const store = useWsStore();
+    seedConversation(store, 1);
+    const sock = await connectAndOpen();
+    const message = store.sendMedia(1, imageMedia);
+    sock.serverFrame({
+      v: 1,
+      t: "msg.ack",
+      d: {
+        client_msg_id: message?.clientMsgId,
+        message_id: "m-p",
+        seq: 1,
+        duplicate: false,
+      },
+    });
+
+    setActivePinia(createPinia());
+    const restored = useWsStore();
+    const restoredMessage = restored.messagesByConversation[1]?.[0];
+    expect(restoredMessage?.media?.mediaId).toBe("mid-1");
+    expect(restored.conversations[0]?.lastMessageKind).toBe("image");
+  });
+});

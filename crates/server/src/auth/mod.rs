@@ -7,8 +7,8 @@ pub mod password;
 pub mod tokens;
 pub mod ws_ticket;
 
-use axum::routing::post;
 use axum::Router;
+use axum::routing::post;
 
 pub fn router() -> Router<crate::state::AppState> {
     Router::new()

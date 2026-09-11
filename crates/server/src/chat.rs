@@ -10,10 +10,10 @@
 use crate::auth::extract::AuthUser;
 use crate::error::AppError;
 use crate::state::AppState;
-use axum::extract::rejection::JsonRejection;
-use axum::extract::State;
-use axum::http::StatusCode;
 use axum::Json;
+use axum::extract::State;
+use axum::extract::rejection::JsonRejection;
+use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -63,12 +63,13 @@ pub async fn create_direct(
     }
     let kind = normalize_kind(req.kind.as_deref()).map_err(AppError::BadRequest)?;
 
-    let peer: Option<(Uuid, i64, String, String, String)> =
-        sqlx::query_as("SELECT id, uid, username, display_name, avatar FROM users WHERE username = $1 LIMIT 1")
-            .bind(&peer_username)
-            .fetch_optional(&state.pool)
-            .await
-            .map_err(AppError::internal)?;
+    let peer: Option<(Uuid, i64, String, String, String)> = sqlx::query_as(
+        "SELECT id, uid, username, display_name, avatar FROM users WHERE username = $1 LIMIT 1",
+    )
+    .bind(&peer_username)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(AppError::internal)?;
     // Unknown peer is a plain 404 with a machine code (no existence games
     // needed here: usernames are public handles, not secrets).
     let Some((peer_id, peer_uid, peer_username, peer_display, peer_avatar)) = peer else {
@@ -147,7 +148,11 @@ pub async fn create_direct(
 /// Lexicographically sorted `"uuidA:uuidB"` — order-independent so both peers
 /// compute the identical key from either side of the conversation.
 fn direct_pair_key(a: Uuid, b: Uuid) -> String {
-    let (low, high) = if a.as_bytes() <= b.as_bytes() { (a, b) } else { (b, a) };
+    let (low, high) = if a.as_bytes() <= b.as_bytes() {
+        (a, b)
+    } else {
+        (b, a)
+    };
     format!("{low}:{high}")
 }
 
@@ -180,7 +185,11 @@ mod tests {
     fn pair_key_never_collides_with_self() {
         let a = Uuid::now_v7();
         let key = direct_pair_key(a, a);
-        assert_eq!(key, format!("{a}:{a}"), "self-pair is well-formed (server rejects it earlier)");
+        assert_eq!(
+            key,
+            format!("{a}:{a}"),
+            "self-pair is well-formed (server rejects it earlier)"
+        );
     }
 
     #[test]
@@ -190,7 +199,10 @@ mod tests {
         assert_eq!(normalize_kind(Some("direct")).unwrap(), "direct");
         assert_eq!(normalize_kind(Some(" secret ")).unwrap(), "secret");
         assert!(normalize_kind(Some("group")).is_err());
-        assert!(normalize_kind(Some("SECRET")).is_err(), "kinds are lowercase-only");
+        assert!(
+            normalize_kind(Some("SECRET")).is_err(),
+            "kinds are lowercase-only"
+        );
     }
 }
 
@@ -276,7 +288,9 @@ pub async fn list_conversations(
                             user_id,
                             uid: peer_uid.unwrap_or_default(),
                             display_name: match (&peer_display, &peer_username) {
-                                (Some(display), Some(uname)) => crate::profile::effective_display_name(display, uname),
+                                (Some(display), Some(uname)) => {
+                                    crate::profile::effective_display_name(display, uname)
+                                }
                                 _ => username.clone(),
                             },
                             username,

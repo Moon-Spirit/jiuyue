@@ -34,8 +34,8 @@ use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use jiuyue_protocol::{FriendAccepted, FriendRequested, Payload, UserIdentity};
 use serde::{Deserialize, Serialize};
-use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 use uuid::Uuid;
 
 /// Friends + requests routes nested under `/api/friends`.
@@ -69,7 +69,13 @@ pub struct FriendPeer {
 impl FriendPeer {
     /// Builds a peer block from a DB row, resolving the display-name fallback
     /// server-side (`empty display_name` renders as `username`).
-    fn from_row(user_id: Uuid, uid: i64, username: String, display_name: String, avatar: String) -> Self {
+    fn from_row(
+        user_id: Uuid,
+        uid: i64,
+        username: String,
+        display_name: String,
+        avatar: String,
+    ) -> Self {
         let effective = crate::profile::effective_display_name(&display_name, &username);
         Self {
             user_id,
@@ -85,7 +91,11 @@ impl FriendPeer {
 /// friendships and their removal key off one value (same convention as
 /// `conversations.pair_key`).
 fn friend_pair_key(a: Uuid, b: Uuid) -> String {
-    let (low, high) = if a.as_bytes() <= b.as_bytes() { (a, b) } else { (b, a) };
+    let (low, high) = if a.as_bytes() <= b.as_bytes() {
+        (a, b)
+    } else {
+        (b, a)
+    };
     format!("{low}:{high}")
 }
 
@@ -113,20 +123,21 @@ async fn peer_identity_of(
 /// (uids come from `users_uid_seq` which starts at 100000), but surfaced as a
 /// guarded error rather than a panic.
 fn wire_uid(user_id: Uuid, uid: i64) -> Result<u64, AppError> {
-    u64::try_from(uid)
-        .map_err(|_| AppError::internal(anyhow::anyhow!("user {user_id} has an out-of-range uid {uid}")))
+    u64::try_from(uid).map_err(|_| {
+        AppError::internal(anyhow::anyhow!(
+            "user {user_id} has an out-of-range uid {uid}"
+        ))
+    })
 }
 
 /// True when ANY friendship row already exists for the unordered pair.
-async fn already_friends(
-    tx: &mut sqlx::PgConnection,
-    pair_key: &str,
-) -> Result<bool, AppError> {
-    let hit: Option<i64> = sqlx::query_scalar("SELECT 1::int8 FROM friendships WHERE pair_key = $1")
-        .bind(pair_key)
-        .fetch_optional(tx)
-        .await
-        .map_err(AppError::internal)?;
+async fn already_friends(tx: &mut sqlx::PgConnection, pair_key: &str) -> Result<bool, AppError> {
+    let hit: Option<i64> =
+        sqlx::query_scalar("SELECT 1::int8 FROM friendships WHERE pair_key = $1")
+            .bind(pair_key)
+            .fetch_optional(tx)
+            .await
+            .map_err(AppError::internal)?;
     Ok(hit.is_some())
 }
 
@@ -262,13 +273,7 @@ pub async fn send_request(
         StatusCode::CREATED,
         Json(SendFriendRequestResponse {
             request_id,
-            to: FriendPeer::from_row(
-                peer_id,
-                peer_uid,
-                peer_username,
-                peer_display,
-                peer_avatar,
-            ),
+            to: FriendPeer::from_row(peer_id, peer_uid, peer_username, peer_display, peer_avatar),
         }),
     ))
 }
@@ -333,13 +338,7 @@ pub async fn list_requests(
     {
         incoming.push(IncomingRequestItem {
             request_id,
-            from: FriendPeer::from_row(
-                peer_id,
-                peer_uid,
-                peer_username,
-                peer_display,
-                peer_avatar,
-            ),
+            from: FriendPeer::from_row(peer_id, peer_uid, peer_username, peer_display, peer_avatar),
             created_at: rfc3339(created_at)?,
         });
     }
@@ -350,13 +349,7 @@ pub async fn list_requests(
     {
         outgoing.push(OutgoingRequestItem {
             request_id,
-            to: FriendPeer::from_row(
-                peer_id,
-                peer_uid,
-                peer_username,
-                peer_display,
-                peer_avatar,
-            ),
+            to: FriendPeer::from_row(peer_id, peer_uid, peer_username, peer_display, peer_avatar),
             created_at: rfc3339(created_at)?,
         });
     }
@@ -379,13 +372,12 @@ pub async fn accept_request(
     user: AuthUser,
     Path(request_id): Path<Uuid>,
 ) -> Result<Json<AcceptFriendRequestResponse>, AppError> {
-    let request: Option<(Uuid, Uuid, String)> = sqlx::query_as(
-        "SELECT from_user, to_user, status FROM friend_requests WHERE id = $1",
-    )
-    .bind(request_id)
-    .fetch_optional(&state.pool)
-    .await
-    .map_err(AppError::internal)?;
+    let request: Option<(Uuid, Uuid, String)> =
+        sqlx::query_as("SELECT from_user, to_user, status FROM friend_requests WHERE id = $1")
+            .bind(request_id)
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(AppError::internal)?;
     let Some((from_user, to_user, status)) = request else {
         return Err(AppError::ResourceNotFound);
     };
@@ -408,15 +400,14 @@ pub async fn accept_request(
     }
 
     // Pending-guarded transition: a concurrent decline/cancel wins instead.
-    let updated: Option<Uuid> =
-        sqlx::query_scalar(
-            "UPDATE friend_requests SET status = 'accepted', responded_at = now() \
+    let updated: Option<Uuid> = sqlx::query_scalar(
+        "UPDATE friend_requests SET status = 'accepted', responded_at = now() \
              WHERE id = $1 AND status = 'pending' RETURNING id",
-        )
-        .bind(request_id)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(AppError::internal)?;
+    )
+    .bind(request_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(AppError::internal)?;
     if updated.is_none() {
         return Err(AppError::ResourceNotFound);
     }
@@ -475,13 +466,12 @@ pub async fn decline_request(
     user: AuthUser,
     Path(request_id): Path<Uuid>,
 ) -> Result<StatusCode, AppError> {
-    let request: Option<(Uuid, Uuid, String)> = sqlx::query_as(
-        "SELECT from_user, to_user, status FROM friend_requests WHERE id = $1",
-    )
-    .bind(request_id)
-    .fetch_optional(&state.pool)
-    .await
-    .map_err(AppError::internal)?;
+    let request: Option<(Uuid, Uuid, String)> =
+        sqlx::query_as("SELECT from_user, to_user, status FROM friend_requests WHERE id = $1")
+            .bind(request_id)
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(AppError::internal)?;
     let Some((from_user, to_user, status)) = request else {
         return Err(AppError::ResourceNotFound);
     };
@@ -515,13 +505,12 @@ pub async fn cancel_request(
     user: AuthUser,
     Path(request_id): Path<Uuid>,
 ) -> Result<StatusCode, AppError> {
-    let request: Option<(Uuid, Uuid, String)> = sqlx::query_as(
-        "SELECT from_user, to_user, status FROM friend_requests WHERE id = $1",
-    )
-    .bind(request_id)
-    .fetch_optional(&state.pool)
-    .await
-    .map_err(AppError::internal)?;
+    let request: Option<(Uuid, Uuid, String)> =
+        sqlx::query_as("SELECT from_user, to_user, status FROM friend_requests WHERE id = $1")
+            .bind(request_id)
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(AppError::internal)?;
     let Some((from_user, _to_user, status)) = request else {
         return Err(AppError::ResourceNotFound);
     };

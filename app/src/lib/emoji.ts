@@ -1,0 +1,78 @@
+/**
+ * Curated emoji catalog for the composer's quick-panel.
+ *
+ * Hand-rolled on purpose (spec: no emoji-picker dependency): a small, stable
+ * grid of Unicode emoji mixing faces / hands / hearts / objects. Consumers
+ * append an entry verbatim to the draft text — the wire protocol stays plain
+ * UTF-8 text, so no extra frames or encoding are involved.
+ */
+export const EMOJIS: readonly string[] = [
+  // Faces
+  "😀",
+  "😃",
+  "😄",
+  "😁",
+  "😆",
+  "😅",
+  "😂",
+  "🤣",
+  "😊",
+  "😇",
+  "🙂",
+  "🙃",
+  "😉",
+  "😌",
+  "😍",
+  "🥰",
+  "😘",
+  "😋",
+  "😜",
+  "🤔",
+  // Hands
+  "👍",
+  "👎",
+  "👌",
+  "✌️",
+  "🤞",
+  "🤟",
+  "🤘",
+  "👏",
+  "🙌",
+  "🙏",
+  "💪",
+  "👋",
+  // Hearts
+  "❤️",
+  "🧡",
+  "💛",
+  "💚",
+  "💙",
+  "💜",
+  "🖤",
+  "🤍",
+  "💔",
+  "💕",
+  // Objects & symbols
+  "🎉",
+  "🎊",
+  "🎁",
+  "🎈",
+  "🍕",
+  "🍔",
+  "🍟",
+  "🍎",
+  "🍉",
+  "⚽",
+  "🏀",
+  "🎮",
+  "🎵",
+  "🎬",
+  "📷",
+  "📱",
+  "💻",
+  "🔥",
+  "⭐",
+  "🌙",
+  "☀️",
+  "🌈",
+];

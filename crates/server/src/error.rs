@@ -1,8 +1,8 @@
 //! Uniform error model: every failure is JSON `{"error": "<machine_code>", "message": "<human>"}`.
 
+use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 use serde::Serialize;
 
 #[derive(Debug, Serialize)]
@@ -62,6 +62,15 @@ pub enum AppError {
     /// 400 — malformed request (bad JSON, missing fields).
     #[error("bad request: {0}")]
     BadRequest(String),
+
+    /// 415 — upload body is not an accepted media type, or the declared
+    /// `Content-Type` disagrees with the sniffed magic bytes (M8 media).
+    #[error("unsupported media type")]
+    UnsupportedMediaType,
+
+    /// 413 — upload exceeded the per-kind size cap (M8 media).
+    #[error("payload too large")]
+    PayloadTooLarge,
 
     /// 500 — unexpected; details logged, never leaked to the client.
     #[error(transparent)]
@@ -134,6 +143,16 @@ impl IntoResponse for AppError {
                 msg.clone(),
             ),
             AppError::BadRequest(msg) => (StatusCode::BAD_REQUEST, "bad_request", msg.clone()),
+            AppError::UnsupportedMediaType => (
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "unsupported_type",
+                "unsupported media type".to_string(),
+            ),
+            AppError::PayloadTooLarge => (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "too_large",
+                "upload exceeds the size limit".to_string(),
+            ),
             AppError::Internal(err) => {
                 tracing::error!(error = %format!("{err:#}"), "internal server error");
                 (

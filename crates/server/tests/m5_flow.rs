@@ -9,18 +9,18 @@
 //! ephemeral-port WS + ping-filtering frame reader).
 
 use axum::{
+    Router,
     body::Body,
     http::{Request, StatusCode},
-    Router,
 };
 use futures_util::StreamExt;
 use http_body_util::BodyExt;
 use jiuyue_protocol::{Frame, FriendAccepted, FriendRequested, Payload, UserIdentity};
 use jiuyue_server::state::AppState;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sqlx::{Connection, PgConnection, PgPool};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::LazyLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tower::ServiceExt;
@@ -228,8 +228,7 @@ async fn send_friend_request(
 }
 
 async fn ws_connect(t: &TestApp, access: &str) -> WsClient {
-    let (status, body) =
-        send_http(&t.app, "POST", "/api/auth/ws-ticket", Some(access), None).await;
+    let (status, body) = send_http(&t.app, "POST", "/api/auth/ws-ticket", Some(access), None).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let ticket = body["ticket"].as_str().expect("ticket").to_owned();
     let url = format!("ws://127.0.0.1:{}/ws?ticket={ticket}&platform=web", t.port);
@@ -266,7 +265,8 @@ async fn ws_next_frame(ws: &mut WsClient) -> Frame {
     let text = ws_next_text(ws, READ_TIMEOUT)
         .await
         .expect("stream must deliver a text frame");
-    serde_json::from_str::<Frame>(&text).expect("wire frame must decode into jiuyue_protocol::Frame")
+    serde_json::from_str::<Frame>(&text)
+        .expect("wire frame must decode into jiuyue_protocol::Frame")
 }
 
 // ---------------------------------------------------------------------------
@@ -291,11 +291,22 @@ async fn friend_lifecycle_send_accept_list_unfriend() {
         b_id.to_string(),
         "response names the resolved peer"
     );
-    assert_eq!(body["to"]["uid"], json!(b_uid), "response carries the peer's uid");
+    assert_eq!(
+        body["to"]["uid"],
+        json!(b_uid),
+        "response carries the peer's uid"
+    );
     assert_eq!(body["to"]["username"], json!("frbob"));
 
     // B's inbox shows exactly one incoming request from A.
-    let (status, body) = send_http(&t.app, "GET", "/api/friends/requests", Some(&b_access), None).await;
+    let (status, body) = send_http(
+        &t.app,
+        "GET",
+        "/api/friends/requests",
+        Some(&b_access),
+        None,
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let incoming = body["incoming"].as_array().expect("incoming array");
     assert_eq!(incoming.len(), 1, "{body}");
@@ -304,19 +315,35 @@ async fn friend_lifecycle_send_accept_list_unfriend() {
         request_id.to_string()
     );
     assert_eq!(
-        incoming[0]["from"]["user_id"].as_str().expect("from.user_id"),
+        incoming[0]["from"]["user_id"]
+            .as_str()
+            .expect("from.user_id"),
         a_id.to_string()
     );
-    assert_eq!(incoming[0]["from"]["uid"], json!(a_uid), "inbox from carries uid");
+    assert_eq!(
+        incoming[0]["from"]["uid"],
+        json!(a_uid),
+        "inbox from carries uid"
+    );
     assert_eq!(incoming[0]["from"]["username"], json!("fralice"));
     assert!(incoming[0]["created_at"].is_string(), "RFC3339 created_at");
     assert!(
-        body["outgoing"].as_array().expect("outgoing array").is_empty(),
+        body["outgoing"]
+            .as_array()
+            .expect("outgoing array")
+            .is_empty(),
         "B sent nothing: {body}"
     );
 
     // A's outbox mirrors it.
-    let (status, body) = send_http(&t.app, "GET", "/api/friends/requests", Some(&a_access), None).await;
+    let (status, body) = send_http(
+        &t.app,
+        "GET",
+        "/api/friends/requests",
+        Some(&a_access),
+        None,
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let outgoing = body["outgoing"].as_array().expect("outgoing array");
     assert_eq!(outgoing.len(), 1, "{body}");
@@ -328,7 +355,11 @@ async fn friend_lifecycle_send_accept_list_unfriend() {
         outgoing[0]["to"]["user_id"].as_str().expect("to.user_id"),
         b_id.to_string()
     );
-    assert_eq!(outgoing[0]["to"]["uid"], json!(b_uid), "outbox to carries uid");
+    assert_eq!(
+        outgoing[0]["to"]["uid"],
+        json!(b_uid),
+        "outbox to carries uid"
+    );
 
     // B accepts → response names A (the person just befriended).
     let (status, body) = send_http(
@@ -344,7 +375,11 @@ async fn friend_lifecycle_send_accept_list_unfriend() {
         body["friend"]["user_id"].as_str().expect("friend.user_id"),
         a_id.to_string()
     );
-    assert_eq!(body["friend"]["uid"], json!(a_uid), "accept friend carries uid");
+    assert_eq!(
+        body["friend"]["uid"],
+        json!(a_uid),
+        "accept friend carries uid"
+    );
     assert_eq!(body["friend"]["username"], json!("fralice"));
 
     // Both friend lists show the symmetric edge.
@@ -356,8 +391,15 @@ async fn friend_lifecycle_send_accept_list_unfriend() {
         assert_eq!(status, StatusCode::OK, "{body}");
         let friends = body.as_array().expect("friend list array");
         assert_eq!(friends.len(), 1, "{body}");
-        assert_eq!(friends[0]["user_id"].as_str().expect("user_id"), peer_id.to_string());
-        assert_eq!(friends[0]["uid"], json!(peer_uid), "friend list item carries uid");
+        assert_eq!(
+            friends[0]["user_id"].as_str().expect("user_id"),
+            peer_id.to_string()
+        );
+        assert_eq!(
+            friends[0]["uid"],
+            json!(peer_uid),
+            "friend list item carries uid"
+        );
         assert_eq!(friends[0]["username"], json!(peer_username));
         assert!(friends[0]["since"].is_string(), "RFC3339 since");
     }
@@ -460,19 +502,53 @@ async fn declined_request_can_be_resent_and_cancelled_request_too() {
     assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
 
     // Inbox/outbox drained after the decline.
-    let (_, body) = send_http(&t.app, "GET", "/api/friends/requests", Some(&f_access), None).await;
-    assert!(body["incoming"].as_array().expect("array").is_empty(), "{body}");
-    let (_, body) = send_http(&t.app, "GET", "/api/friends/requests", Some(&e_access), None).await;
-    assert!(body["outgoing"].as_array().expect("array").is_empty(), "{body}");
+    let (_, body) = send_http(
+        &t.app,
+        "GET",
+        "/api/friends/requests",
+        Some(&f_access),
+        None,
+    )
+    .await;
+    assert!(
+        body["incoming"].as_array().expect("array").is_empty(),
+        "{body}"
+    );
+    let (_, body) = send_http(
+        &t.app,
+        "GET",
+        "/api/friends/requests",
+        Some(&e_access),
+        None,
+    )
+    .await;
+    assert!(
+        body["outgoing"].as_array().expect("array").is_empty(),
+        "{body}"
+    );
 
     // Re-send after decline is ALLOWED (row flipped back to pending).
     let (rid2, status, body) = send_friend_request(&t, &e_access, "decfinn").await;
-    assert_eq!(status, StatusCode::CREATED, "declined pair may re-request: {body}");
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "declined pair may re-request: {body}"
+    );
     let rid2 = rid2.expect("request id");
-    let (_, body) = send_http(&t.app, "GET", "/api/friends/requests", Some(&f_access), None).await;
+    let (_, body) = send_http(
+        &t.app,
+        "GET",
+        "/api/friends/requests",
+        Some(&f_access),
+        None,
+    )
+    .await;
     let incoming = body["incoming"].as_array().expect("array");
     assert_eq!(incoming.len(), 1, "{body}");
-    assert_eq!(incoming[0]["request_id"].as_str().expect("id"), rid2.to_string());
+    assert_eq!(
+        incoming[0]["request_id"].as_str().expect("id"),
+        rid2.to_string()
+    );
 
     // Sender cancel: Gina → Hank, Gina cancels before Hank reacts.
     let (_g_id, g_access) = register_user(&t, "can-gina@example.com", "cangina").await;
@@ -489,14 +565,38 @@ async fn declined_request_can_be_resent_and_cancelled_request_too() {
     )
     .await;
     assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
-    let (_, body) = send_http(&t.app, "GET", "/api/friends/requests", Some(&h_access), None).await;
-    assert!(body["incoming"].as_array().expect("array").is_empty(), "{body}");
-    let (_, body) = send_http(&t.app, "GET", "/api/friends/requests", Some(&g_access), None).await;
-    assert!(body["outgoing"].as_array().expect("array").is_empty(), "{body}");
+    let (_, body) = send_http(
+        &t.app,
+        "GET",
+        "/api/friends/requests",
+        Some(&h_access),
+        None,
+    )
+    .await;
+    assert!(
+        body["incoming"].as_array().expect("array").is_empty(),
+        "{body}"
+    );
+    let (_, body) = send_http(
+        &t.app,
+        "GET",
+        "/api/friends/requests",
+        Some(&g_access),
+        None,
+    )
+    .await;
+    assert!(
+        body["outgoing"].as_array().expect("array").is_empty(),
+        "{body}"
+    );
 
     // Cancelled pair may also re-request.
     let (_, status, body) = send_friend_request(&t, &g_access, "canhank").await;
-    assert_eq!(status, StatusCode::CREATED, "cancelled pair may re-request: {body}");
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "cancelled pair may re-request: {body}"
+    );
 
     // Decline the re-sent request once more: its id is terminal again until
     // yet another re-send flips the row back (accepting a declined request
@@ -636,12 +736,21 @@ async fn friend_wire_frames_reach_live_sockets_only() {
     match ws_next_frame(&mut ws_b).await.payload {
         Payload::FriendRequested(FriendRequested {
             request_id,
-            from: UserIdentity { user_id, uid, username },
+            from:
+                UserIdentity {
+                    user_id,
+                    uid,
+                    username,
+                },
         }) => {
             assert_eq!(request_id, rid);
             assert_eq!(user_id, a_id, "relay stamps the authenticated sender");
             assert_eq!(username, "wirealice");
-            assert_eq!(uid, Some(a_uid as u64), "relay carries the sender's stable numeric uid");
+            assert_eq!(
+                uid,
+                Some(a_uid as u64),
+                "relay carries the sender's stable numeric uid"
+            );
         }
         other => panic!("expected friend.requested on recipient socket, got {other:?}"),
     }
@@ -658,20 +767,35 @@ async fn friend_wire_frames_reach_live_sockets_only() {
     assert_eq!(status, StatusCode::OK, "{body}");
     match ws_next_frame(&mut ws_a).await.payload {
         Payload::FriendAccepted(FriendAccepted {
-            friend: UserIdentity { user_id, uid, username },
+            friend:
+                UserIdentity {
+                    user_id,
+                    uid,
+                    username,
+                },
         }) => {
             assert_eq!(user_id, b_id, "the frame names WHO accepted");
             assert_eq!(username, "wirebob");
-            assert_eq!(uid, Some(b_uid as u64), "relay carries the accepter's stable numeric uid");
+            assert_eq!(
+                uid,
+                Some(b_uid as u64),
+                "relay carries the accepter's stable numeric uid"
+            );
         }
         other => panic!("expected friend.accepted on sender socket, got {other:?}"),
     }
 
     // Fire-and-forget means exactly one frame each — nothing else follows.
     let extra_a = ws_next_text(&mut ws_a, SILENCE_PROBE).await;
-    assert!(extra_a.is_none(), "sender socket must stay silent, got {extra_a:?}");
+    assert!(
+        extra_a.is_none(),
+        "sender socket must stay silent, got {extra_a:?}"
+    );
     let extra_b = ws_next_text(&mut ws_b, SILENCE_PROBE).await;
-    assert!(extra_b.is_none(), "recipient socket must stay silent, got {extra_b:?}");
+    assert!(
+        extra_b.is_none(),
+        "recipient socket must stay silent, got {extra_b:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -727,10 +851,18 @@ async fn user_search_finds_by_exact_uid_and_uid_prefix() {
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let hits = body.as_array().expect("array body");
-    assert_eq!(hits.len(), 2, "exact match + prefix match, self excluded: {body}");
+    assert_eq!(
+        hits.len(),
+        2,
+        "exact match + prefix match, self excluded: {body}"
+    );
     assert_eq!(hits[0]["uid"], json!(my_uid), "exact uid ranks first");
     assert_eq!(hits[0]["username"], "srchme");
-    assert_eq!(hits[1]["uid"], json!(b_uid), "then prefix matches by uid order");
+    assert_eq!(
+        hits[1]["uid"],
+        json!(b_uid),
+        "then prefix matches by uid order"
+    );
     assert_eq!(hits[1]["username"], "srchb");
     assert!(
         hits.iter().all(|h| h["user_id"].as_str().is_some()),
@@ -848,7 +980,11 @@ async fn user_search_disambiguates_numeric_usernames_from_uids() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body.as_array().expect("array body").len(), 0, "self uid must be excluded");
+    assert_eq!(
+        body.as_array().expect("array body").len(),
+        0,
+        "self uid must be excluded"
+    );
 }
 
 #[tokio::test]
@@ -875,14 +1011,8 @@ async fn user_search_bearer_required_and_empty_q_is_422() {
     assert_eq!(error_code(&body), "validation_error");
 
     // Missing q entirely → 422 validation_error.
-    let (status, body) = send_http(
-        &t.app,
-        "GET",
-        "/api/users/search",
-        Some(&me_access),
-        None,
-    )
-    .await;
+    let (status, body) =
+        send_http(&t.app, "GET", "/api/users/search", Some(&me_access), None).await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
     assert_eq!(error_code(&body), "validation_error");
 

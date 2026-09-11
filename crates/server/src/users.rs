@@ -120,13 +120,15 @@ async fn search_numeric(
 
     Ok(rows
         .into_iter()
-        .map(|(user_id, username, uid, display_name, avatar, _rank)| SearchResultItem {
-            user_id,
-            username: username.clone(),
-            uid,
-            display_name: crate::profile::effective_display_name(&display_name, &username),
-            avatar,
-        })
+        .map(
+            |(user_id, username, uid, display_name, avatar, _rank)| SearchResultItem {
+                user_id,
+                username: username.clone(),
+                uid,
+                display_name: crate::profile::effective_display_name(&display_name, &username),
+                avatar,
+            },
+        )
         .collect())
 }
 
@@ -161,12 +163,14 @@ async fn search_by_username(
 
     Ok(rows
         .into_iter()
-        .map(|(user_id, username, uid, display_name, avatar, _rank)| SearchResultItem {
-            user_id,
-            username: username.clone(),
-            uid,
-            display_name: crate::profile::effective_display_name(&display_name, &username),
-            avatar,
-        })
+        .map(
+            |(user_id, username, uid, display_name, avatar, _rank)| SearchResultItem {
+                user_id,
+                username: username.clone(),
+                uid,
+                display_name: crate::profile::effective_display_name(&display_name, &username),
+                avatar,
+            },
+        )
         .collect())
 }

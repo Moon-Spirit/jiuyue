@@ -22,7 +22,7 @@
 
 use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Key, Nonce};
-use anyhow::{anyhow, Context};
+use anyhow::{Context, anyhow};
 use rand::RngCore;
 use sha2::{Digest, Sha256};
 

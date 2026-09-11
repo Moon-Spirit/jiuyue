@@ -4,10 +4,10 @@ use crate::auth::extract::AuthUser;
 use crate::auth::{jwt, password, tokens, ws_ticket};
 use crate::error::{AppError, ConflictKind};
 use crate::state::AppState;
-use axum::extract::rejection::JsonRejection;
-use axum::extract::State;
-use axum::http::StatusCode;
 use axum::Json;
+use axum::extract::State;
+use axum::extract::rejection::JsonRejection;
+use axum::http::StatusCode;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use time::{Duration as TimeDuration, OffsetDateTime};
@@ -119,8 +119,8 @@ fn normalize_target(channel: &Channel, raw: &str) -> Option<String> {
         }
         Channel::Phone => {
             let digits = trimmed.strip_prefix('+').unwrap_or(trimmed);
-            let plausible = (5..=20).contains(&digits.len())
-                && digits.chars().all(|c| c.is_ascii_digit());
+            let plausible =
+                (5..=20).contains(&digits.len()) && digits.chars().all(|c| c.is_ascii_digit());
             plausible.then(|| trimmed.to_string())
         }
     }
@@ -215,10 +215,7 @@ pub async fn request_code(
 ) -> Result<(StatusCode, Json<RequestCodeResponse>), AppError> {
     let Json(req) = payload.map_err(bad_json)?;
     let target = normalize_target(&req.channel, &req.target).ok_or_else(|| {
-        AppError::Validation(format!(
-            "invalid {} address format",
-            req.channel.as_str()
-        ))
+        AppError::Validation(format!("invalid {} address format", req.channel.as_str()))
     })?;
 
     let code = six_digit_code();
@@ -248,22 +245,23 @@ pub async fn register(
 ) -> Result<(StatusCode, Json<RegisterResponse>), AppError> {
     let Json(req) = payload.map_err(bad_json)?;
     let channel_str = req.channel.as_str();
-    let target = normalize_target(&req.channel, &req.target).ok_or_else(|| {
-        AppError::Validation(format!("invalid {} address format", channel_str))
-    })?;
+    let target = normalize_target(&req.channel, &req.target)
+        .ok_or_else(|| AppError::Validation(format!("invalid {} address format", channel_str)))?;
     let username = req.username.trim().to_string();
     validate_credentials_inputs(&username, &req.password)?;
 
     // Wrong code vs unknown target: identical generic 401 (anti-enumeration).
     let dev_code_allowed = cfg!(debug_assertions);
-    if !state.codes.verify(channel_str, &target, &req.code, dev_code_allowed) {
+    if !state
+        .codes
+        .verify(channel_str, &target, &req.code, dev_code_allowed)
+    {
         return Err(AppError::InvalidCode);
     }
     state.codes.consume(channel_str, &target);
 
     let user_id = Uuid::now_v7();
-    let password_hash =
-        password::hash_password(&req.password).map_err(AppError::internal)?;
+    let password_hash = password::hash_password(&req.password).map_err(AppError::internal)?;
 
     let mut tx = state.pool.begin().await.map_err(AppError::internal)?;
     // Allocate the stable numeric uid INSIDE the insert transaction. nextval
@@ -294,7 +292,9 @@ pub async fn register(
     .map_err(classify_insert_error)?;
     tx.commit().await.map_err(AppError::internal)?;
 
-    let session = issue_session(&state, user_id).await.map_err(AppError::internal)?;
+    let session = issue_session(&state, user_id)
+        .await
+        .map_err(AppError::internal)?;
     tracing::info!(%user_id, %username, "user registered via {channel_str}");
     Ok((
         StatusCode::CREATED,
@@ -336,7 +336,9 @@ pub async fn login(
         return Err(AppError::InvalidCredentials);
     }
 
-    let session = issue_session(&state, user_id).await.map_err(AppError::internal)?;
+    let session = issue_session(&state, user_id)
+        .await
+        .map_err(AppError::internal)?;
     Ok(Json(LoginResponse {
         access_token: session.access_token,
         refresh_token: session.refresh_token,
@@ -353,8 +355,8 @@ pub async fn refresh(
     payload: Result<Json<RefreshRequest>, JsonRejection>,
 ) -> Result<Json<TokenPairResponse>, AppError> {
     let Json(req) = payload.map_err(bad_json)?;
-    let presented_hash = tokens::stored_hash(&req.refresh_token)
-        .map_err(|_| AppError::InvalidCredentials)?;
+    let presented_hash =
+        tokens::stored_hash(&req.refresh_token).map_err(|_| AppError::InvalidCredentials)?;
 
     let row: Option<(Uuid, Uuid, OffsetDateTime, Option<OffsetDateTime>)> = sqlx::query_as(
         "SELECT id, user_id, expires_at, revoked_at FROM refresh_tokens WHERE token_hash = $1",
@@ -410,6 +412,8 @@ pub async fn ws_ticket(
     State(state): State<AppState>,
     user: AuthUser,
 ) -> Result<Json<WsTicketResponse>, AppError> {
-    let ticket = ws_ticket::issue(&state, user.0).await.map_err(AppError::internal)?;
+    let ticket = ws_ticket::issue(&state, user.0)
+        .await
+        .map_err(AppError::internal)?;
     Ok(Json(WsTicketResponse { ticket }))
 }

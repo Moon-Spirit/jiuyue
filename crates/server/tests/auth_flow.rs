@@ -13,12 +13,12 @@
 //! running test in another.
 
 use axum::http::{Request, StatusCode};
-use axum::{body::Body, Router};
+use axum::{Router, body::Body};
 use http_body_util::BodyExt;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sqlx::{Connection, PgConnection, PgPool};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::LazyLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tower::ServiceExt;
 
 use jiuyue_server::auth::ws_ticket;
@@ -26,8 +26,7 @@ use jiuyue_server::error::AppError;
 use jiuyue_server::state::AppState;
 
 /// Serializes tests and guards the one-time schema reset.
-static GATE: LazyLock<tokio::sync::Mutex<()>> =
-    LazyLock::new(|| tokio::sync::Mutex::const_new(()));
+static GATE: LazyLock<tokio::sync::Mutex<()>> = LazyLock::new(|| tokio::sync::Mutex::const_new(()));
 static SCHEMA_READY: AtomicBool = AtomicBool::new(false);
 
 /// Arbitrary fixed key shared by every JiuYue test binary.
@@ -223,8 +222,16 @@ async fn email_register_login_refresh_and_ws_ticket_roundtrip() {
     assert_eq!(status, StatusCode::OK, "{login_email}");
 
     // Login mirrors the profile (incl. the stable uid) for client display.
-    assert_eq!(login_user["uid"], json!(reg_uid), "login by username carries the same uid");
-    assert_eq!(login_email["uid"], json!(reg_uid), "login by email carries the same uid");
+    assert_eq!(
+        login_user["uid"],
+        json!(reg_uid),
+        "login by username carries the same uid"
+    );
+    assert_eq!(
+        login_email["uid"],
+        json!(reg_uid),
+        "login by email carries the same uid"
+    );
     assert_eq!(login_user["user_id"], reg["user_id"]);
     assert_eq!(login_email["username"], "alice");
 
@@ -266,14 +273,8 @@ async fn email_register_login_refresh_and_ws_ticket_roundtrip() {
     assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
 
     // ...and yields a single-use ticket bound to the user
-    let (status, ticket_body) = send(
-        &t.app,
-        "POST",
-        "/api/auth/ws-ticket",
-        Some(&access),
-        None,
-    )
-    .await;
+    let (status, ticket_body) =
+        send(&t.app, "POST", "/api/auth/ws-ticket", Some(&access), None).await;
     assert_eq!(status, StatusCode::OK, "{ticket_body}");
     let ticket = ticket_body["ticket"].as_str().unwrap();
 
@@ -597,14 +598,8 @@ async fn ws_ticket_is_single_use() {
     .await;
     let access = reg["access_token"].as_str().unwrap();
 
-    let (status, ticket_body) = send(
-        &t.app,
-        "POST",
-        "/api/auth/ws-ticket",
-        Some(access),
-        None,
-    )
-    .await;
+    let (status, ticket_body) =
+        send(&t.app, "POST", "/api/auth/ws-ticket", Some(access), None).await;
     assert_eq!(status, StatusCode::OK, "{ticket_body}");
     let ticket = ticket_body["ticket"].as_str().unwrap();
 
@@ -651,21 +646,19 @@ async fn migrations_run_idempotently() {
     let _guard = GATE.lock().await;
     let t = test_app().await;
 
-    let count_before: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM _sqlx_migrations")
-            .fetch_one(&t.pool)
-            .await
-            .expect("count migrations");
+    let count_before: i64 = sqlx::query_scalar("SELECT count(*) FROM _sqlx_migrations")
+        .fetch_one(&t.pool)
+        .await
+        .expect("count migrations");
 
     // Running the migrator repeatedly must be a no-op, not an error.
     jiuyue_server::MIGRATOR.run(&t.pool).await.expect("rerun 1");
     jiuyue_server::MIGRATOR.run(&t.pool).await.expect("rerun 2");
 
-    let count_after: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM _sqlx_migrations")
-            .fetch_one(&t.pool)
-            .await
-            .expect("count migrations");
+    let count_after: i64 = sqlx::query_scalar("SELECT count(*) FROM _sqlx_migrations")
+        .fetch_one(&t.pool)
+        .await
+        .expect("count migrations");
 
     assert!(count_before >= 1);
     assert_eq!(count_before, count_after, "migrations re-applied!");
@@ -767,8 +760,7 @@ async fn login_response_includes_profile_for_client_display() {
     assert_eq!(body["user_id"], Value::String(user_id), "{body}");
     assert_eq!(body["username"], "profileuser");
     assert_eq!(
-        body["uid"],
-        reg["uid"],
+        body["uid"], reg["uid"],
         "login profile carries the same uid the register response returned"
     );
 }

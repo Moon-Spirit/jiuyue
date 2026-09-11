@@ -151,3 +151,29 @@ fn unknown_frame_type_fixture_parses_into_typed_error_without_panicking() {
         );
     }
 }
+
+#[test]
+fn msg_send_media_fixture_carries_typed_media_ref() {
+    let contents = fs::read_to_string(Path::new(GOLDEN_DIR).join("msg_send_media.json"))
+        .expect("media golden fixture readable");
+    let input: Value = serde_json::from_str(&contents).expect("valid JSON");
+    let frame: Frame = serde_json::from_value(input.clone()).expect("decodes into Frame");
+    match &frame.payload {
+        Payload::MsgSend(send) => {
+            let media = send.media.as_ref().expect("media present");
+            assert_eq!(media.kind, "image");
+            assert_eq!(media.mime, "image/png");
+            assert_eq!(media.bytes, 2048);
+            assert_eq!(media.file_name, "holiday-photo.png");
+            assert_eq!(media.width, Some(800));
+            assert_eq!(media.height, Some(600));
+            assert_eq!(send.body, "", "media send carries an empty body");
+        }
+        other => panic!("expected msg.send, got {other:?}"),
+    }
+    let output: Value = serde_json::to_value(&frame).expect("serializes");
+    assert_eq!(
+        input, output,
+        "media golden fixture must roundtrip losslessly"
+    );
+}

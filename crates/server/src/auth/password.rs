@@ -1,10 +1,10 @@
 //! argon2id password hashing (OWASP-default params via `Argon2::default`).
 
 use anyhow::anyhow;
-use argon2::password_hash::{
-    rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString,
-};
 use argon2::Argon2;
+use argon2::password_hash::{
+    PasswordHash, PasswordHasher, PasswordVerifier, SaltString, rand_core::OsRng,
+};
 
 pub fn hash_password(password: &str) -> anyhow::Result<String> {
     let salt = SaltString::generate(&mut OsRng);

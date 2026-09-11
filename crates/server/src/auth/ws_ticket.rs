@@ -4,8 +4,8 @@
 
 use crate::error::AppError;
 use crate::state::AppState;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use rand::RngCore;
 use uuid::Uuid;
 
@@ -79,8 +79,10 @@ pub async fn consume(state: &AppState, ticket: &str) -> Result<Uuid, AppError> {
         }
     }
 
-    let user_id =
-        held.ok_or(AppError::InvalidCredentials)?.parse::<Uuid>().map_err(|err| {
+    let user_id = held
+        .ok_or(AppError::InvalidCredentials)?
+        .parse::<Uuid>()
+        .map_err(|err| {
             AppError::Internal(anyhow::anyhow!("ws_ticket held malformed user id: {err}"))
         })?;
     Ok(user_id)

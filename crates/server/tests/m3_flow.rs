@@ -15,21 +15,21 @@
 //!    (plaintext `msg.new` + encrypted `e2ee.msg`) in seq order.
 
 use axum::{
+    Router,
     body::Body,
     http::{Request, StatusCode},
-    Router,
 };
 use futures_util::{SinkExt, StreamExt};
 use http_body_util::BodyExt;
 use jiuyue_protocol::{
-    E2eeMsg, ErrorCode, Frame, MsgAck, MsgNew, MsgRecall, MsgRecalled, MsgSend, Payload,
-    SyncCursor, SyncMessage, SyncReq, PROTOCOL_VERSION,
+    E2eeMsg, ErrorCode, Frame, MsgAck, MsgNew, MsgRecall, MsgRecalled, MsgSend, PROTOCOL_VERSION,
+    Payload, SyncCursor, SyncMessage, SyncReq,
 };
 use jiuyue_server::state::AppState;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sqlx::{Connection, PgConnection, PgPool};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::LazyLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
@@ -237,11 +237,17 @@ async fn ws_next_frame(ws: &mut WsClient) -> Frame {
         .expect("stream must stay open")
         .expect("ws stream healthy");
     let text = msg.to_text().expect("text frame").to_owned();
-    serde_json::from_str::<Frame>(&text).expect("wire frame must decode into jiuyue_protocol::Frame")
+    serde_json::from_str::<Frame>(&text)
+        .expect("wire frame must decode into jiuyue_protocol::Frame")
 }
 
 /// Creates a conversation of the given kind over HTTP; returns the body.
-async fn create_conversation(t: &TestApp, creator_access: &str, peer_username: &str, kind: Option<&str>) -> Value {
+async fn create_conversation(
+    t: &TestApp,
+    creator_access: &str,
+    peer_username: &str,
+    kind: Option<&str>,
+) -> Value {
     let mut payload = json!({ "peer_username": peer_username });
     if let Some(kind) = kind {
         payload["kind"] = json!(kind);
@@ -259,7 +265,9 @@ async fn create_conversation(t: &TestApp, creator_access: &str, peer_username: &
 }
 
 fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
-    haystack.windows(needle.len()).any(|window| window == needle)
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
 }
 
 // ---------------------------------------------------------------------------
@@ -296,7 +304,10 @@ async fn key_upload_then_fetch_claims_exactly_one_key_until_exhaustion() {
     .await;
     assert_eq!(status, StatusCode::CREATED, "{uploaded}");
     assert_eq!(uploaded["one_time_key_count"], json!(2));
-    let device_id = uploaded["device_id"].as_str().expect("device_id").to_owned();
+    let device_id = uploaded["device_id"]
+        .as_str()
+        .expect("device_id")
+        .to_owned();
 
     // Re-upload targeting the SAME device replaces the bundle (upsert row).
     let (status, re) = send_http(
@@ -308,12 +319,11 @@ async fn key_upload_then_fetch_claims_exactly_one_key_until_exhaustion() {
     )
     .await;
     assert_eq!(status, StatusCode::CREATED, "{re}");
-    let rows: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM e2ee_identities WHERE user_id = $1")
-            .bind(_a_id)
-            .fetch_one(&t.pool)
-            .await
-            .expect("count bundles");
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM e2ee_identities WHERE user_id = $1")
+        .bind(_a_id)
+        .fetch_one(&t.pool)
+        .await
+        .expect("count bundles");
     assert_eq!(rows, 1, "upsert keyed by device keeps exactly one row");
 
     // A device_id owned by someone else is rejected.
@@ -328,14 +338,16 @@ async fn key_upload_then_fetch_claims_exactly_one_key_until_exhaustion() {
     assert_eq!(status, StatusCode::BAD_REQUEST, "{err}");
 
     // Claiming pops exactly ONE key per fetch (the freshest stored first).
-    let (status, bundle) = send_http(&t.app, "GET", "/api/e2ee/keys/kia", Some(&b_access), None).await;
+    let (status, bundle) =
+        send_http(&t.app, "GET", "/api/e2ee/keys/kia", Some(&b_access), None).await;
     assert_eq!(status, StatusCode::OK, "{bundle}");
     assert_eq!(bundle["identity_key"], json!("ik-base64-a2"));
     assert_eq!(bundle["one_time_key"], json!("otk-beta"));
     assert!(bundle["user_id"].as_str().is_some());
     assert_eq!(bundle["device_id"], json!(device_id));
 
-    let (status, bundle2) = send_http(&t.app, "GET", "/api/e2ee/keys/kia", Some(&b_access), None).await;
+    let (status, bundle2) =
+        send_http(&t.app, "GET", "/api/e2ee/keys/kia", Some(&b_access), None).await;
     assert_eq!(status, StatusCode::OK, "{bundle2}");
     assert_eq!(bundle2["one_time_key"], json!("otk-alpha"));
 
@@ -345,7 +357,14 @@ async fn key_upload_then_fetch_claims_exactly_one_key_until_exhaustion() {
     assert_eq!(err["error"], json!("no_one_time_keys"));
 
     // Unknown username → plain 404.
-    let (status, err) = send_http(&t.app, "GET", "/api/e2ee/keys/nobody", Some(&b_access), None).await;
+    let (status, err) = send_http(
+        &t.app,
+        "GET",
+        "/api/e2ee/keys/nobody",
+        Some(&b_access),
+        None,
+    )
+    .await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{err}");
 
     // Unauthenticated fetches are rejected.
@@ -446,7 +465,10 @@ async fn e2ee_msg_loops_end_to_end_and_stores_verbatim_ciphertext() {
         }) => {
             assert_eq!(got_conv, conversation_id);
             assert_eq!(got_cmid, client_msg_id);
-            assert_eq!(got_ct, ciphertext, "ciphertext must survive the relay verbatim");
+            assert_eq!(
+                got_ct, ciphertext,
+                "ciphertext must survive the relay verbatim"
+            );
             assert_eq!(got_mt, 0);
         }
         other => panic!("expected mirrored e2ee.msg, got {other:?}"),
@@ -492,12 +514,11 @@ async fn e2ee_msg_loops_end_to_end_and_stores_verbatim_ciphertext() {
         .await
         .expect("count messages");
     assert_eq!(rows, 1, "duplicate e2ee.msg must dedupe down to one row");
-    let last_seq: i64 =
-        sqlx::query_scalar("SELECT last_seq FROM conversations WHERE id = $1")
-            .bind(conversation_id)
-            .fetch_one(&t.pool)
-            .await
-            .expect("read last_seq");
+    let last_seq: i64 = sqlx::query_scalar("SELECT last_seq FROM conversations WHERE id = $1")
+        .bind(conversation_id)
+        .fetch_one(&t.pool)
+        .await
+        .expect("read last_seq");
     assert_eq!(last_seq, 1, "duplicates must not advance the counter");
 }
 
@@ -564,13 +585,12 @@ async fn recall_works_on_secret_conversation_messages() {
         }
     }
 
-    let recalled_at: Option<time::OffsetDateTime> = sqlx::query_scalar(
-        "SELECT recalled_at FROM messages WHERE id = $1",
-    )
-    .bind(message_id)
-    .fetch_one(&t.pool)
-    .await
-    .expect("fetch recalled_at");
+    let recalled_at: Option<time::OffsetDateTime> =
+        sqlx::query_scalar("SELECT recalled_at FROM messages WHERE id = $1")
+            .bind(message_id)
+            .fetch_one(&t.pool)
+            .await
+            .expect("fetch recalled_at");
     assert!(recalled_at.is_some(), "tombstone must be persisted");
 
     // Double recall is refused as a conflict (tombstone is terminal).
@@ -604,6 +624,7 @@ async fn reconnect_sync_replays_stored_e2ee_frames_in_order() {
             client_msg_id: Uuid::now_v7(),
             body: "plain-hello".to_owned(),
             reply_to: None,
+            media: None,
         }),
     };
     ws_send_text(
@@ -659,9 +680,7 @@ async fn reconnect_sync_replays_stored_e2ee_frames_in_order() {
             assert_eq!(res.messages.len(), 2, "{res:?}");
             match (&res.messages[0], &res.messages[1]) {
                 (
-                    SyncMessage::Plain(MsgNew {
-                        seq, body, ..
-                    }),
+                    SyncMessage::Plain(MsgNew { seq, body, .. }),
                     SyncMessage::Encrypted(E2eeMsg {
                         ciphertext,
                         message_type,

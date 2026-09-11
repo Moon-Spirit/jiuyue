@@ -23,8 +23,8 @@ impl FromRequestParts<crate::state::AppState> for AuthUser {
         let token = header
             .strip_prefix("Bearer ")
             .ok_or(AppError::InvalidCredentials)?;
-        let user_id =
-            jwt::verify_access(&state.jwt_secret, token).map_err(|_| AppError::InvalidCredentials)?;
+        let user_id = jwt::verify_access(&state.jwt_secret, token)
+            .map_err(|_| AppError::InvalidCredentials)?;
         Ok(AuthUser(user_id))
     }
 }

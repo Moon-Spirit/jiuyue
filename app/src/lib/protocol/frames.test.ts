@@ -4,6 +4,7 @@ import { describe, expect, it } from "vitest";
 import authTicketReq from "../../../../crates/protocol/tests/golden/auth_ticket_req.json";
 import authTicketRes from "../../../../crates/protocol/tests/golden/auth_ticket_res.json";
 import msgSend from "../../../../crates/protocol/tests/golden/msg_send.json";
+import msgSendMedia from "../../../../crates/protocol/tests/golden/msg_send_media.json";
 import msgAck from "../../../../crates/protocol/tests/golden/msg_ack.json";
 import msgNew from "../../../../crates/protocol/tests/golden/msg_new.json";
 import syncReq from "../../../../crates/protocol/tests/golden/sync_req.json";
@@ -22,6 +23,8 @@ import unknownType from "../../../../crates/protocol/tests/golden/unknown_type.j
 
 import {
   isFrame,
+  isMediaRef,
+  isMsgNew,
   isMsgSend,
   isSyncCursor,
   parseFrame,
@@ -34,6 +37,7 @@ const KNOWN_FIXTURES: [string, object][] = [
   ["auth_ticket_req", authTicketReq],
   ["auth_ticket_res", authTicketRes],
   ["msg_send", msgSend],
+  ["msg_send_media", msgSendMedia],
   ["msg_ack", msgAck],
   ["msg_new", msgNew],
   ["sync_req", syncReq],
@@ -190,5 +194,111 @@ describe("type guards", () => {
       expect(isFrame(fixture)).toBe(true);
     expect(isFrame(unknownType)).toBe(true); // degrades to error frame, still a Frame
     expect(isFrame({ nope: true })).toBe(false);
+  });
+});
+
+describe("M8 media references (additive, null-absent)", () => {
+  const validMedia = {
+    media_id: "0190aabb-ccdd-7e01-8a1b-2c3d4e5f6071",
+    kind: "image",
+    mime: "image/png",
+    bytes: 12345,
+    file_name: "photo.png",
+    width: 800,
+    height: 600,
+  };
+
+  it("accepts a well-formed MediaRef (with and without dimensions)", () => {
+    expect(isMediaRef(validMedia)).toBe(true);
+    expect(
+      isMediaRef({
+        media_id: validMedia.media_id,
+        kind: validMedia.kind,
+        mime: validMedia.mime,
+        bytes: validMedia.bytes,
+        file_name: validMedia.file_name,
+      }),
+    ).toBe(true);
+  });
+
+  it("rejects malformed MediaRefs", () => {
+    expect(isMediaRef(null)).toBe(false);
+    expect(isMediaRef("x")).toBe(false);
+    expect(isMediaRef({ ...validMedia, media_id: undefined })).toBe(false);
+    expect(isMediaRef({ ...validMedia, kind: "audio" })).toBe(false);
+    expect(isMediaRef({ ...validMedia, bytes: "12" })).toBe(false);
+    expect(isMediaRef({ ...validMedia, width: "800" })).toBe(false);
+    expect(isMediaRef({ ...validMedia, file_name: 7 })).toBe(false);
+  });
+
+  it("keeps msg.send valid when media is absent (M1 byte-identical)", () => {
+    expect(isMsgSend((msgSend as { d: unknown }).d)).toBe(true);
+    expect(serializeFrame(parseFrame(msgSend))).toEqual(msgSend);
+  });
+
+  it("parses msg.send carrying a media ref and round-trips unchanged", () => {
+    const fixture = {
+      v: 1,
+      t: "msg.send",
+      d: {
+        conversation_id: 42,
+        client_msg_id: "0190aabb-ccdd-7e01-8a1b-2c3d4e5f6071",
+        body: "",
+        media: validMedia,
+      },
+    };
+    const frame = parseFrame(fixture);
+    expect(frame.t).toBe("msg.send");
+    if (frame.t !== "msg.send") throw new Error("unreachable");
+    expect(frame.d.body).toBe("");
+    expect(frame.d.media?.media_id).toBe(validMedia.media_id);
+    expect(serializeFrame(frame)).toEqual(fixture);
+  });
+
+  it("parses msg.new carrying a media ref and exposes it on the union", () => {
+    const fixture = {
+      v: 1,
+      t: "msg.new",
+      d: {
+        message_id: "m-media",
+        conversation_id: 42,
+        seq: 7,
+        sender_id: "peer-1",
+        body: "",
+        sent_at: "2026-09-11T10:00:00Z",
+        media: { ...validMedia, kind: "video", mime: "video/mp4" },
+      },
+    };
+    const frame = parseFrame(fixture);
+    expect(frame.t).toBe("msg.new");
+    if (frame.t !== "msg.new") throw new Error("unreachable");
+    expect(frame.d.media?.kind).toBe("video");
+    expect(serializeFrame(frame)).toEqual(fixture);
+  });
+
+  it("rejects msg.send/msg.new whose media is present but malformed", () => {
+    expect(() =>
+      parseFrame({
+        v: 1,
+        t: "msg.send",
+        d: {
+          conversation_id: 1,
+          client_msg_id: "c1",
+          body: "",
+          media: { kind: "image" },
+        },
+      }),
+    ).toThrow();
+    expect(
+      isMsgNew({
+        message_id: "m",
+        conversation_id: 1,
+        seq: 1,
+        sender_id: "s",
+        body: "",
+        sent_at: "t",
+        media: { ...validMedia, bytes: 1.5 },
+      }),
+    ).toBe(false);
   });
 });

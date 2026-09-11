@@ -2,16 +2,17 @@
 //! drive it with `tower::ServiceExt::oneshot` (HTTP) or a real listener (WS).
 
 use crate::state::AppState;
-use crate::{auth, chat, e2ee, friends, push, users, ws};
-use axum::routing::get;
+use crate::{auth, chat, e2ee, friends, media, push, users, ws};
 use axum::Router;
+use axum::routing::{get, post};
 
 async fn healthz() -> &'static str {
     "ok"
 }
 
-/// Full application router: `/healthz` + `/api/auth/*` + `/api/conversations`
-/// + `/api/e2ee/*` + `/api/friends/*` + `/ws` (dev builds add `/api/dev/push-log`).
+/// Full application router: `/healthz`, `/api/auth/*`, `/api/conversations`,
+/// `/api/e2ee/*`, `/api/friends/*`, `/api/media/*`, `/ws` (dev builds add
+/// `/api/dev/push-log`).
 pub fn build_router(state: AppState) -> Router {
     let mut router = Router::new()
         .route("/healthz", get(healthz))
@@ -23,6 +24,8 @@ pub fn build_router(state: AppState) -> Router {
             "/api/conversations",
             get(chat::list_conversations).post(chat::create_direct),
         )
+        .route("/api/media", post(media::upload))
+        .route("/api/media/{id}", get(media::serve))
         .route("/ws", get(ws::ws_handler));
 
     // M4 debug surface for offline-push evidence. Dev-profile only

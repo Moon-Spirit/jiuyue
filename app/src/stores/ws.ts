@@ -15,6 +15,7 @@ import type {
   ErrorCode,
   ErrorPayload,
   Frame,
+  MediaRef,
   MsgAck,
   MsgNew,
   MsgRecalled,
@@ -58,6 +59,54 @@ export type WsStatus =
 /** M2: `read` = the peer's read receipt covered this message. */
 export type MessageStatus = "sending" | "delivered" | "read" | "failed";
 
+/** M8 media kind, mirrored on the wire as `MediaRef.kind`. */
+export type MediaKind = "image" | "video";
+
+/**
+ * Local (camelCase) view of an M8 media attachment. Inbound `MediaRef`
+ * snake_case fields are mapped here the same way top-level wire fields are
+ * (e.g. `reply_to_message_id` → `replyToMessageId`); the reverse mapping
+ * happens when building an outbound `msg.send` frame.
+ */
+export interface ChatMessageMedia {
+  mediaId: string;
+  kind: MediaKind;
+  mime: string;
+  bytes: number;
+  fileName: string;
+  /** Natural pixel dimensions (best-effort); undefined when probe failed. */
+  width?: number;
+  height?: number;
+}
+
+/** Wire (`MediaRef`) → local (`ChatMessageMedia`) mapper. */
+function fromMediaRef(ref: MediaRef): ChatMessageMedia {
+  const media: ChatMessageMedia = {
+    mediaId: ref.media_id,
+    kind: ref.kind,
+    mime: ref.mime,
+    bytes: ref.bytes,
+    fileName: ref.file_name,
+  };
+  if (ref.width !== undefined) media.width = ref.width;
+  if (ref.height !== undefined) media.height = ref.height;
+  return media;
+}
+
+/** Local (`ChatMessageMedia`) → wire (`MediaRef`) mapper. */
+function toMediaRef(media: ChatMessageMedia): MediaRef {
+  const ref: MediaRef = {
+    media_id: media.mediaId,
+    kind: media.kind,
+    mime: media.mime,
+    bytes: media.bytes,
+    file_name: media.fileName,
+  };
+  if (media.width !== undefined) ref.width = media.width;
+  if (media.height !== undefined) ref.height = media.height;
+  return ref;
+}
+
 export interface ChatMessage {
   /** Idempotency key; empty for messages that arrived from the wire only. */
   clientMsgId: string;
@@ -67,6 +116,8 @@ export interface ChatMessage {
   seq: number | null;
   senderId: string;
   body: string;
+  /** M8 media attachment (image/video); undefined for text messages. */
+  media?: ChatMessageMedia;
   sentAt: string;
   mine: boolean;
   status: MessageStatus;
@@ -102,6 +153,12 @@ export interface Conversation {
    */
   peerAvatar?: string | null;
   lastMessagePreview: string | null;
+  /**
+   * M8: kind of the newest message when it is a media attachment, so the
+   * session-row preview can render a localized "[图片]"/"[视频]" placeholder
+   * instead of an empty string. Undefined for text messages.
+   */
+  lastMessageKind?: MediaKind;
   lastActivityAt: string;
   unread: number;
   /** Highest seq marked as read (opening the conversation advances this). */
@@ -214,6 +271,10 @@ function loadPersistedConversations(): Conversation[] {
         typeof c["lastMessagePreview"] === "string"
           ? c["lastMessagePreview"]
           : null,
+      lastMessageKind:
+        c["lastMessageKind"] === "image" || c["lastMessageKind"] === "video"
+          ? c["lastMessageKind"]
+          : undefined,
       lastActivityAt: String(c["lastActivityAt"] ?? ""),
       unread: Number(c["unread"] ?? 0),
       lastSeenSeq: Number(c["lastSeenSeq"] ?? 0),
@@ -239,6 +300,29 @@ function loadPersistedConversations(): Conversation[] {
   }
 }
 
+/** Defensive parse of a persisted camelCase media attachment (or undefined). */
+function parsePersistedMedia(value: unknown): ChatMessageMedia | undefined {
+  if (!isRecord(value)) return undefined;
+  const mediaId = value["mediaId"];
+  const kind = value["kind"];
+  const mime = value["mime"];
+  const bytes = value["bytes"];
+  const fileName = value["fileName"];
+  if (
+    typeof mediaId !== "string" ||
+    (kind !== "image" && kind !== "video") ||
+    typeof mime !== "string" ||
+    typeof bytes !== "number" ||
+    typeof fileName !== "string"
+  ) {
+    return undefined;
+  }
+  const media: ChatMessageMedia = { mediaId, kind, mime, bytes, fileName };
+  if (typeof value["width"] === "number") media.width = value["width"];
+  if (typeof value["height"] === "number") media.height = value["height"];
+  return media;
+}
+
 function loadPersistedMessages(): Record<number, ChatMessage[]> {
   const out: Record<number, ChatMessage[]> = {};
   try {
@@ -258,6 +342,7 @@ function loadPersistedMessages(): Record<number, ChatMessage[]> {
         seq: typeof m["seq"] === "number" ? m["seq"] : null,
         senderId: String(m["senderId"] ?? ""),
         body: String(m["body"] ?? ""),
+        media: parsePersistedMedia(m["media"]),
         sentAt: String(m["sentAt"] ?? ""),
         mine: m["mine"] === true,
         status:
@@ -742,6 +827,7 @@ export const useWsStore = defineStore("ws", {
         if (isNewest) {
           conversation.lastActivityAt = entry.sentAt;
           conversation.lastMessagePreview = entry.body;
+          conversation.lastMessageKind = entry.media?.kind;
         }
         if (this.activeConversationId === conversation.conversationId) {
           conversation.lastSeenSeq = conversation.maxSeq;
@@ -794,13 +880,17 @@ export const useWsStore = defineStore("ws", {
       const body = m.recalled === true ? "" : m.body;
 
       // Lost-ack recovery: our own unacked optimistic bubble with identical
-      // body gets adopted instead of spawning a second entry.
+      // content gets adopted instead of spawning a second entry. Media
+      // messages share an empty `body`, so the media id must also match to
+      // avoid adopting the wrong attachment.
       if (mine && m.recalled !== true) {
+        const incomingMediaId = m.media?.media_id ?? null;
         const orphan = messages.find(
           (msg) =>
             msg.seq === null &&
             msg.mine &&
             msg.body === m.body &&
+            (msg.media?.mediaId ?? null) === incomingMediaId &&
             msg.status !== "failed",
         );
         if (orphan !== undefined) {
@@ -821,6 +911,7 @@ export const useWsStore = defineStore("ws", {
         seq: m.seq,
         senderId: m.sender_id,
         body,
+        media: m.media !== undefined ? fromMediaRef(m.media) : undefined,
         sentAt: m.sent_at,
         mine,
         status: "delivered",
@@ -850,6 +941,7 @@ export const useWsStore = defineStore("ws", {
       conversation.maxSeq = Math.max(conversation.maxSeq, m.seq);
       if (isNewest) {
         conversation.lastMessagePreview = m.body;
+        conversation.lastMessageKind = m.media?.kind;
         conversation.lastActivityAt = m.sent_at;
       }
       if (this.activeConversationId === conversation.conversationId) {
@@ -1125,9 +1217,19 @@ export const useWsStore = defineStore("ws", {
     // Outbound
     // ------------------------------------------------------------------
 
-    send(conversationId: number, body: string): ChatMessage | null {
+    /**
+     * Optimistic send. `media` is an optional M8 attachment: when present the
+     * wire `body` stays "" and the local bubble carries the media ref. Media
+     * over a secret (e2ee) conversation is refused (returns null) rather than
+     * silently downgraded to plaintext.
+     */
+    send(
+      conversationId: number,
+      body: string,
+      media?: ChatMessageMedia,
+    ): ChatMessage | null {
       const trimmed = body.trim();
-      if (trimmed.length === 0) return null;
+      if (trimmed.length === 0 && media === undefined) return null;
 
       let conversation = this.conversations.find(
         (c) => c.conversationId === conversationId,
@@ -1148,6 +1250,10 @@ export const useWsStore = defineStore("ws", {
         this.conversations.push(conversation);
       }
 
+      // Secret chats relay opaque ciphertext only; a media attachment cannot
+      // be end-to-end encrypted here, so refuse instead of leaking it.
+      if (media !== undefined && conversation.kind === "secret") return null;
+
       const message: ChatMessage = {
         clientMsgId: newClientMsgId(),
         messageId: null,
@@ -1155,6 +1261,7 @@ export const useWsStore = defineStore("ws", {
         seq: null,
         senderId: this.mySenderId(),
         body: trimmed,
+        media,
         sentAt: new Date().toISOString(),
         mine: true,
         status: "sending",
@@ -1170,6 +1277,9 @@ export const useWsStore = defineStore("ws", {
       this.messagesByConversation[conversationId] = messages;
 
       conversation.lastMessagePreview = trimmed;
+      // Media previews render a localized placeholder from the kind (the body
+      // is empty); a text send clears any previous media kind.
+      conversation.lastMessageKind = media?.kind;
       conversation.lastActivityAt = message.sentAt;
 
       // Attach (and consume) the composer reply context. Conditional spread:
@@ -1191,6 +1301,7 @@ export const useWsStore = defineStore("ws", {
             conversation_id: conversationId,
             client_msg_id: message.clientMsgId,
             body: trimmed,
+            ...(media !== undefined ? { media: toMediaRef(media) } : {}),
             ...(replyTo !== undefined && replyTo !== null
               ? { reply_to: replyTo }
               : {}),
@@ -1209,6 +1320,17 @@ export const useWsStore = defineStore("ws", {
       this.persistConversations();
       this.persistMessages(conversationId);
       return message;
+    },
+
+    /**
+     * M8: send a media-only message (empty body + media ref) through the
+     * same optimistic send path as text messages.
+     */
+    sendMedia(
+      conversationId: number,
+      media: ChatMessageMedia,
+    ): ChatMessage | null {
+      return this.send(conversationId, "", media);
     },
 
     /** Resend a failed message reusing its original client_msg_id. */
@@ -1238,6 +1360,9 @@ export const useWsStore = defineStore("ws", {
               conversation_id: entry.conversationId,
               client_msg_id: entry.clientMsgId,
               body: entry.body,
+              ...(entry.media !== undefined
+                ? { media: toMediaRef(entry.media) }
+                : {}),
             },
           };
           if (this.transmitFrame(frame) === "queued")

@@ -1,5 +1,12 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, ref, watch } from "vue";
+import {
+  computed,
+  nextTick,
+  onBeforeUnmount,
+  onMounted,
+  ref,
+  watch,
+} from "vue";
 import { useI18n } from "vue-i18n";
 import { useRoute, useRouter } from "vue-router";
 import AppShell from "../components/layout/AppShell.vue";
@@ -7,12 +14,22 @@ import Avatar from "../components/Avatar.vue";
 import LanguageToggle from "../components/LanguageToggle.vue";
 import ThemeToggle from "../components/ThemeToggle.vue";
 import { apiErrorMessage } from "../lib/api/messages";
+import { apiBase } from "../lib/apiConfig";
+import { EMOJIS } from "../lib/emoji";
+import {
+  MediaUploadError,
+  checkMediaFile,
+  formatBytes,
+  maxBytesForKind,
+  uploadMedia,
+} from "../lib/api/media";
+import type { MediaKind } from "../lib/api/media";
 import * as olm from "../lib/crypto/olm-lite";
 import { useAuthStore } from "../stores/auth";
 import { useFriendsStore } from "../stores/friends";
 import { useProfileStore } from "../stores/profile";
 import { RECALL_WINDOW_MS, useWsStore } from "../stores/ws";
-import type { ChatMessage, Conversation } from "../stores/ws";
+import type { ChatMessage, ChatMessageMedia, Conversation } from "../stores/ws";
 
 const { t, locale } = useI18n();
 const router = useRouter();
@@ -35,6 +52,22 @@ const sasCode = ref<string | null>(null);
 const composerEl = ref<HTMLTextAreaElement | null>(null);
 const messagesEndRef = ref<HTMLElement | null>(null);
 
+// --- M8 media / emoji composer state -----------------------------------
+const emojiOpen = ref(false);
+const uploading = ref(false);
+const uploadPercent = ref(0);
+const uploadError = ref("");
+/** Media shown full-screen in the lightbox; null when closed. */
+const lightboxMedia = ref<ChatMessageMedia | null>(null);
+const imageInputEl = ref<HTMLInputElement | null>(null);
+const videoInputEl = ref<HTMLInputElement | null>(null);
+
+/** Secret chats are e2ee-only: media attachments are not offered there. */
+const mediaEnabled = computed(
+  () =>
+    ws.activeConversation !== null && ws.activeConversation.kind !== "secret",
+);
+
 onMounted(() => {
   // Router guards ensure /chat is only reachable while authed; connecting
   // here keeps tests (anon auth) free of network side effects.
@@ -42,6 +75,11 @@ onMounted(() => {
     profile.ensureLoaded();
     void ws.connect();
   }
+  document.addEventListener("keydown", onGlobalKeydown);
+});
+
+onBeforeUnmount(() => {
+  document.removeEventListener("keydown", onGlobalKeydown);
 });
 
 watch(
@@ -107,6 +145,16 @@ function truncatePreview(body: string | null): string {
   return body.length > PREVIEW_MAX_CHARS
     ? `${body.slice(0, PREVIEW_MAX_CHARS)}…`
     : body;
+}
+
+/**
+ * Session-row preview text. Media messages carry an empty body, so their
+ * last-known kind renders a localized placeholder instead.
+ */
+function conversationPreview(conversation: Conversation): string {
+  if (conversation.lastMessageKind === "image") return t("chat.previewImage");
+  if (conversation.lastMessageKind === "video") return t("chat.previewVideo");
+  return truncatePreview(conversation.lastMessagePreview);
 }
 
 const relativeFormat = computed(
@@ -318,6 +366,188 @@ function onComposerBlur(): void {
   const conversationId = ws.activeConversationId;
   if (conversationId !== null) ws.notifyTypingStop(conversationId);
 }
+
+// ---------------------------------------------------------------------
+// M8: emoji panel, media attach + upload, media rendering
+// ---------------------------------------------------------------------
+
+/** Public URL of an uploaded attachment (relative in web dev, absolute in Tauri). */
+function mediaUrl(media: ChatMessageMedia): string {
+  return `${apiBase()}/api/media/${encodeURIComponent(media.mediaId)}`;
+}
+
+function toggleEmoji(): void {
+  uploadError.value = "";
+  emojiOpen.value = !emojiOpen.value;
+}
+
+/** Appends an emoji to the end of the draft and keeps the panel open. */
+function insertEmoji(emoji: string): void {
+  draft.value += emoji;
+  emojiOpen.value = true;
+  void nextTick(() => {
+    autoGrow();
+    composerEl.value?.focus();
+  });
+}
+
+function openLightbox(media: ChatMessageMedia): void {
+  if (media.kind === "image") lightboxMedia.value = media;
+}
+
+function closeLightbox(): void {
+  lightboxMedia.value = null;
+}
+
+/** Esc closes transient overlays regardless of focus. */
+function onGlobalKeydown(event: KeyboardEvent): void {
+  if (event.key !== "Escape") return;
+  emojiOpen.value = false;
+  lightboxMedia.value = null;
+}
+
+function pickImage(): void {
+  uploadError.value = "";
+  imageInputEl.value?.click();
+}
+
+function pickVideo(): void {
+  uploadError.value = "";
+  videoInputEl.value?.click();
+}
+
+function onFilePicked(event: Event): void {
+  const input = event.target as HTMLInputElement;
+  const file = input.files?.[0] ?? null;
+  // Reset so picking the same file twice still fires `change`.
+  input.value = "";
+  if (file !== null) void handleMediaFile(file);
+}
+
+function probeImageSize(
+  url: string,
+): Promise<{ width: number; height: number } | null> {
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.onload = () =>
+      resolve(
+        img.naturalWidth > 0 && img.naturalHeight > 0
+          ? { width: img.naturalWidth, height: img.naturalHeight }
+          : null,
+      );
+    img.onerror = () => resolve(null);
+    img.src = url;
+  });
+}
+
+function probeVideoSize(
+  url: string,
+): Promise<{ width: number; height: number } | null> {
+  return new Promise((resolve) => {
+    const video = document.createElement("video");
+    video.preload = "metadata";
+    video.onloadedmetadata = () =>
+      resolve(
+        video.videoWidth > 0 && video.videoHeight > 0
+          ? { width: video.videoWidth, height: video.videoHeight }
+          : null,
+      );
+    video.onerror = () => resolve(null);
+    video.src = url;
+  });
+}
+
+/** Best-effort natural dimensions (jsdom/offline failures return {}). */
+async function probeDimensions(
+  file: File,
+  kind: MediaKind,
+): Promise<{ width?: number; height?: number }> {
+  try {
+    if (
+      typeof URL === "undefined" ||
+      typeof URL.createObjectURL !== "function"
+    ) {
+      return {};
+    }
+    const url = URL.createObjectURL(file);
+    try {
+      const size =
+        kind === "image"
+          ? await probeImageSize(url)
+          : await probeVideoSize(url);
+      return size ?? {};
+    } finally {
+      URL.revokeObjectURL(url);
+    }
+  } catch {
+    return {};
+  }
+}
+
+function mediaErrorMessage(error: unknown, file: File): string {
+  if (error instanceof MediaUploadError) {
+    if (error.code === "too_large") {
+      const kind = checkMediaFile(file).kind;
+      const limit = kind !== null ? formatBytes(maxBytesForKind(kind)) : "";
+      return t("chat.mediaTooLarge", { limit });
+    }
+    if (error.code === "unsupported_type") {
+      return t("chat.mediaUnsupportedType");
+    }
+  }
+  return t("chat.mediaUploadFailed");
+}
+
+/**
+ * Full media flow: client-side size/type check → upload original bytes with
+ * progress → best-effort dimension probe → optimistic ws send.
+ */
+async function handleMediaFile(file: File): Promise<void> {
+  const conversationId = ws.activeConversationId;
+  if (conversationId === null || !ws.isConnected || uploading.value) return;
+
+  const check = checkMediaFile(file);
+  if (check.kind === null || check.error === "unsupported_type") {
+    uploadError.value = t("chat.mediaUnsupportedType");
+    return;
+  }
+  if (check.error === "too_large") {
+    uploadError.value = t("chat.mediaTooLarge", {
+      limit: formatBytes(maxBytesForKind(check.kind)),
+    });
+    return;
+  }
+
+  const token = await auth.ensureAccessToken();
+  if (token === null) {
+    uploadError.value = t("chat.mediaUploadFailed");
+    return;
+  }
+
+  uploadError.value = "";
+  uploading.value = true;
+  uploadPercent.value = 0;
+  try {
+    const result = await uploadMedia(token, file, (percent) => {
+      uploadPercent.value = percent;
+    });
+    const dimensions = await probeDimensions(file, result.kind);
+    const media: ChatMessageMedia = {
+      mediaId: result.media_id,
+      kind: result.kind,
+      mime: result.mime,
+      bytes: result.bytes,
+      fileName: result.file_name,
+      ...dimensions,
+    };
+    ws.sendMedia(conversationId, media);
+  } catch (error) {
+    uploadError.value = mediaErrorMessage(error, file);
+  } finally {
+    uploading.value = false;
+    uploadPercent.value = 0;
+  }
+}
 </script>
 
 <template>
@@ -518,7 +748,7 @@ function onComposerBlur(): void {
                 <span
                   class="min-w-0 truncate text-xs text-neutral-500 dark:text-neutral-400"
                   data-testid="session-preview"
-                  >{{ truncatePreview(conversation.lastMessagePreview) }}</span
+                  >{{ conversationPreview(conversation) }}</span
                 >
                 <span
                   v-if="conversation.unread > 0"
@@ -700,6 +930,40 @@ function onComposerBlur(): void {
                 >
                   {{ t("chat.recalledPlaceholder") }}
                 </div>
+                <!-- M8 media: rounded image (tap → lightbox) or inline player.
+                     width/height attrs reserve layout space when known. -->
+                <div
+                  v-else-if="message.media"
+                  class="inline-block"
+                  data-testid="media-bubble"
+                >
+                  <img
+                    v-if="message.media.kind === 'image'"
+                    :src="mediaUrl(message.media)"
+                    :width="message.media.width"
+                    :height="message.media.height"
+                    alt=""
+                    class="h-auto max-w-[280px] cursor-zoom-in rounded-2xl"
+                    data-testid="media-image"
+                    @click="openLightbox(message.media)"
+                  />
+                  <template v-else>
+                    <video
+                      :src="mediaUrl(message.media)"
+                      :width="message.media.width"
+                      :height="message.media.height"
+                      controls
+                      preload="metadata"
+                      class="h-auto max-w-[320px] rounded-2xl"
+                      data-testid="media-video"
+                    ></video>
+                    <span
+                      class="mt-0.5 block text-[11px] text-neutral-400 dark:text-neutral-500"
+                      data-testid="media-size"
+                      >{{ formatBytes(message.media.bytes) }}</span
+                    >
+                  </template>
+                </div>
                 <div
                   v-else
                   class="inline-block rounded-2xl px-3 py-1.5 text-sm leading-relaxed break-words"
@@ -818,7 +1082,7 @@ function onComposerBlur(): void {
 
         <!-- Composer -->
         <footer
-          class="flex shrink-0 flex-col border-t border-neutral-200 dark:border-neutral-800"
+          class="relative flex shrink-0 flex-col border-t border-neutral-200 dark:border-neutral-800"
         >
           <!-- Reply context strip above the input -->
           <div
@@ -843,7 +1107,107 @@ function onComposerBlur(): void {
               ×
             </button>
           </div>
+          <!-- M8 upload progress + inline error -->
+          <div
+            v-if="uploading"
+            class="flex items-center gap-2 px-3 pt-2 text-[11px]"
+            data-testid="upload-progress"
+          >
+            <div
+              class="h-1 flex-1 overflow-hidden rounded bg-neutral-200 dark:bg-neutral-800"
+            >
+              <div
+                class="h-1 rounded bg-indigo-600 transition-[width]"
+                :style="{ width: uploadPercent + '%' }"
+              ></div>
+            </div>
+            <span class="shrink-0 text-neutral-500 dark:text-neutral-400">
+              {{ t("chat.mediaUploading", { percent: uploadPercent }) }}
+            </span>
+          </div>
+          <p
+            v-if="uploadError.length > 0"
+            class="px-3 pt-2 text-[11px] text-red-500"
+            data-testid="upload-error"
+          >
+            {{ uploadError }}
+          </p>
+
+          <!-- M8 emoji quick-panel popover (backdrop closes on outside click) -->
+          <div
+            v-if="emojiOpen"
+            class="fixed inset-0 z-40"
+            data-testid="emoji-backdrop"
+            @click="emojiOpen = false"
+          ></div>
+          <div
+            v-if="emojiOpen"
+            class="absolute bottom-full left-3 z-50 mb-1 w-72 rounded-xl border border-neutral-200 bg-white p-2 shadow-lg dark:border-neutral-700 dark:bg-neutral-900"
+            data-testid="emoji-panel"
+          >
+            <div class="grid max-h-56 grid-cols-8 gap-0.5 overflow-y-auto">
+              <button
+                v-for="emoji in EMOJIS"
+                :key="emoji"
+                type="button"
+                class="rounded p-1 text-lg leading-none hover:bg-neutral-100 dark:hover:bg-neutral-800"
+                data-testid="emoji-choice"
+                @click="insertEmoji(emoji)"
+              >
+                {{ emoji }}
+              </button>
+            </div>
+          </div>
+
           <div class="flex items-end gap-2 p-3">
+            <button
+              type="button"
+              data-testid="emoji-toggle"
+              :title="t('chat.emojiToggle')"
+              :aria-label="t('chat.emojiToggle')"
+              class="shrink-0 rounded-xl px-2 py-2 text-lg leading-none hover:bg-neutral-100 dark:hover:bg-neutral-800"
+              @click="toggleEmoji()"
+            >
+              😀
+            </button>
+            <template v-if="mediaEnabled">
+              <button
+                type="button"
+                data-testid="attach-image"
+                :title="t('chat.mediaAttachImage')"
+                :aria-label="t('chat.mediaAttachImage')"
+                class="shrink-0 rounded-xl px-2 py-2 text-lg leading-none hover:bg-neutral-100 dark:hover:bg-neutral-800"
+                @click="pickImage()"
+              >
+                🖼️
+              </button>
+              <button
+                type="button"
+                data-testid="attach-video"
+                :title="t('chat.mediaAttachVideo')"
+                :aria-label="t('chat.mediaAttachVideo')"
+                class="shrink-0 rounded-xl px-2 py-2 text-lg leading-none hover:bg-neutral-100 dark:hover:bg-neutral-800"
+                @click="pickVideo()"
+              >
+                🎬
+              </button>
+            </template>
+            <input
+              ref="imageInputEl"
+              type="file"
+              accept="image/*"
+              class="hidden"
+              data-testid="image-file-input"
+              @change="onFilePicked"
+            />
+            <input
+              ref="videoInputEl"
+              type="file"
+              accept="video/*"
+              class="hidden"
+              data-testid="video-file-input"
+              @change="onFilePicked"
+            />
             <textarea
               ref="composerEl"
               v-model="draft"
@@ -918,6 +1282,21 @@ function onComposerBlur(): void {
             {{ t("chat.forwardPickerCancel") }}
           </button>
         </div>
+      </div>
+
+      <!-- M8 image lightbox: full-fit view, click / Esc closes -->
+      <div
+        v-if="lightboxMedia !== null"
+        class="fixed inset-0 z-[60] flex cursor-zoom-out items-center justify-center bg-black/80 p-4"
+        data-testid="media-lightbox"
+        @click="closeLightbox()"
+      >
+        <img
+          :src="mediaUrl(lightboxMedia)"
+          alt=""
+          class="max-h-full max-w-full object-contain"
+          data-testid="media-lightbox-image"
+        />
       </div>
     </template>
   </AppShell>

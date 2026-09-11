@@ -12,9 +12,9 @@
 //! |--------------------|-----------|------------------------------------------------------------------------------------------------------|
 //! | `auth.ticket.req`  | C → S     | `{}`                                                                                                 |
 //! | `auth.ticket.res`  | S → C     | `{ ticket }`                                                                                         |
-//! | `msg.send`         | C → S     | `{ conversation_id, client_msg_id, body, reply_to? }`                                                |
+//! | `msg.send`         | C → S     | `{ conversation_id, client_msg_id, body, reply_to?, media? }`                                        |
 //! | `msg.ack`          | S → C     | `{ client_msg_id, message_id, seq, duplicate }`                                                      |
-//! | `msg.new`          | S → C     | `{ message_id, conversation_id, seq, sender_id, body, sent_at, reply_to_message_id?, reply_to_sender_id?, reply_to_body_preview?, forwarded_from_username?, recalled? }` |
+//! | `msg.new`          | S → C     | `{ message_id, conversation_id, seq, sender_id, body, sent_at, reply_to_message_id?, reply_to_sender_id?, reply_to_body_preview?, forwarded_from_username?, recalled?, media? }` |
 //! | `sync.req`         | C → S     | `{ cursors: [{ conversation_id, last_delivered_seq }] }`                                             |
 //! | `sync.res`         | S → C     | `{ messages: [msg.new-shaped], complete }`                                                           |
 //! | `read.update`      | C → S     | `{ conversation_id, last_read_seq }`                                                                 |
@@ -53,8 +53,8 @@
 //! ```
 
 use serde::{
-    de::{DeserializeOwned, Error as _},
     Deserialize, Deserializer, Serialize,
+    de::{DeserializeOwned, Error as _},
 };
 use serde_json::Value;
 use uuid::Uuid;
@@ -81,6 +81,28 @@ pub enum ErrorCode {
 pub struct SyncCursor {
     pub conversation_id: i64,
     pub last_delivered_seq: i64,
+}
+
+/// Media attachment reference (M8) carried on `msg.send`, `msg.new` and the
+/// `sync.res` entries that replay media messages.
+///
+/// `width`/`height` are CLIENT-supplied presentation hints — the server never
+/// decodes image/video bytes. Every other field mirrors the authoritative
+/// `media` row created by `POST /api/media`; on the fanout/replay side the
+/// server rebuilds this object from that row. Null-absent: an absent
+/// `width`/`height` is omitted from the wire entirely.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MediaRef {
+    pub media_id: Uuid,
+    /// `"image"` | `"video"` (mirrors `messages.kind` for this message).
+    pub kind: String,
+    pub mime: String,
+    pub bytes: i64,
+    pub file_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub width: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height: Option<i32>,
 }
 
 /// Server-pushed message record; the shape of `msg.new` and of entries in
@@ -118,6 +140,10 @@ pub struct MsgNew {
     /// True for recall tombstones: `body` is then empty by contract.
     #[serde(default, skip_serializing_if = "is_false")]
     pub recalled: bool,
+    /// M8 media attachment; absent for ordinary text messages so M1-era
+    /// frames stay byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media: Option<MediaRef>,
 }
 
 /// `skip_serializing_if` helper: omit `recalled` while it carries its
@@ -143,6 +169,11 @@ pub struct MsgSend {
     /// conversation or the server rejects the send with `bad_request`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply_to: Option<Uuid>,
+    /// M8 media attachment: the id of a previously uploaded `media` row the
+    /// sender owns. When present the message is stored with `kind` =
+    /// `media.kind` and an empty body; server awards no XP for it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media: Option<MediaRef>,
 }
 
 /// Server acknowledgement of a [`MsgSend`].
@@ -300,8 +331,13 @@ pub struct E2eeMsg {
 /// Untagged so the plain variant serializes EXACTLY like the frozen M1/M2
 /// `msg.new` shape (existing fixtures stay byte-identical); secret-chat rows
 /// replay as `e2ee.msg` entries carrying the stored ciphertext verbatim.
+///
+/// M8 grew [`MsgNew`] by the optional media attachment, widening the variant
+/// size gap. Boxing `MsgNew` would ripple through every server/test call site
+/// for no wire benefit, so the enum keeps its flat shape.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
+#[allow(clippy::large_enum_variant)]
 pub enum SyncMessage {
     Plain(MsgNew),
     Encrypted(E2eeMsg),
@@ -475,6 +511,7 @@ mod tests {
                 client_msg_id: "018f6d2a-7b3c-7c05-9a2f-3d8f1e2b4c11".parse().unwrap(),
                 body: "你好".to_owned(),
                 reply_to: None,
+                media: None,
             }),
         };
 
@@ -600,6 +637,7 @@ mod tests {
                 reply_to_body_preview: None,
                 forwarded_from_username: None,
                 recalled: false,
+                media: None,
             }),
         };
         let value = serde_json::to_value(&frame).unwrap();
@@ -626,6 +664,7 @@ mod tests {
                 client_msg_id: "018f6d2a-7b3c-7c05-9a2f-3d8f1e2b4c11".parse().unwrap(),
                 body: "plain".to_owned(),
                 reply_to: None,
+                media: None,
             }),
         };
         let value = serde_json::to_value(&send).unwrap();
@@ -669,6 +708,7 @@ mod tests {
                         reply_to_body_preview: None,
                         forwarded_from_username: None,
                         recalled: false,
+                        media: None,
                     }),
                     SyncMessage::Encrypted(E2eeMsg {
                         conversation_id: 43,
@@ -710,6 +750,7 @@ mod tests {
                     client_msg_id: "018f6d2a-7b3c-7c05-9a2f-3d8f1e2b4c11".parse().unwrap(),
                     body: String::new(),
                     reply_to: None,
+                    media: None,
                 }),
             },
             Frame {
@@ -735,6 +776,7 @@ mod tests {
                     reply_to_body_preview: None,
                     forwarded_from_username: None,
                     recalled: false,
+                    media: None,
                 }),
             },
             Frame {
@@ -813,5 +855,71 @@ mod tests {
             let back: Frame = serde_json::from_value(value).unwrap();
             assert_eq!(frame, back, "variant {:?} roundtrips", frame.payload);
         }
+    }
+
+    #[test]
+    fn media_ref_is_null_absent_when_missing_and_roundtrips_when_present() {
+        let media = MediaRef {
+            media_id: "0190aabb-ccdd-7e01-8a1b-2c3d4e5f6071".parse().unwrap(),
+            kind: "image".to_owned(),
+            mime: "image/png".to_owned(),
+            bytes: 2048,
+            file_name: "photo.png".to_owned(),
+            width: Some(800),
+            height: Some(600),
+        };
+        let frame = Frame {
+            v: 1,
+            payload: Payload::MsgSend(MsgSend {
+                conversation_id: 42,
+                client_msg_id: "018f6d2a-7b3c-7c05-9a2f-3d8f1e2b4c11".parse().unwrap(),
+                body: String::new(),
+                reply_to: None,
+                media: Some(media.clone()),
+            }),
+        };
+        let value = serde_json::to_value(&frame).unwrap();
+        assert_eq!(
+            value["d"]["media"]["media_id"],
+            json!("0190aabb-ccdd-7e01-8a1b-2c3d4e5f6071")
+        );
+        assert_eq!(value["d"]["media"]["kind"], json!("image"));
+        assert_eq!(value["d"]["media"]["width"], json!(800));
+        let back: Frame = serde_json::from_value(value).unwrap();
+        assert_eq!(frame, back, "media frame roundtrips");
+
+        // width/height absent -> omitted from the wire entirely.
+        let bare = MediaRef {
+            width: None,
+            height: None,
+            ..media
+        };
+        let value = serde_json::to_value(&bare).unwrap();
+        assert!(value.get("width").is_none());
+        assert!(value.get("height").is_none());
+
+        // A MsgNew without media emits no `media` key (M1 byte-compat).
+        let msg_new = Frame {
+            v: 1,
+            payload: Payload::MsgNew(MsgNew {
+                message_id: "0190aabb-ccdd-7e01-8a1b-2c3d4e5f6071".parse().unwrap(),
+                conversation_id: 42,
+                seq: 1,
+                sender_id: "018e1122-3344-7006-9a2b-1c2d3e4f5a6b".parse().unwrap(),
+                body: "hi".to_owned(),
+                sent_at: "2026-08-24T08:30:00.123Z".to_owned(),
+                reply_to_message_id: None,
+                reply_to_sender_id: None,
+                reply_to_body_preview: None,
+                forwarded_from_username: None,
+                recalled: false,
+                media: None,
+            }),
+        };
+        let value = serde_json::to_value(&msg_new).unwrap();
+        assert!(
+            value["d"].get("media").is_none(),
+            "absent media must not serialize"
+        );
     }
 }

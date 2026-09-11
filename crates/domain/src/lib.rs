@@ -10,8 +10,8 @@ mod seq;
 mod state_machine;
 
 pub use progress::{
-    level_from_xp, title_for_level, total_xp_for, xp_for_level, DAILY_LOGIN_XP, MSG_XP_CHAR_BLOCK,
-    MSG_XP_DAILY_CAP, MSG_XP_PER_BLOCK,
+    DAILY_LOGIN_XP, MSG_XP_CHAR_BLOCK, MSG_XP_DAILY_CAP, MSG_XP_PER_BLOCK, level_from_xp,
+    title_for_level, total_xp_for, xp_for_level,
 };
 pub use recall::{RecallError, RecallPolicy};
 pub use seq::{InMemorySeqAllocator, SeqAllocator};

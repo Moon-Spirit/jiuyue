@@ -1,0 +1,18 @@
+{
+  "v": 1,
+  "t": "msg.send",
+  "d": {
+    "conversation_id": 42,
+    "client_msg_id": "018f6d2a-7b3c-7c05-9a2f-3d8f1e2b4c11",
+    "body": "",
+    "media": {
+      "media_id": "0190aabb-ccdd-7e05-8a1b-2c3d4e5f6075",
+      "kind": "image",
+      "mime": "image/png",
+      "bytes": 2048,
+      "file_name": "holiday-photo.png",
+      "width": 800,
+      "height": 600
+    }
+  }
+}

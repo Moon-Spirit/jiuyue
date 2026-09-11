@@ -28,12 +28,12 @@
 use crate::auth::extract::AuthUser;
 use crate::error::AppError;
 use crate::state::AppState;
+use axum::Json;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, State};
-use axum::Json;
 use jiuyue_domain::{
-    level_from_xp, title_for_level, xp_for_level, DAILY_LOGIN_XP,
-    MSG_XP_CHAR_BLOCK, MSG_XP_DAILY_CAP, MSG_XP_PER_BLOCK,
+    DAILY_LOGIN_XP, MSG_XP_CHAR_BLOCK, MSG_XP_DAILY_CAP, MSG_XP_PER_BLOCK, level_from_xp,
+    title_for_level, xp_for_level,
 };
 use serde::{Deserialize, Serialize};
 use time::{Date, OffsetDateTime};
@@ -47,9 +47,9 @@ use uuid::Uuid;
 /// emoji). `PATCH /api/users/profile` rejects any `avatar` not in this list;
 /// the empty string clears the avatar.
 pub const AVATARS: &[&str] = &[
-    "🟫", "🪨", "🪵", "🧱", "⛏️", "🪓", "🏹", "🗡️", "🛡️", "🪖", "💎", "🪙", "⭐", "🌟", "🔥",
-    "💧", "🌱", "🌳", "🍄", "🐷", "🐮", "🐑", "🐔", "🐺", "🐱", "🐲", "🥚", "⚗️", "🧪", "🪄",
-    "📦", "🚪", "🗺️", "🧭", "🏔️", "🌋", "🌙", "☀️", "👑", "💀", "👾", "⚡", "🌀", "🌸",
+    "🟫", "🪨", "🪵", "🧱", "⛏️", "🪓", "🏹", "🗡️", "🛡️", "🪖", "💎", "🪙", "⭐", "🌟", "🔥", "💧",
+    "🌱", "🌳", "🍄", "🐷", "🐮", "🐑", "🐔", "🐺", "🐱", "🐲", "🥚", "⚗️", "🧪", "🪄", "📦", "🚪",
+    "🗺️", "🧭", "🏔️", "🌋", "🌙", "☀️", "👑", "💀", "👾", "⚡", "🌀", "🌸",
 ];
 
 /// Maximum accepted size of a custom data-URL avatar (raw base64 payload).
@@ -193,13 +193,12 @@ pub async fn update_profile(
     let Json(req) = payload.map_err(|rejection| AppError::BadRequest(rejection.body_text()))?;
 
     // Read the current row so PATCH semantics stay "change what is present".
-    let current: Option<(String, String, String, String)> = sqlx::query_as(
-        "SELECT username, display_name, bio, avatar FROM users WHERE id = $1",
-    )
-    .bind(user.0)
-    .fetch_optional(&state.pool)
-    .await
-    .map_err(AppError::internal)?;
+    let current: Option<(String, String, String, String)> =
+        sqlx::query_as("SELECT username, display_name, bio, avatar FROM users WHERE id = $1")
+            .bind(user.0)
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(AppError::internal)?;
     let Some((_username, cur_display, cur_bio, cur_avatar)) = current else {
         return Err(AppError::ResourceNotFound);
     };
@@ -225,7 +224,9 @@ pub async fn update_profile(
     let bio = match req.bio {
         Some(raw) => {
             if raw.chars().count() > 200 {
-                return Err(AppError::Validation("bio must be at most 200 characters".into()));
+                return Err(AppError::Validation(
+                    "bio must be at most 200 characters".into(),
+                ));
             }
             raw
         }
@@ -355,14 +356,7 @@ pub(crate) async fn grant_daily_login_bonus(
         tx.commit().await?;
         return Ok(());
     }
-    apply_xp(
-        &mut tx,
-        user_id,
-        DAILY_LOGIN_XP,
-        Some(today),
-        None,
-    )
-    .await?;
+    apply_xp(&mut tx, user_id, DAILY_LOGIN_XP, Some(today), None).await?;
     tx.commit().await?;
     tracing::debug!(%user_id, %today, xp = DAILY_LOGIN_XP, "daily login bonus granted");
     Ok(())
@@ -410,14 +404,7 @@ pub(crate) async fn award_message_xp_for_chars(
         return Ok(());
     }
     let actual = gain.min(available);
-    apply_xp(
-        &mut tx,
-        user_id,
-        actual,
-        None,
-        Some((today, actual as i32)),
-    )
-    .await?;
+    apply_xp(&mut tx, user_id, actual, None, Some((today, actual as i32))).await?;
     tx.commit().await?;
     tracing::debug!(%user_id, %conversation_id, actual, "message xp awarded");
     Ok(())
