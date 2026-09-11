@@ -840,6 +840,8 @@ describe("ChatView — M8 media & emoji", () => {
     expect(clickSpy).toHaveBeenCalledTimes(1);
     await main.find('[data-testid="attach-video"]').trigger("click");
     expect(clickSpy).toHaveBeenCalledTimes(2);
+    await main.find('[data-testid="attach-audio"]').trigger("click");
+    expect(clickSpy).toHaveBeenCalledTimes(3);
 
     clickSpy.mockRestore();
   });
@@ -850,11 +852,18 @@ describe("ChatView — M9 voice, audio player & forward attribution", () => {
     static instances: MockMediaRecorder[] = [];
     state = "inactive";
     mimeType = "audio/webm;codecs=opus";
+    audioBitsPerSecond = 0;
     ondataavailable: ((event: { data: Blob }) => void) | null = null;
     onstop: (() => void) | null = null;
     onerror: (() => void) | null = null;
-    constructor(_stream: unknown, options?: { mimeType?: string }) {
+    constructor(
+      _stream: unknown,
+      options?: { mimeType?: string; audioBitsPerSecond?: number },
+    ) {
       if (options?.mimeType !== undefined) this.mimeType = options.mimeType;
+      if (options?.audioBitsPerSecond !== undefined) {
+        this.audioBitsPerSecond = options.audioBitsPerSecond;
+      }
       MockMediaRecorder.instances.push(this);
     }
     static isTypeSupported(): boolean {
@@ -997,6 +1006,11 @@ describe("ChatView — M9 voice, audio player & forward attribution", () => {
     // Recording UI replaces the composer and shows a live mm:ss timer.
     expect(main.find('[data-testid="voice-timer"]').exists()).toBe(true);
     expect(main.find('[data-testid="composer-input"]').exists()).toBe(false);
+
+    // Clarity regression: the recorder must run at the high opus bitrate
+    // (Chromium's default ~32 kbps sounded muffled).
+    const recorder = MockMediaRecorder.instances.at(-1);
+    expect(recorder?.audioBitsPerSecond).toBe(128000);
 
     await main.find('[data-testid="voice-stop"]').trigger("click");
     await flushPromises();
@@ -1170,6 +1184,7 @@ describe("ChatView — M9 voice, audio player & forward attribution", () => {
 
     expect(main.find('[data-testid="attach-image"]').exists()).toBe(false);
     expect(main.find('[data-testid="attach-video"]').exists()).toBe(false);
+    expect(main.find('[data-testid="attach-audio"]').exists()).toBe(false);
     expect(main.find('[data-testid="voice-record"]').exists()).toBe(false);
     // Emoji panel stays available in secret chats.
     expect(main.find('[data-testid="emoji-toggle"]').exists()).toBe(true);

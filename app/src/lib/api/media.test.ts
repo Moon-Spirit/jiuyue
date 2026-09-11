@@ -94,7 +94,10 @@ describe("mediaKindFor", () => {
     // Browsers report the codec parameter; the bare container decides.
     expect(mediaKindFor("audio/webm;codecs=opus")).toBe("audio");
     expect(mediaKindFor("audio/ogg; codecs=opus")).toBe("audio");
-    expect(mediaKindFor("audio/mpeg")).toBeNull();
+    expect(mediaKindFor("audio/mpeg")).toBe("audio");
+    expect(mediaKindFor("audio/aac")).toBe("audio");
+    expect(mediaKindFor("audio/wav")).toBe("audio");
+    expect(mediaKindFor("audio/flac")).toBeNull();
   });
 });
 

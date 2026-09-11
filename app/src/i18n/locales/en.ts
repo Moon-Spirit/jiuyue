@@ -127,6 +127,7 @@ const en: MessageSchema = {
     emojiToggle: "Emoji",
     mediaAttachImage: "Attach image",
     mediaAttachVideo: "Attach video",
+    mediaAttachAudio: "Attach audio file",
     mediaUploading: "Uploading {percent}%",
     mediaTooLarge: "File too large, max {limit}",
     mediaUnsupportedType: "Unsupported file type",

@@ -774,6 +774,30 @@ fn m4a_bytes() -> Vec<u8> {
     out
 }
 
+/// MP3 with an ID3v2 header + filler.
+fn mp3_bytes(len: usize) -> Vec<u8> {
+    let mut out = b"ID3\x04\x00\x00\x00\x00\x00\x00".to_vec();
+    out.resize(len.max(10), 0xAB);
+    out
+}
+
+/// Bare MPEG frame sync (0xFF 0xFB) — the no-ID3 variant.
+fn mp3_sync_bytes() -> Vec<u8> {
+    vec![0xFF, 0xFB, 0x90, 0x00, 0x00, 0x00, 0x00, 0x00]
+}
+
+/// ADTS AAC frame sync.
+fn aac_bytes() -> Vec<u8> {
+    vec![0xFF, 0xF1, 0x50, 0x80, 0x00, 0x1F, 0x00, 0x00]
+}
+
+/// RIFF/WAVE header + filler.
+fn wav_bytes() -> Vec<u8> {
+    let mut out = b"RIFF\x24\x00\x00\x00WAVEfmt ".to_vec();
+    out.resize(64, 0x00);
+    out
+}
+
 /// Uploads audio bytes as `access`; returns `(media_id, byte_len)`.
 async fn upload_audio(
     t: &TestApp,
@@ -1083,11 +1107,27 @@ async fn audio_upload_accepts_supported_families_and_rejects_mismatches() {
     // ISO-BMFF family → audio/mp4.
     upload_audio(&t, &access, "audio/mp4", m4a_bytes()).await;
 
+    // MP3 family → audio/mpeg (ID3 tag and bare frame-sync variants).
+    let (_, mp3_len) = upload_audio(&t, &access, "audio/mpeg", mp3_bytes(1024)).await;
+    assert!(mp3_len >= 1024);
+    upload_audio(&t, &access, "audio/mpeg", mp3_sync_bytes()).await;
+
+    // ADTS AAC → audio/aac.
+    upload_audio(&t, &access, "audio/aac", aac_bytes()).await;
+
+    // RIFF/WAVE → audio/wav.
+    upload_audio(&t, &access, "audio/wav", wav_bytes()).await;
+
     // Wrong magic (PNG bytes declared audio/webm) → 415.
     let (status, body) =
         upload_media(&t.app, Some(&access), "audio/webm", None, png_bytes(64)).await;
     assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE, "{body}");
     assert_eq!(body["error"], json!("unsupported_type"));
+
+    // MP3 bytes declared as wav → family disagreement → 415.
+    let (status, body) =
+        upload_media(&t.app, Some(&access), "audio/wav", None, mp3_bytes(64)).await;
+    assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE, "{body}");
 
     // Family disagreement (EBML bytes declared audio/ogg) → 415.
     let (status, body) = upload_media(

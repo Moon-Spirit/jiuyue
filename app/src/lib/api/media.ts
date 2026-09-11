@@ -34,11 +34,14 @@ export const VIDEO_MIME_TYPES: readonly string[] = [
   "video/webm",
 ];
 
-/** Container MIME types accepted for voice messages (browser MediaRecorder + iOS). */
+/** Container MIME types accepted for voice messages + audio files. */
 export const AUDIO_MIME_TYPES: readonly string[] = [
   "audio/webm",
   "audio/ogg",
   "audio/mp4",
+  "audio/mpeg",
+  "audio/aac",
+  "audio/wav",
 ];
 
 export type MediaKind = "image" | "video" | "audio";

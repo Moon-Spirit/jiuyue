@@ -61,6 +61,7 @@ const uploadError = ref("");
 const lightboxMedia = ref<ChatMessageMedia | null>(null);
 const imageInputEl = ref<HTMLInputElement | null>(null);
 const videoInputEl = ref<HTMLInputElement | null>(null);
+const audioInputEl = ref<HTMLInputElement | null>(null);
 
 // --- M9 voice messages: recorder + custom minimal audio player ----------
 const recording = ref(false);
@@ -455,6 +456,11 @@ function pickVideo(): void {
   videoInputEl.value?.click();
 }
 
+function pickAudio(): void {
+  uploadError.value = "";
+  audioInputEl.value?.click();
+}
+
 function onFilePicked(event: Event): void {
   const input = event.target as HTMLInputElement;
   const file = input.files?.[0] ?? null;
@@ -496,6 +502,22 @@ function probeVideoSize(
   });
 }
 
+/** Best-effort audio duration (mp3/m4a/wav/…) for the voice bubble caption. */
+function probeAudioDuration(url: string): Promise<number | null> {
+  return new Promise((resolve) => {
+    const audio = document.createElement("audio");
+    audio.preload = "metadata";
+    audio.onloadedmetadata = () =>
+      resolve(
+        Number.isFinite(audio.duration) && audio.duration > 0
+          ? Math.round(audio.duration * 1000)
+          : null,
+      );
+    audio.onerror = () => resolve(null);
+    audio.src = url;
+  });
+}
+
 /** Best-effort natural dimensions (jsdom/offline failures return {}). */
 async function probeDimensions(
   file: File,
@@ -508,6 +530,7 @@ async function probeDimensions(
     ) {
       return {};
     }
+    if (kind === "audio") return {};
     const url = URL.createObjectURL(file);
     try {
       const size =
@@ -571,6 +594,24 @@ async function handleMediaFile(file: File): Promise<void> {
       uploadPercent.value = percent;
     });
     const dimensions = await probeDimensions(file, result.kind);
+    let durationMs: number | null = null;
+    if (result.kind === "audio") {
+      try {
+        if (
+          typeof URL !== "undefined" &&
+          typeof URL.createObjectURL === "function"
+        ) {
+          const url = URL.createObjectURL(file);
+          try {
+            durationMs = await probeAudioDuration(url);
+          } finally {
+            URL.revokeObjectURL(url);
+          }
+        }
+      } catch {
+        durationMs = null;
+      }
+    }
     const media: ChatMessageMedia = {
       mediaId: result.media_id,
       kind: result.kind,
@@ -578,6 +619,7 @@ async function handleMediaFile(file: File): Promise<void> {
       bytes: result.bytes,
       fileName: result.file_name,
       ...dimensions,
+      ...(durationMs !== null ? { durationMs } : {}),
     };
     ws.sendMedia(conversationId, media);
   } catch (error) {
@@ -591,6 +633,9 @@ async function handleMediaFile(file: File): Promise<void> {
 // ---------------------------------------------------------------------
 // M9 voice messages: MediaRecorder capture + custom minimal player
 // ---------------------------------------------------------------------
+
+/** Opus encode target: 128 kbps is transparent for speech (default ~32k). */
+const VOICE_BITS_PER_SECOND = 128_000;
 
 /** Preferred recorder container: opus/webm when supported, else defaults. */
 function pickAudioMime(): string | null {
@@ -667,7 +712,14 @@ async function startVoiceRecording(): Promise<void> {
   uploadError.value = "";
   let stream: MediaStream;
   try {
-    stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    // 48 kHz mono capture; the clarity lever is the encoder bitrate below
+    // (Chromium's default ~32 kbps opus is noticeably muffled).
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        sampleRate: { ideal: 48000 },
+        channelCount: { ideal: 1 },
+      },
+    });
   } catch {
     // Permission denied / no device: surface a localized error and reset.
     uploadError.value = t("chat.voicePermissionDenied");
@@ -683,8 +735,13 @@ async function startVoiceRecording(): Promise<void> {
   try {
     recorder =
       mime !== null
-        ? new MediaRecorder(stream, { mimeType: mime })
-        : new MediaRecorder(stream);
+        ? new MediaRecorder(stream, {
+            mimeType: mime,
+            audioBitsPerSecond: VOICE_BITS_PER_SECOND,
+          })
+        : new MediaRecorder(stream, {
+            audioBitsPerSecond: VOICE_BITS_PER_SECOND,
+          });
   } catch {
     try {
       recorder = new MediaRecorder(stream);
@@ -1572,6 +1629,16 @@ function toggleAudio(media: ChatMessageMedia): void {
               >
                 🎬
               </button>
+              <button
+                type="button"
+                data-testid="attach-audio"
+                :title="t('chat.mediaAttachAudio')"
+                :aria-label="t('chat.mediaAttachAudio')"
+                class="shrink-0 rounded-xl px-2 py-2 text-lg leading-none hover:bg-neutral-100 dark:hover:bg-neutral-800"
+                @click="pickAudio()"
+              >
+                🎵
+              </button>
               <!-- M9 voice: record only (never in secret/e2ee chats) -->
               <button
                 v-if="!recording"
@@ -1599,6 +1666,14 @@ function toggleAudio(media: ChatMessageMedia): void {
               accept="video/*"
               class="hidden"
               data-testid="video-file-input"
+              @change="onFilePicked"
+            />
+            <input
+              ref="audioInputEl"
+              type="file"
+              accept="audio/*,.mp3,.m4a,.wav,.ogg,.aac,.flac"
+              class="hidden"
+              data-testid="audio-file-input"
               @change="onFilePicked"
             />
             <!-- Recording strip replaces the text input while capturing -->

@@ -67,6 +67,12 @@ enum Family {
     Ogg,
     /// ISO base media file format (`ftyp` box): mp4/m4a/quicktime family.
     IsoBmff,
+    /// MPEG audio: ID3-tagged or raw MPEG frame sync (`audio/mpeg` = mp3).
+    Mp3,
+    /// ADTS AAC stream (`audio/aac`).
+    Aac,
+    /// RIFF/WAVE (`audio/wav`).
+    Wav,
 }
 
 /// Magic-byte FAMILY detection. Returns `None` for anything unsupported (or
@@ -87,6 +93,21 @@ fn sniff_family(prefix: &[u8]) -> Option<Family> {
     // WebP: "RIFF" .... "WEBP" (bytes 0-3 and 8-11)
     if prefix.len() >= 12 && &prefix[0..4] == b"RIFF" && &prefix[8..12] == b"WEBP" {
         return Some(Family::Webp);
+    }
+    // WAV: "RIFF" .... "WAVE" (same RIFF envelope, different form type)
+    if prefix.len() >= 12 && &prefix[0..4] == b"RIFF" && &prefix[8..12] == b"WAVE" {
+        return Some(Family::Wav);
+    }
+    // ADTS AAC: 12-bit frame sync, layer bits 00 (FF F1 / FF F9 …). Checked
+    // BEFORE the generic MPEG sync because ADTS shares the FF Ex/Fx prefix.
+    if prefix.len() >= 2 && prefix[0] == 0xFF && (prefix[1] & 0xF6) == 0xF0 {
+        return Some(Family::Aac);
+    }
+    // MP3: `ID3` tag or a bare MPEG audio frame sync (FF Ex / FF Fx).
+    if prefix.starts_with(b"ID3")
+        || (prefix.len() >= 2 && prefix[0] == 0xFF && (prefix[1] & 0xE0) == 0xE0)
+    {
+        return Some(Family::Mp3);
     }
     // WebM / Matroska EBML header: 1A 45 DF A3
     if prefix.starts_with(&[0x1A, 0x45, 0xDF, 0xA3]) {
@@ -122,6 +143,9 @@ fn resolve_mime(family: Family, declared: &str) -> Option<&'static str> {
         (Family::IsoBmff, "video/mp4") => Some("video/mp4"),
         (Family::IsoBmff, "video/quicktime") => Some("video/quicktime"),
         (Family::IsoBmff, "audio/mp4") => Some("audio/mp4"),
+        (Family::Mp3, "audio/mpeg") => Some("audio/mpeg"),
+        (Family::Aac, "audio/aac") => Some("audio/aac"),
+        (Family::Wav, "audio/wav") => Some("audio/wav"),
         _ => None,
     }
 }
@@ -160,6 +184,9 @@ fn canonical_content_type(raw: Option<&HeaderValue>) -> Option<&'static str> {
         "audio/webm" => Some("audio/webm"),
         "audio/ogg" => Some("audio/ogg"),
         "audio/mp4" => Some("audio/mp4"),
+        "audio/mpeg" => Some("audio/mpeg"),
+        "audio/aac" => Some("audio/aac"),
+        "audio/wav" => Some("audio/wav"),
         _ => None,
     }
 }
@@ -177,6 +204,9 @@ fn ext_for_mime(mime: &str) -> Option<&'static str> {
         "audio/webm" => Some("webm"),
         "audio/ogg" => Some("ogg"),
         "audio/mp4" => Some("m4a"),
+        "audio/mpeg" => Some("mp3"),
+        "audio/aac" => Some("aac"),
+        "audio/wav" => Some("wav"),
         _ => None,
     }
 }
@@ -444,6 +474,10 @@ mod tests {
     const WEBP: &[u8] = b"RIFF\x00\x00\x00\x00WEBPVP8 ";
     const WEBM: &[u8] = &[0x1A, 0x45, 0xDF, 0xA3, 0x01, 0x00];
     const OGG: &[u8] = b"OggS\x00\x02\x00\x00\x00\x00\x00\x00";
+    const MP3_ID3: &[u8] = b"ID3\x04\x00\x00\x00\x00\x00\x00";
+    const MP3_SYNC: &[u8] = &[0xFF, 0xFB, 0x90, 0x00, 0x00, 0x00];
+    const AAC_ADTS: &[u8] = &[0xFF, 0xF1, 0x50, 0x80, 0x00, 0x1F];
+    const WAV: &[u8] = b"RIFF\x24\x00\x00\x00WAVEfmt ";
     fn mp4_brand(brand: &[u8; 4]) -> Vec<u8> {
         let mut out = vec![0, 0, 0, 0x18];
         out.extend_from_slice(b"ftyp");
@@ -461,6 +495,10 @@ mod tests {
         assert_eq!(sniff_family(WEBM), Some(Family::Ebml));
         assert_eq!(sniff_family(OGG), Some(Family::Ogg));
         assert_eq!(sniff_family(&mp4_brand(b"isom")), Some(Family::IsoBmff));
+        assert_eq!(sniff_family(MP3_ID3), Some(Family::Mp3));
+        assert_eq!(sniff_family(MP3_SYNC), Some(Family::Mp3));
+        assert_eq!(sniff_family(AAC_ADTS), Some(Family::Aac));
+        assert_eq!(sniff_family(WAV), Some(Family::Wav));
 
         assert_eq!(resolve_mime(Family::Png, "image/png"), Some("image/png"));
         assert_eq!(resolve_mime(Family::Jpeg, "image/jpeg"), Some("image/jpeg"));
@@ -479,10 +517,16 @@ mod tests {
             Some("video/quicktime")
         );
         assert_eq!(resolve_mime(Family::IsoBmff, "audio/mp4"), Some("audio/mp4"));
+        assert_eq!(resolve_mime(Family::Mp3, "audio/mpeg"), Some("audio/mpeg"));
+        assert_eq!(resolve_mime(Family::Aac, "audio/aac"), Some("audio/aac"));
+        assert_eq!(resolve_mime(Family::Wav, "audio/wav"), Some("audio/wav"));
 
         // Family disagreement is a hard reject (e.g. audio declared over PNG).
         assert_eq!(resolve_mime(Family::Png, "audio/webm"), None);
         assert_eq!(resolve_mime(Family::Ogg, "video/webm"), None);
+        // MP3 bytes declared as wav / aac never cross families.
+        assert_eq!(resolve_mime(Family::Mp3, "audio/wav"), None);
+        assert_eq!(resolve_mime(Family::Wav, "audio/mpeg"), None);
     }
 
     #[test]
@@ -492,6 +536,9 @@ mod tests {
         assert_eq!(kind_for_mime("audio/webm"), "audio");
         assert_eq!(kind_for_mime("audio/ogg"), "audio");
         assert_eq!(kind_for_mime("audio/mp4"), "audio");
+        assert_eq!(kind_for_mime("audio/mpeg"), "audio");
+        assert_eq!(kind_for_mime("audio/aac"), "audio");
+        assert_eq!(kind_for_mime("audio/wav"), "audio");
     }
 
     #[test]
@@ -528,6 +575,18 @@ mod tests {
         assert_eq!(
             canonical_content_type(Some(&value("audio/mp4"))),
             Some("audio/mp4")
+        );
+        assert_eq!(
+            canonical_content_type(Some(&value("audio/mpeg"))),
+            Some("audio/mpeg")
+        );
+        assert_eq!(
+            canonical_content_type(Some(&value(" AUDIO/AAC "))),
+            Some("audio/aac")
+        );
+        assert_eq!(
+            canonical_content_type(Some(&value("audio/wav"))),
+            Some("audio/wav")
         );
         assert_eq!(
             canonical_content_type(Some(&value("application/pdf"))),
@@ -575,6 +634,9 @@ mod tests {
         assert_eq!(ext_for_mime("audio/webm"), Some("webm"));
         assert_eq!(ext_for_mime("audio/ogg"), Some("ogg"));
         assert_eq!(ext_for_mime("audio/mp4"), Some("m4a"));
+        assert_eq!(ext_for_mime("audio/mpeg"), Some("mp3"));
+        assert_eq!(ext_for_mime("audio/aac"), Some("aac"));
+        assert_eq!(ext_for_mime("audio/wav"), Some("wav"));
         assert_eq!(ext_for_mime("application/pdf"), None);
     }
 }

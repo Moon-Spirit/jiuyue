@@ -122,6 +122,7 @@ const zhCN = {
     emojiToggle: "表情",
     mediaAttachImage: "发送图片",
     mediaAttachVideo: "发送视频",
+    mediaAttachAudio: "发送音频文件",
     mediaUploading: "上传中 {percent}%",
     mediaTooLarge: "文件过大，最大 {limit}",
     mediaUnsupportedType: "不支持的文件类型",
