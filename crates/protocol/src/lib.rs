@@ -265,6 +265,18 @@ pub struct FriendAccepted {
     pub friend: UserIdentity,
 }
 
+/// Server push when a user edits their public profile (`profile.updated`):
+/// sent live to every ONLINE user sharing at least one conversation with
+/// them, carrying the new editable fields so session rows / headers can
+/// refresh the avatar and display name without a REST round-trip.
+/// Fire-and-forget: offline peers catch up on the next conversation listing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfileUpdated {
+    pub user_id: Uuid,
+    pub display_name: String,
+    pub avatar: String,
+}
+
 /// Client-to-server end-to-end-encrypted send request (secret chats).
 ///
 /// `ciphertext` is an opaque Olm message produced by the sender's device;
@@ -328,6 +340,8 @@ pub enum Payload {
     FriendRequested(FriendRequested),
     #[serde(rename = "friend.accepted")]
     FriendAccepted(FriendAccepted),
+    #[serde(rename = "profile.updated")]
+    ProfileUpdated(ProfileUpdated),
     #[serde(rename = "e2ee.msg")]
     E2eeMsg(E2eeMsg),
     #[serde(rename = "error")]
@@ -431,6 +445,7 @@ fn decode_payload(t: &str, d: Value) -> Result<Payload, FrameError> {
         "msg.recalled" => Ok(Payload::MsgRecalled(decode_as(t, d)?)),
         "friend.requested" => Ok(Payload::FriendRequested(decode_as(t, d)?)),
         "friend.accepted" => Ok(Payload::FriendAccepted(decode_as(t, d)?)),
+        "profile.updated" => Ok(Payload::ProfileUpdated(decode_as(t, d)?)),
         "e2ee.msg" => Ok(Payload::E2eeMsg(decode_as(t, d)?)),
         "error" => Ok(Payload::Error(decode_as(t, d)?)),
         other => Ok(Payload::Error(ErrorPayload {

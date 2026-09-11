@@ -18,6 +18,7 @@ import type {
   MsgAck,
   MsgNew,
   MsgRecalled,
+  ProfileUpdated,
   ReadReceipt,
   SyncRes,
   Typing,
@@ -29,6 +30,7 @@ import {
 } from "../lib/protocol/frames";
 import { useAuthStore } from "./auth";
 import { useFriendsStore } from "./friends";
+import { useProfileStore } from "./profile";
 
 /**
  * Realtime chat store: owns the WebSocket lifecycle, optimistic sending with
@@ -702,6 +704,9 @@ export const useWsStore = defineStore("ws", {
         case "friend.accepted":
           useFriendsStore().onFriendAccepted(frame.d);
           break;
+        case "profile.updated":
+          this.handleProfileUpdated(frame.d);
+          break;
         case "error":
           this.handleErrorFrame(frame.d);
           break;
@@ -864,9 +869,27 @@ export const useWsStore = defineStore("ws", {
       }
     },
 
+    /** Peer profile edit: refresh cached display identity everywhere. */
+    handleProfileUpdated(payload: ProfileUpdated): void {
+      let changed = false;
+      for (const conversation of this.conversations) {
+        if (conversation.peerUserId !== payload.user_id) continue;
+        conversation.peerDisplayName =
+          payload.display_name.trim().length > 0
+            ? payload.display_name
+            : undefined;
+        const trimmed = payload.avatar.trim();
+        conversation.peerAvatar = trimmed.length > 0 ? trimmed : undefined;
+        changed = true;
+      }
+      if (changed) this.persistConversations();
+      // The profile store's peer cache refetches on next view.
+      useProfileStore().invalidatePeer(payload.user_id);
+    },
+
     /**
      * Peer read receipt: upgrade MY messages with seq <= last_read_seq from
-     * delivered → read (✓✓已读). Idempotent — already-read entries stay put.
+     * delivered �� read (??�Ѷ�). Idempotent �� already-read entries stay put.
      */
     handleReadReceipt(receipt: ReadReceipt): void {
       const messages = this.messagesByConversation[receipt.conversation_id];

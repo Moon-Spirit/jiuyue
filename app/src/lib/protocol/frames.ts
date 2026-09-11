@@ -170,6 +170,13 @@ export interface FriendAccepted {
   friend: FriendUserRef;
 }
 
+/** Server → client: a conversation partner edited their public profile. */
+export interface ProfileUpdated {
+  user_id: string;
+  display_name: string;
+  avatar: string;
+}
+
 export type ErrorCode =
   | "bad_request"
   | "unauthorized"
@@ -201,6 +208,7 @@ export const FRAME_TYPES = [
   "e2ee.msg",
   "friend.requested",
   "friend.accepted",
+  "profile.updated",
   "error",
 ] as const;
 
@@ -228,6 +236,7 @@ export type Frame =
   | Envelope<"e2ee.msg", E2eeMsg>
   | Envelope<"friend.requested", FriendRequested>
   | Envelope<"friend.accepted", FriendAccepted>
+  | Envelope<"profile.updated", ProfileUpdated>
   | Envelope<"error", ErrorPayload>;
 
 /** Thrown when a raw value cannot be interpreted as a v1 frame at all. */
@@ -406,6 +415,15 @@ export function isFriendAccepted(d: unknown): d is FriendAccepted {
   return isRecord(d) && isFriendUserRef(d["friend"]);
 }
 
+export function isProfileUpdated(d: unknown): d is ProfileUpdated {
+  return (
+    isRecord(d) &&
+    typeof d["user_id"] === "string" &&
+    typeof d["display_name"] === "string" &&
+    typeof d["avatar"] === "string"
+  );
+}
+
 const PAYLOAD_GUARDS: { [T in FrameType]: (d: unknown) => boolean } = {
   "auth.ticket.req": isAuthTicketReq,
   "auth.ticket.res": isAuthTicketRes,
@@ -422,6 +440,7 @@ const PAYLOAD_GUARDS: { [T in FrameType]: (d: unknown) => boolean } = {
   "e2ee.msg": isE2eeMsg,
   "friend.requested": isFriendRequested,
   "friend.accepted": isFriendAccepted,
+  "profile.updated": isProfileUpdated,
   error: isErrorPayload,
 };
 

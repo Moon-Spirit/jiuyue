@@ -256,6 +256,11 @@ pub async fn update_profile(
         .map_err(AppError::internal)?;
 
     tracing::info!(user = %user.0, "profile updated");
+
+    // Live-notify conversation partners so avatars/display names refresh on
+    // their session rows without a REST round-trip (best-effort fan-out).
+    crate::ws::relay_profile_updated(&state, user.0, &display_name, &avatar).await;
+
     load_profile(&state, user.0).await.map(Json)
 }
 

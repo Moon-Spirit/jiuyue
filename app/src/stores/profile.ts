@@ -186,6 +186,12 @@ export const useProfileStore = defineStore("profile", {
       }
     },
 
+    /** Drops a cached peer profile so the next view refetches (called when a
+     *  `profile.updated` WS frame reports the peer changed their identity). */
+    invalidatePeer(userId: string): void {
+      delete this.peers[userId];
+    },
+
     async fetchPeer(userId: string): Promise<UserProfile | null> {
       const auth = useAuthStore();
       const token = await auth.ensureAccessToken();

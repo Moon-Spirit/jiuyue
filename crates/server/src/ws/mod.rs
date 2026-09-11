@@ -38,8 +38,8 @@ use axum::response::{IntoResponse, Response};
 use futures_util::{SinkExt, StreamExt};
 use jiuyue_protocol::{
     E2eeMsg, ErrorCode, ErrorPayload, Frame, MsgAck, MsgNew, MsgRecall, MsgRecalled, MsgSend,
-    Payload, ReadReceipt, ReadUpdate, SyncMessage, SyncReq, SyncRes, Typing, TypingState,
-    PROTOCOL_VERSION,
+    Payload, ProfileUpdated, ReadReceipt, ReadUpdate, SyncMessage, SyncReq, SyncRes, Typing,
+    TypingState, PROTOCOL_VERSION,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -211,6 +211,48 @@ pub(crate) fn relay_friend_payload(state: &AppState, to_user: Uuid, payload: Pay
     let wire = serialize_frame(&frame);
     let delivered = state.registry.deliver_to(to_user, &wire);
     tracing::debug!(%to_user, delivered, "friend frame relayed");
+}
+
+/// Fire-and-forget `profile.updated` fan-out after a profile PATCH commits.
+///
+/// Recipients: every ONLINE user sharing at least one conversation with the
+/// editor (conversation members minus self, deduplicated, registry-filtered).
+/// Offline peers miss the live notice and catch the new avatar/name on their
+/// next conversation listing / sync — the profile surface is REST-authoritative.
+pub(crate) async fn relay_profile_updated(
+    state: &AppState,
+    editor: Uuid,
+    display_name: &str,
+    avatar: &str,
+) {
+    let Ok(partners) = sqlx::query_scalar::<_, Uuid>(
+        "SELECT DISTINCT cm2.user_id
+           FROM conversation_members cm1
+           JOIN conversation_members cm2 ON cm2.conversation_id = cm1.conversation_id
+          WHERE cm1.user_id = $1 AND cm2.user_id <> $1",
+    )
+    .bind(editor)
+    .fetch_all(&state.pool)
+    .await
+    else {
+        return;
+    };
+    if partners.is_empty() {
+        return;
+    }
+    let frame = Frame {
+        v: PROTOCOL_VERSION,
+        payload: Payload::ProfileUpdated(ProfileUpdated {
+            user_id: editor,
+            display_name: display_name.to_owned(),
+            avatar: avatar.to_owned(),
+        }),
+    };
+    let wire = serialize_frame(&frame);
+    for partner in partners {
+        let delivered = state.registry.deliver_to(partner, &wire);
+        tracing::debug!(editor = %editor, %partner, delivered, "profile.updated relayed");
+    }
 }
 
 /// What the frame loop should do after handling one frame.
@@ -661,7 +703,8 @@ async fn handle_frame(
         | Payload::ReadReceipt(_)
         | Payload::MsgRecalled(_)
         | Payload::FriendRequested(_)
-        | Payload::FriendAccepted(_) => {
+        | Payload::FriendAccepted(_)
+        | Payload::ProfileUpdated(_) => {
             let _ = out_tx
                 .send(serialize_frame(&error_frame(
                     ErrorCode::BadRequest,

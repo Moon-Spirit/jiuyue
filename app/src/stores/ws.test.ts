@@ -909,4 +909,47 @@ describe("ws store — M2 forwarding", () => {
     expect(added?.peerUsername).toBe("carol");
     expect(added?.maxSeq).toBe(0); // fresh entry starts from zero
   });
+  it("profile.updated refreshes conversation peer identity + invalidates profile cache", async () => {
+    const auth = useAuthStore();
+    auth.user = { userId: "me-1", username: "me", uid: 1 };
+    const ws = useWsStore();
+    ws.conversations.push({
+      conversationId: 7,
+      peerUserId: "peer-9",
+      peerUsername: "oldname",
+      peerAvatar: "🐷",
+      lastMessagePreview: "hi",
+      lastActivityAt: "now",
+      unread: 0,
+      lastSeenSeq: 0,
+      maxSeq: 0,
+      peerTypingUntil: null,
+      kind: "direct",
+    });
+    // Seed the profile store peer cache so invalidation is observable.
+    const { useProfileStore } = await import("./profile");
+    const profileStore = useProfileStore();
+    profileStore.peers["peer-9"] = {
+      user_id: "peer-9",
+      username: "oldname",
+      uid: 9,
+      display_name: "oldname",
+      bio: "",
+      avatar: "🐷",
+      level: 1,
+      title: "",
+      xp: 0,
+      xp_to_next: 0,
+    };
+
+    ws.handleProfileUpdated({
+      user_id: "peer-9",
+      display_name: "矿工老王",
+      avatar: "data:image/jpeg;base64,AAAA",
+    });
+
+    expect(ws.conversations[0]!.peerDisplayName).toBe("矿工老王");
+    expect(ws.conversations[0]!.peerAvatar).toBe("data:image/jpeg;base64,AAAA");
+    expect(profileStore.peers["peer-9"]).toBeUndefined();
+  });
 });
