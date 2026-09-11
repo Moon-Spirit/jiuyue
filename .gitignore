@@ -21,3 +21,6 @@ Thumbs.db
 
 # media/uploads data dir (runtime storage)
 data/
+
+# magic-context session artifacts
+.cortexkit/

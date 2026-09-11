@@ -1,0 +1,43 @@
+name: Bug 报告
+description: 报告一个缺陷或异常行为
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢反馈！请尽量提供可复现的信息。
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: 现象
+      description: 发生了什么？期望是什么？
+      placeholder: 例如：注册页提交验证码后提示"账号或密码错误"…
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: 复现步骤
+      placeholder: |
+        1. 打开 …
+        2. 点击 …
+        3. 看到 …
+    validations:
+      required: true
+  - type: dropdown
+    id: client
+    attributes:
+      label: 客户端
+      options:
+        - 网页版（localhost:5173）
+        - 桌面客户端（jiuyue-app.exe）
+        - 后端 / API
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: 环境
+      placeholder: 操作系统、版本、网络环境等
+    validations:
+      required: false

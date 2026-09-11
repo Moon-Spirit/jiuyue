@@ -1,6 +1,12 @@
 # JiuYue
 
-商业级跨平台即时通讯 MVP：文字单聊、可靠送达、离线同步、可选端到端加密密聊（规划）。
+跨平台即时通讯：文字单聊、可靠送达、离线同步、消息体验全套（已读/正在输入/撤回/回复/转发）、密聊 E2EE、好友系统（UID 搜索）、个人资料与经验等级体系、图片/视频与表情包发送。
+
+[![Frontend](https://img.shields.io/badge/frontend-Vite%207%20%2B%20Vue%203%20%2B%20TS-42b883?logo=vuedotjs&logoColor=white)](app/)
+[![Desktop](https://img.shields.io/badge/desktop-Tauri%202-24C8DB?logo=tauri&logoColor=white)](app/src-tauri/)
+[![Backend](https://img.shields.io/badge/backend-Rust%20axum%20%2B%20tokio-000000?logo=rust&logoColor=white)](crates/)
+[![Database](https://img.shields.io/badge/db-PostgreSQL%2016%20%2B%20Redis-4169E1?logo=postgresql&logoColor=white)](deploy/)
+[![Status](https://img.shields.io/badge/status-MVP%20active-brightgreen)](#)
 
 - 前端：Vite 7 + Vue 3 + TypeScript + Pinia + Tailwind CSS v4
 - 壳：Tauri 2（Windows / macOS / Linux，iOS / Android 规划）
@@ -27,9 +33,27 @@ cargo run -p jiuyue-server    # 后端 :8080（/healthz）
 cd app; pnpm install; pnpm dev
 ```
 
+桌面客户端：
+
+```powershell
+cd app; pnpm tauri build --no-bundle   # 产物 app/src-tauri/target/release/jiuyue-app.exe
+```
+
 ## 质量门
 
 ```bash
 cargo clippy --workspace -- -D warnings && cargo test --workspace
 cd app && pnpm typecheck && pnpm test
 ```
+
+## 仓库结构
+
+| 路径              | 内容                                                    |
+| ----------------- | ------------------------------------------------------- |
+| `crates/protocol` | 版本化 WebSocket 线协议（frame envelope + golden 测试） |
+| `crates/domain`   | 纯领域逻辑（seq 分配、消息状态机、XP 曲线、称号阶梯）   |
+| `crates/server`   | axum HTTP + WS 服务、PG/Redis 适配                      |
+| `app/`            | Vue 3 前端 + Tauri 2 桌面壳                             |
+| `migrations/`     | PostgreSQL 迁移（sqlx）                                 |
+| `docs/`           | 规格 / 任务票 / 调研报告                                |
+| `deploy/`         | Docker Compose 与本机开发脚本                           |

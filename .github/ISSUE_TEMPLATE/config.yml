@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: 项目文档
+    url: https://github.com/Moon-Spirit/jiuyue/blob/main/docs/specs/jiuyue-mvp.md
+    about: 先看规格文档再提 issue
