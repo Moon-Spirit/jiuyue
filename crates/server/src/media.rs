@@ -147,13 +147,16 @@ fn ext_for_mime(mime: &str) -> Option<&'static str> {
     }
 }
 
-/// Sanitizes the optional `X-File-Name`: strips path separators and control
-/// characters, caps at 120 chars, falls back to `"file"` when empty.
+/// Sanitizes the optional `X-File-Name`: percent-decodes it first (clients
+/// encode UTF-8 names because header values are Latin-1 only), then strips
+/// path separators and control characters, caps at 120 chars, falls back to
+/// `"file"` when empty.
 fn sanitize_file_name(raw: Option<&str>) -> String {
     let Some(raw) = raw else {
         return "file".to_owned();
     };
-    let cleaned: String = raw
+    let decoded = percent_decode_utf8(raw);
+    let cleaned: String = decoded
         .chars()
         .filter(|c| !c.is_control() && *c != '/' && *c != '\\')
         .take(120)
@@ -164,6 +167,29 @@ fn sanitize_file_name(raw: Option<&str>) -> String {
     } else {
         trimmed.to_owned()
     }
+}
+
+/// Decodes `%XX` escapes into their bytes, then re-interprets the result as
+/// UTF-8. Malformed escapes and invalid UTF-8 pass through verbatim, so old
+/// clients that sent raw Latin-1 names keep working unchanged.
+fn percent_decode_utf8(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(hi), Some(lo)) = (hi, lo) {
+                out.push((hi * 16 + lo) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8(out).unwrap_or_else(|_| input.to_owned())
 }
 
 /// `POST /api/media` response.
@@ -443,6 +469,22 @@ mod tests {
         assert_eq!(
             sanitize_file_name(Some(&"x".repeat(500))).chars().count(),
             120
+        );
+    }
+
+    #[test]
+    fn sanitize_file_name_percent_decodes_utf8_names() {
+        // "中文.png" percent-encoded — what the web client sends now, because
+        // header values are Latin-1 and raw CJK throws in the browser.
+        assert_eq!(sanitize_file_name(Some("%E4%B8%AD%E6%96%87.png")), "中文.png");
+        // Plain ASCII (old clients) passes through unchanged.
+        assert_eq!(sanitize_file_name(Some("photo.png")), "photo.png");
+        // Malformed escapes stay verbatim rather than erroring.
+        assert_eq!(sanitize_file_name(Some("a%ZZb.png")), "a%ZZb.png");
+        // Decoded path separators are still stripped afterwards (defense kept).
+        assert_eq!(
+            sanitize_file_name(Some("%2E%2E%2Fetc%2Fpasswd")),
+            "..etcpasswd"
         );
     }
 

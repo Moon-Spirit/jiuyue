@@ -154,7 +154,13 @@ export function uploadMedia(
     xhr.open("POST", `${apiBase()}/api/media`);
     xhr.setRequestHeader("Authorization", `Bearer ${accessToken}`);
     xhr.setRequestHeader("Content-Type", file.type);
-    xhr.setRequestHeader("X-File-Name", file.name);
+    try {
+      // Header values are Latin-1; raw CJK names throw in Chromium. The
+      // server percent-decodes (and tolerates raw ASCII for old clients).
+      xhr.setRequestHeader("X-File-Name", encodeURIComponent(file.name));
+    } catch {
+      // The header is optional — a hostile name must never block upload.
+    }
     xhr.responseType = "text";
 
     if (onProgress !== undefined) {

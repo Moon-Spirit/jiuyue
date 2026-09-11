@@ -138,7 +138,9 @@ describe("uploadMedia", () => {
     expect(xhr.url).toBe("/api/media");
     expect(xhr.requestHeaders.get("Authorization")).toBe("Bearer tok-1");
     expect(xhr.requestHeaders.get("Content-Type")).toBe("image/png");
-    expect(xhr.requestHeaders.get("X-File-Name")).toBe("photo.png");
+    expect(xhr.requestHeaders.get("X-File-Name")).toBe(
+      encodeURIComponent("photo.png"),
+    );
     // Original File object travels verbatim — no re-encoding/compression.
     expect(xhr.sentBody).toBe(file);
 
@@ -163,6 +165,30 @@ describe("uploadMedia", () => {
       file_name: "photo.png",
     });
     expect(progress).toEqual([25, 100]);
+  });
+
+  it("percent-encodes CJK file names so the Latin-1 header cannot throw", async () => {
+    // Regression: raw "截图.png" throws a ByteString TypeError inside
+    // setRequestHeader on Chromium/WebView2, killing the upload before it
+    // even leaves the client (observed in the packaged desktop app).
+    const file = new File(["x"], "截图.png", { type: "image/png" });
+    const promise = uploadMedia("tok", file);
+    const xhr = MockXHR.instances.at(-1);
+    if (xhr === undefined) throw new Error("no XHR instance");
+    expect(xhr.requestHeaders.get("X-File-Name")).toBe(
+      encodeURIComponent("截图.png"),
+    );
+    xhr.respond(
+      201,
+      JSON.stringify({
+        media_id: "mid-2",
+        kind: "image",
+        mime: "image/png",
+        bytes: 1,
+        file_name: "截图.png",
+      }),
+    );
+    await expect(promise).resolves.toMatchObject({ media_id: "mid-2" });
   });
 
   it.each([
