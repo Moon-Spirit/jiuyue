@@ -18,6 +18,7 @@ pub mod groups_titles;
 pub mod media;
 pub mod profile;
 pub mod push;
+pub mod rtc;
 pub mod state;
 pub mod users;
 pub mod ws;

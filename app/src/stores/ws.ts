@@ -32,6 +32,7 @@ import {
   serializeFrame,
 } from "../lib/protocol/frames";
 import { useAuthStore } from "./auth";
+import { useCallStore } from "./call";
 import { useFriendsStore } from "./friends";
 import { useGroupsStore } from "./groups";
 import { useProfileStore } from "./profile";
@@ -568,6 +569,8 @@ export const useWsStore = defineStore("ws", {
         if (socket !== ws) return;
         socket = null;
         stopStalenessWatch();
+        // M14: a call cannot outlive its signalling channel — drop media.
+        useCallStore().handleWsClosed();
         if (intentionalClose) {
           this.status = "closed";
           return;
@@ -588,6 +591,8 @@ export const useWsStore = defineStore("ws", {
       if (socket !== null) socket.close();
       socket = null;
       this.status = "closed";
+      // M14: explicit disconnect also drops any active call.
+      useCallStore().handleWsClosed();
     },
 
     /** Full teardown (logout / test hygiene): clears queues and flags too. */
@@ -860,6 +865,10 @@ export const useWsStore = defineStore("ws", {
           break;
         case "profile.updated":
           this.handleProfileUpdated(frame.d);
+          break;
+        case "rtc.signal":
+          // M14 calls: route WebRTC signalling into the ephemeral call store.
+          useCallStore().handleSignal(frame.d);
           break;
         case "error":
           this.handleErrorFrame(frame.d);

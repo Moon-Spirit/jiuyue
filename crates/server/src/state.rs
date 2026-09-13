@@ -3,6 +3,7 @@
 use crate::code_store::CodeStore;
 use crate::crypto::BodyCipher;
 use crate::push::PushService;
+use crate::rtc::CallRegistry;
 use crate::ws::{ConnRegistry, HeartbeatConfig};
 use sqlx::PgPool;
 use std::path::PathBuf;
@@ -53,6 +54,10 @@ pub struct AppState {
     /// quota (1 GiB) is a separate, fixed domain constant and is NOT tuned by
     /// this cap — the cap only bounds a single file, streamed then aborted.
     pub group_file_max_bytes: u64,
+    /// M14a in-memory RTC call registry: which conversation has an active
+    /// call, who is in it, and since when. Process-local and ephemeral — no
+    /// call history is persisted (media never touches the server).
+    pub calls: Arc<CallRegistry>,
 }
 
 /// Reads a positive `u64` byte cap from the environment; missing, non-numeric
@@ -104,6 +109,7 @@ impl AppState {
                 "JIUYUE_GROUP_FILE_MAX_BYTES",
                 DEFAULT_GROUP_FILE_MAX_BYTES,
             ),
+            calls: Arc::new(CallRegistry::new()),
         }
     }
 }

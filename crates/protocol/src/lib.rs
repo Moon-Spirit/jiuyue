@@ -26,6 +26,7 @@
 //! | `friend.accepted`  | S → C     | `{ friend: { user_id, username, uid? } }`                                                                  |
 //! | `group.invited`    | S → C     | `{ invite_id, conversation_id, group_name, from: { user_id, username, uid? } }`                       |
 //! | `group.updated`    | S → C     | `{ conversation_id }`                                                                                 |
+//! | `rtc.signal`       | C ⇄ S     | `{ conversation_id, call_id, kind, to_user_id?, media?, reason?, sdp_type?, sdp?, candidate?, sdp_mid?, sdp_mline_index? }` + S→C `{ from, participants? }` |
 //! | `error`            | S → C     | `{ code, message, retryable }`                                                                       |
 //!
 //! Optional `msg.*` metadata fields are null-absent: when absent they are
@@ -341,6 +342,90 @@ pub struct GroupUpdated {
     pub conversation_id: i64,
 }
 
+/// Minimal public identity block for RTC signaling (M14a): the `from` field of
+/// every server-relayed `rtc.signal` frame plus each entry of a `roster`
+/// frame's `participants` list.
+///
+/// Deliberately distinct from [`UserIdentity`]: RTC consumers need the
+/// effective `display_name` (for call UI labels) and have no use for the
+/// numeric `uid`, so this type mirrors the exact S→C wire shape
+/// `{ user_id, username, display_name }`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserRef {
+    pub user_id: Uuid,
+    pub username: String,
+    /// Effective display handle (stored display_name, or username when empty;
+    /// resolved server-side).
+    pub display_name: String,
+}
+
+/// Client→server RTC signaling frame (`rtc.signal`, M14a).
+///
+/// Pure signaling relay: media never touches the server — it is WebRTC P2P.
+/// Every optional field is null-absent (omitted from the wire when `None`) so
+/// each `kind` carries only the fields it needs. `kind` is an open string
+/// (`"invite" | "accept" | "reject" | "join" | "leave" | "hangup" | "sdp" |
+/// "ice"`) validated by the server, not a closed enum, so an older build stays
+/// forward-decodable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RtcSignalIn {
+    pub conversation_id: i64,
+    pub call_id: Uuid,
+    pub kind: String,
+    /// Direct-signal target (sdp/ice); absent for broadcast events.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to_user_id: Option<Uuid>,
+    /// Negotiated media: `"audio"` (default server-side) or `"audio_video"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media: Option<String>,
+    /// Human reason (reject/ended).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// SDP type: `"offer"` or `"answer"` (kind `sdp`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sdp_type: Option<String>,
+    /// Opaque SDP body (kind `sdp`), relayed verbatim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sdp: Option<String>,
+    /// Stringified `RTCIceCandidateInit` JSON (kind `ice`), relayed verbatim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sdp_mid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sdp_mline_index: Option<i32>,
+}
+
+/// Server→client RTC signaling frame: [`RtcSignalIn`] flattened verbatim plus
+/// the server-stamped `from` and, on roster-bearing events
+/// (`accept`/`join`/`leave`/`hangup` → `kind:"roster"`; terminal events →
+/// `kind:"ended"` with an empty list), the full `participants` roster.
+///
+/// `from` is optional in the Rust type so the SAME payload variant decodes a
+/// C→S frame (which carries no `from`); the server always sets it on the wire,
+/// where the contract makes it mandatory.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RtcSignalOut {
+    #[serde(flatten)]
+    pub signal: RtcSignalIn,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<UserRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub participants: Option<Vec<UserRef>>,
+}
+
+impl RtcSignalOut {
+    /// Builds a server relay frame from an inbound signal: common fields
+    /// preserved verbatim, server-stamped `from`/`participants` attached.
+    pub fn reply(signal: RtcSignalIn, from: UserRef, participants: Option<Vec<UserRef>>) -> Self {
+        Self {
+            signal,
+            from: Some(from),
+            participants,
+        }
+    }
+}
+
 /// Client-to-server end-to-end-encrypted send request (secret chats).
 ///
 /// `ciphertext` is an opaque Olm message produced by the sender's device;
@@ -415,6 +500,8 @@ pub enum Payload {
     GroupInvited(GroupInvited),
     #[serde(rename = "group.updated")]
     GroupUpdated(GroupUpdated),
+    #[serde(rename = "rtc.signal")]
+    RtcSignal(RtcSignalOut),
     #[serde(rename = "e2ee.msg")]
     E2eeMsg(E2eeMsg),
     #[serde(rename = "error")]
@@ -521,6 +608,7 @@ fn decode_payload(t: &str, d: Value) -> Result<Payload, FrameError> {
         "profile.updated" => Ok(Payload::ProfileUpdated(decode_as(t, d)?)),
         "group.invited" => Ok(Payload::GroupInvited(decode_as(t, d)?)),
         "group.updated" => Ok(Payload::GroupUpdated(decode_as(t, d)?)),
+        "rtc.signal" => Ok(Payload::RtcSignal(decode_as(t, d)?)),
         "e2ee.msg" => Ok(Payload::E2eeMsg(decode_as(t, d)?)),
         "error" => Ok(Payload::Error(decode_as(t, d)?)),
         other => Ok(Payload::Error(ErrorPayload {
@@ -729,6 +817,78 @@ mod tests {
         assert_eq!(value["d"]["message_type"], json!(0));
         let back: Frame = serde_json::from_value(value).unwrap();
         assert_eq!(frame, back);
+    }
+
+    #[test]
+    fn rtc_signal_out_roundtrips_and_flattens_common_fields() {
+        let from = UserRef {
+            user_id: "018e1122-3344-7006-9a2b-1c2d3e4f5a6b".parse().unwrap(),
+            username: "alice".to_owned(),
+            display_name: "Alice".to_owned(),
+        };
+        let frame = Frame {
+            v: 1,
+            payload: Payload::RtcSignal(RtcSignalOut {
+                signal: RtcSignalIn {
+                    conversation_id: 42,
+                    call_id: "0190aabb-ccdd-7e01-8a1b-2c3d4e5f6071".parse().unwrap(),
+                    kind: "roster".to_owned(),
+                    to_user_id: None,
+                    media: Some("audio".to_owned()),
+                    reason: None,
+                    sdp_type: None,
+                    sdp: None,
+                    candidate: None,
+                    sdp_mid: None,
+                    sdp_mline_index: None,
+                },
+                from: Some(from.clone()),
+                participants: Some(vec![from]),
+            }),
+        };
+        let value = serde_json::to_value(&frame).unwrap();
+        assert_eq!(value["t"], json!("rtc.signal"));
+        // Common fields are flattened onto `d`, not nested under a key.
+        assert_eq!(value["d"]["conversation_id"], json!(42));
+        assert_eq!(value["d"]["kind"], json!("roster"));
+        assert_eq!(value["d"]["from"]["username"], json!("alice"));
+        assert_eq!(
+            value["d"]["participants"][0]["display_name"],
+            json!("Alice")
+        );
+        // Null-absent optionals never serialize.
+        assert!(value["d"].get("reason").is_none());
+        assert!(value["d"].get("sdp").is_none());
+
+        let back: Frame = serde_json::from_value(value).unwrap();
+        assert_eq!(frame, back);
+    }
+
+    #[test]
+    fn rtc_signal_inbound_frame_decodes_without_from() {
+        // A C→S frame has no `from`/`participants`; it must still decode into
+        // the shared RtcSignalOut payload with those slots empty.
+        let raw = json!({
+            "v": 1,
+            "t": "rtc.signal",
+            "d": {
+                "conversation_id": 7,
+                "call_id": "0190aabb-ccdd-7e01-8a1b-2c3d4e5f6071",
+                "kind": "sdp",
+                "to_user_id": "018e1122-3344-7006-9a2b-1c2d3e4f5a6b",
+                "sdp_type": "offer",
+                "sdp": "v=0"
+            }
+        });
+        match serde_json::from_value::<Frame>(raw).unwrap().payload {
+            Payload::RtcSignal(out) => {
+                assert_eq!(out.signal.kind, "sdp");
+                assert_eq!(out.signal.sdp.as_deref(), Some("v=0"));
+                assert!(out.from.is_none());
+                assert!(out.participants.is_none());
+            }
+            other => panic!("expected rtc.signal, got {other:?}"),
+        }
     }
 
     #[test]

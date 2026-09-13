@@ -26,6 +26,7 @@
  * | friend.accepted  | S → C     | `{ friend: { user_id, username } }`                            |
  * | group.invited    | S → C     | `{ invite_id, conversation_id, group_name, from: { user_id, username, display_name? } }` |
  * | group.updated    | S → C     | `{ conversation_id }`                                          |
+ * | rtc.signal       | C ⇄ S     | `{ conversation_id, call_id, kind, to_user_id?, media?, reason?, sdp_type?, sdp?, candidate?, sdp_mid?, sdp_mline_index?, from?, participants? }` |
  * | error            | S → C     | `{ code, message, retryable }`                                 |
  *
  * M2 optional `msg.*` metadata fields are null-absent: absent on the wire
@@ -235,6 +236,61 @@ export interface GroupUpdated {
   conversation_id: number;
 }
 
+/**
+ * M14 WebRTC call signaling kinds.
+ *
+ * C → S: `invite | accept | reject | join | leave | hangup | sdp | ice`.
+ * S → C: all of the above plus `roster` (full participant list after every
+ * membership change) and `ended` (the call is over for everyone).
+ */
+export type RtcSignalKind =
+  | "invite"
+  | "accept"
+  | "reject"
+  | "join"
+  | "leave"
+  | "hangup"
+  | "sdp"
+  | "ice"
+  | "roster"
+  | "ended";
+
+/** Shared `{ user_id, username, display_name? }` caller/participant ref. */
+export interface RtcUserRef {
+  user_id: string;
+  username: string;
+  /** Curated label; additive (older servers omit it). */
+  display_name?: string;
+}
+
+/** One roster entry — same shape as {@link RtcUserRef}. */
+export type RtcParticipant = RtcUserRef;
+
+/**
+ * M14 `rtc.signal` payload. `to_user_id` targets a single peer (DM or one mesh
+ * leg); absent means the server fans the signal out to the whole conversation
+ * (group invite / accept / leave / ended). `from` is stamped server-side on
+ * S→C frames and omitted on C→S frames; `participants` is present on `roster`.
+ */
+export interface RtcSignal {
+  conversation_id: number;
+  call_id: string;
+  kind: RtcSignalKind;
+  to_user_id?: string;
+  /** Reserved for future media modes; audio calls set/accept `"audio"`. */
+  media?: "audio";
+  /** Reject reason (`"busy"`, `"declined"`, …) or ended reason. */
+  reason?: string;
+  sdp_type?: "offer" | "answer";
+  sdp?: string;
+  /** Stringified `RTCIceCandidateInit` (or "" for the end-of-candidates). */
+  candidate?: string;
+  sdp_mid?: string;
+  sdp_mline_index?: number;
+  from?: RtcUserRef;
+  participants?: RtcParticipant[];
+}
+
 export type ErrorCode =
   | "bad_request"
   | "unauthorized"
@@ -269,6 +325,7 @@ export const FRAME_TYPES = [
   "profile.updated",
   "group.invited",
   "group.updated",
+  "rtc.signal",
   "error",
 ] as const;
 
@@ -299,6 +356,7 @@ export type Frame =
   | Envelope<"profile.updated", ProfileUpdated>
   | Envelope<"group.invited", GroupInvited>
   | Envelope<"group.updated", GroupUpdated>
+  | Envelope<"rtc.signal", RtcSignal>
   | Envelope<"error", ErrorPayload>;
 
 /** Thrown when a raw value cannot be interpreted as a v1 frame at all. */
@@ -547,6 +605,60 @@ export function isGroupUpdated(d: unknown): d is GroupUpdated {
   return isRecord(d) && hasInt(d, "conversation_id");
 }
 
+const RTC_SIGNAL_KINDS: readonly RtcSignalKind[] = [
+  "invite",
+  "accept",
+  "reject",
+  "join",
+  "leave",
+  "hangup",
+  "sdp",
+  "ice",
+  "roster",
+  "ended",
+];
+
+export function isRtcSignalKind(v: unknown): v is RtcSignalKind {
+  return RTC_SIGNAL_KINDS.includes(v as RtcSignalKind);
+}
+
+/** Shape guard for the `{ user_id, username, display_name? }` call ref. */
+export function isRtcUserRef(v: unknown): v is RtcUserRef {
+  return (
+    isRecord(v) &&
+    hasString(v, "user_id") &&
+    hasString(v, "username") &&
+    hasOptionalString(v, "display_name")
+  );
+}
+
+export function isRtcSignal(d: unknown): d is RtcSignal {
+  if (!isRecord(d)) return false;
+  if (!hasInt(d, "conversation_id")) return false;
+  if (!hasString(d, "call_id")) return false;
+  if (!isRtcSignalKind(d["kind"])) return false;
+  if (!hasOptionalString(d, "to_user_id")) return false;
+  if (d["media"] !== undefined && d["media"] !== "audio") return false;
+  if (!hasOptionalString(d, "reason")) return false;
+  if (
+    d["sdp_type"] !== undefined &&
+    d["sdp_type"] !== "offer" &&
+    d["sdp_type"] !== "answer"
+  ) {
+    return false;
+  }
+  if (!hasOptionalString(d, "sdp")) return false;
+  if (!hasOptionalString(d, "candidate")) return false;
+  if (!hasOptionalString(d, "sdp_mid")) return false;
+  if (!hasOptionalInt(d, "sdp_mline_index")) return false;
+  if (d["from"] !== undefined && !isRtcUserRef(d["from"])) return false;
+  if (d["participants"] !== undefined) {
+    if (!Array.isArray(d["participants"])) return false;
+    if (!d["participants"].every((p) => isRtcUserRef(p))) return false;
+  }
+  return true;
+}
+
 const PAYLOAD_GUARDS: { [T in FrameType]: (d: unknown) => boolean } = {
   "auth.ticket.req": isAuthTicketReq,
   "auth.ticket.res": isAuthTicketRes,
@@ -566,6 +678,7 @@ const PAYLOAD_GUARDS: { [T in FrameType]: (d: unknown) => boolean } = {
   "profile.updated": isProfileUpdated,
   "group.invited": isGroupInvited,
   "group.updated": isGroupUpdated,
+  "rtc.signal": isRtcSignal,
   error: isErrorPayload,
 };
 

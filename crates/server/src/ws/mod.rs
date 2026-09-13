@@ -173,7 +173,7 @@ fn envelope_version_is_supported(text: &str) -> bool {
 
 /// Serializes a server frame; our payloads are pure serde types, so failure
 /// is an invariant breach that degrades to a logged placeholder, never a panic.
-fn serialize_frame(frame: &Frame) -> OutboundFrame {
+pub(crate) fn serialize_frame(frame: &Frame) -> OutboundFrame {
     Arc::new(serde_json::to_string(frame).unwrap_or_else(|err| {
         tracing::error!(%err, "frame serialization failed; substituting empty object");
         "{}".to_owned()
@@ -776,6 +776,43 @@ async fn handle_frame(
                 Flow::Continue
             }
         },
+        // M14a RTC signaling: membership-gated relay + in-memory call roster.
+        // Never closes the connection — every failure is a policy answer
+        // (`not_a_member`, `call_busy`, `call_not_found`, ...), not identity
+        // doubt, and the server never sees media (pure WebRTC P2P).
+        Payload::RtcSignal(signal) => {
+            match crate::rtc::handle_signal(state, sender_id, signal).await {
+                Ok(()) => Flow::Continue,
+                Err(crate::rtc::RtcRejection::BadRequest(message)) => {
+                    let _ = out_tx
+                        .send(serialize_frame(&error_frame(ErrorCode::BadRequest, message)))
+                        .await;
+                    Flow::Continue
+                }
+                Err(crate::rtc::RtcRejection::Conflict(message)) => {
+                    let _ = out_tx
+                        .send(serialize_frame(&error_frame(ErrorCode::Conflict, message)))
+                        .await;
+                    Flow::Continue
+                }
+                Err(crate::rtc::RtcRejection::NotFound(message)) => {
+                    let _ = out_tx
+                        .send(serialize_frame(&error_frame(ErrorCode::NotFound, message)))
+                        .await;
+                    Flow::Continue
+                }
+                Err(crate::rtc::RtcRejection::Internal(err)) => {
+                    tracing::error!(%sender_id, error = %format!("{err:#}"), "rtc.signal failed");
+                    let _ = out_tx
+                        .send(serialize_frame(&error_frame(
+                            ErrorCode::Internal,
+                            "internal error",
+                        )))
+                        .await;
+                    Flow::Continue
+                }
+            }
+        }
         // Server-to-client types arriving client→server are protocol misuse.
         Payload::MsgAck(_)
         | Payload::MsgNew(_)

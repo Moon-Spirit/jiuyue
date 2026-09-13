@@ -54,7 +54,15 @@ import {
 } from "../lib/api/groupFiles";
 import type { GroupFile } from "../lib/api/groupFiles";
 import * as olm from "../lib/crypto/olm-lite";
+import {
+  SHARE_FRAMERATES,
+  SHARE_RESOLUTIONS,
+  shareQuality,
+} from "../lib/rtc/callSession";
+import type { ShareQuality } from "../lib/rtc/callSession";
+import { callStatusText } from "../lib/rtc/callStatus";
 import { useAuthStore } from "../stores/auth";
+import { useCallStore } from "../stores/call";
 import { useFriendsStore } from "../stores/friends";
 import { useGroupsStore } from "../stores/groups";
 import { useProfileStore } from "../stores/profile";
@@ -69,6 +77,7 @@ const ws = useWsStore();
 const friends = useFriendsStore();
 const groups = useGroupsStore();
 const profile = useProfileStore();
+const calls = useCallStore();
 const { preference: themePreference } = useTheme();
 /** Own instance, captured for cross-breakpoint DOM measurement at runtime. */
 const viewInstance = getCurrentInstance();
@@ -126,6 +135,70 @@ const groupAvatarInputEl = ref<HTMLInputElement | null>(null);
 const titleDialogMember = ref<GroupMember | null>(null);
 const titleDraft = ref("");
 const titleSaving = ref(false);
+
+// --- M14 calls: incoming/active panel + screen-share quality picker ------
+const sharePickerOpen = ref(false);
+/** Selected capture resolution label (matches SHARE_RESOLUTIONS labels). */
+const shareResolutionLabel = ref("720p");
+/** Selected capture framerate (matches SHARE_FRAMERATES). */
+const shareFrameRate = ref(30);
+/** Ticking clock driving the call duration display. */
+const callNow = ref(Date.now());
+let callTimer: ReturnType<typeof setInterval> | null = null;
+let callToastTimer: ReturnType<typeof setTimeout> | null = null;
+/** Video sinks bound imperatively (srcObject is a DOM property, not an attr). */
+const remoteVideoEl = ref<HTMLVideoElement | null>(null);
+const selfVideoEl = ref<HTMLVideoElement | null>(null);
+const selfThumbEl = ref<HTMLVideoElement | null>(null);
+
+/** Call affordances exist in direct + group threads, never in secret chats. */
+const callsEnabled = computed(
+  () =>
+    ws.activeConversation !== null && ws.activeConversation.kind !== "secret",
+);
+/** Curated caller label for the incoming dialog. */
+const incomingCallerName = computed(() => {
+  const peer = calls.peer;
+  if (peer === null) return "";
+  const display = peer.displayName?.trim() ?? "";
+  return display.length > 0 ? display : peer.username;
+});
+/** mm:ss duration anchored at the moment the call first went live. */
+const callDuration = computed(() => {
+  if (calls.startedAt === null) return "00:00";
+  const total = Math.max(
+    0,
+    Math.floor((callNow.value - calls.startedAt) / 1000),
+  );
+  const mm = String(Math.floor(total / 60)).padStart(2, "0");
+  const ss = String(total % 60).padStart(2, "0");
+  return `${mm}:${ss}`;
+});
+/** The quality the picker currently represents. */
+const selectedShareQuality = computed<ShareQuality>(() =>
+  shareQuality(shareResolutionLabel.value, shareFrameRate.value),
+);
+/** Human status line for the active call panel (never empty — see helper). */
+const callStatusLabel = computed(() =>
+  callStatusText(
+    calls.status,
+    (key, params) => (params === undefined ? t(key) : t(key, params)),
+    {
+      isGroup: calls.isGroup,
+      participantCount: calls.participants.length,
+    },
+  ),
+);
+/** Avatar ring order: group roster, or [self, peer] for a 1:1 call. */
+const callParticipantIds = computed<string[]>(() => {
+  if (calls.isGroup) return calls.participants.map((p) => p.user_id);
+  const ids: string[] = [];
+  if (calls.myUserId() !== "") ids.push(calls.myUserId());
+  if (calls.peer !== null) ids.push(calls.peer.userId);
+  return ids;
+});
+/** True when a remote screen takes the big stage (else the self preview does). */
+const stageIsRemote = computed(() => calls.videoStageUserId !== null);
 
 // --- M13b group files: usage, listing, up/download/delete, drag & drop ---
 const fileUploading = ref(false);
@@ -207,6 +280,15 @@ onBeforeUnmount(() => {
   }
   resetRecordingState();
   pauseAudio();
+  // Call UI timers are local to this view; the call itself stays in the store.
+  if (callTimer !== null) {
+    clearInterval(callTimer);
+    callTimer = null;
+  }
+  if (callToastTimer !== null) {
+    clearTimeout(callToastTimer);
+    callToastTimer = null;
+  }
 });
 
 watch(
@@ -216,6 +298,64 @@ watch(
     // Optional call: jsdom (tests) does not implement scrollIntoView.
     messagesEndRef.value?.scrollIntoView?.({ block: "end" });
   },
+);
+
+// --- M14 call view glue: duration clock, toast auto-dismiss, video sinks --
+watch(
+  () => calls.isInCall,
+  (inCall) => {
+    if (inCall) {
+      callNow.value = Date.now();
+      if (callTimer === null) {
+        callTimer = setInterval(() => {
+          callNow.value = Date.now();
+        }, 1_000);
+      }
+    } else {
+      if (callTimer !== null) {
+        clearInterval(callTimer);
+        callTimer = null;
+      }
+      sharePickerOpen.value = false;
+    }
+  },
+);
+
+watch(
+  () => calls.toast,
+  (toast) => {
+    if (callToastTimer !== null) {
+      clearTimeout(callToastTimer);
+      callToastTimer = null;
+    }
+    if (toast !== null) {
+      callToastTimer = setTimeout(() => {
+        callToastTimer = null;
+        calls.clearToast();
+      }, 4_000);
+    }
+  },
+);
+
+// Post-flush: the <video> sinks only exist while the stage renders.
+watch(
+  [() => calls.videoStageUserId, () => calls.remoteStreams, remoteVideoEl],
+  () => {
+    const userId = calls.videoStageUserId;
+    const stream =
+      userId !== null ? (calls.remoteStreams[userId] ?? null) : null;
+    if (remoteVideoEl.value !== null) remoteVideoEl.value.srcObject = stream;
+  },
+  { flush: "post" },
+);
+watch(
+  [() => calls.localScreenStream, selfVideoEl, selfThumbEl],
+  () => {
+    const stream = calls.localScreenStream;
+    if (selfVideoEl.value !== null) selfVideoEl.value.srcObject = stream;
+    if (selfThumbEl.value !== null) selfThumbEl.value.srcObject = stream;
+  },
+  { flush: "post" },
 );
 
 async function logout(): Promise<void> {
@@ -1786,6 +1926,115 @@ async function submitGroupInvite(): Promise<void> {
     groupActionError.value = groupApiErrorMessage(error, (key) => t(key));
   }
 }
+
+// ---------------------------------------------------------------------
+// M14 calls + screen share
+// ---------------------------------------------------------------------
+
+/** Phone button in the thread header / group drawer. */
+function startCallFromThread(): void {
+  const id = ws.activeConversationId;
+  if (id === null) return;
+  sharePickerOpen.value = false;
+  calls.startCall(id);
+}
+
+function acceptCall(): void {
+  void calls.acceptIncoming();
+}
+
+function rejectCall(): void {
+  calls.rejectIncoming();
+}
+
+function hangupCall(): void {
+  calls.hangup();
+}
+
+function toggleCallMute(): void {
+  calls.toggleMute();
+}
+
+/** Pre-share it toggles the picker; while sharing it stops the share. */
+function toggleSharePicker(): void {
+  if (calls.sharing) {
+    void calls.stopShare();
+    return;
+  }
+  sharePickerOpen.value = !sharePickerOpen.value;
+}
+
+function confirmShare(): void {
+  sharePickerOpen.value = false;
+  void calls.startShare(selectedShareQuality.value);
+}
+
+function stopShare(): void {
+  void calls.stopShare();
+}
+
+function selectShareResolution(label: string): void {
+  shareResolutionLabel.value = label;
+}
+
+function selectShareFrameRate(fps: number): void {
+  shareFrameRate.value = fps;
+}
+
+/** Live quality switch while already sharing (replaceTrack per mesh leg). */
+function pickShareQuality(label: string, fps: number): void {
+  shareResolutionLabel.value = label;
+  shareFrameRate.value = fps;
+  if (calls.sharing) void calls.changeShareQuality(shareQuality(label, fps));
+}
+
+function shareQualityLabel(label: string): string {
+  return t(`call.quality${label}`);
+}
+
+function shareFpsLabel(fps: number): string {
+  return t(`call.fps${fps}`);
+}
+
+interface CallParticipantView {
+  username: string;
+  displayName?: string;
+  avatar?: string | null;
+}
+
+function participantRef(userId: string): CallParticipantView {
+  if (userId === calls.myUserId()) {
+    return {
+      username: auth.user?.username ?? "",
+      displayName: auth.user?.displayName,
+      avatar: auth.user?.avatar ?? null,
+    };
+  }
+  if (calls.peer !== null && userId === calls.peer.userId) {
+    return {
+      username: calls.peer.username,
+      displayName: calls.peer.displayName,
+      avatar: null,
+    };
+  }
+  const participant = calls.participants.find((p) => p.user_id === userId);
+  return {
+    username: participant?.username ?? userId,
+    displayName: participant?.display_name,
+    avatar: null,
+  };
+}
+
+function speakerName(userId: string): string {
+  if (userId === calls.myUserId()) return t("call.you");
+  const ref = participantRef(userId);
+  const display = ref.displayName?.trim() ?? "";
+  return display.length > 0 ? display : ref.username;
+}
+
+function speakingOf(userId: string): boolean {
+  return calls.speaking[userId] === true;
+}
 </script>
 
 <template>
@@ -2169,15 +2418,343 @@ async function submitGroupInvite(): Promise<void> {
             <path d="M8 11V7a4 4 0 0 1 8 0v4" />
           </svg>
           <button
+            v-if="callsEnabled"
+            type="button"
+            class="ml-auto shrink-0 rounded-lg border border-neutral-300 p-1.5 text-neutral-600 hover:bg-neutral-100 dark:border-neutral-700 dark:text-neutral-300 dark:hover:bg-neutral-800"
+            data-testid="call-start"
+            :title="
+              ws.activeConversation.kind === 'group'
+                ? t('call.groupCall')
+                : t('call.start')
+            "
+            :aria-label="t('call.start')"
+            @click="startCallFromThread()"
+          >
+            <svg
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+              class="h-4 w-4"
+              aria-hidden="true"
+            >
+              <path
+                d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72c.13.96.36 1.9.7 2.81a2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45c.91.34 1.85.57 2.81.7A2 2 0 0 1 22 16.92z"
+              />
+            </svg>
+          </button>
+          <button
             v-if="ws.activeConversation.kind === 'group'"
             type="button"
-            class="ml-auto shrink-0 rounded-lg border border-neutral-300 px-2 py-1 text-xs font-medium text-neutral-600 hover:bg-neutral-100 dark:border-neutral-700 dark:text-neutral-300 dark:hover:bg-neutral-800"
+            class="ml-1 shrink-0 rounded-lg border border-neutral-300 px-2 py-1 text-xs font-medium text-neutral-600 hover:bg-neutral-100 dark:border-neutral-700 dark:text-neutral-300 dark:hover:bg-neutral-800"
             data-testid="group-info-button"
             @click="openGroupPanel()"
           >
             {{ t("group.infoButton") }}
           </button>
         </header>
+
+        <!-- M14 active call panel: participants, controls, screen stage -->
+        <div
+          v-if="calls.isInCall && calls.status !== 'incoming'"
+          class="shrink-0 border-b border-neutral-200 px-3 py-2 dark:border-neutral-800"
+          data-testid="call-panel"
+        >
+          <div class="flex items-center gap-2">
+            <span
+              class="text-xs font-semibold text-neutral-700 dark:text-neutral-200"
+              data-testid="call-status"
+            >
+              {{ callStatusLabel }}
+            </span>
+            <span
+              class="text-xs tabular-nums text-neutral-400 dark:text-neutral-500"
+              data-testid="call-duration"
+            >
+              {{ callDuration }}
+            </span>
+            <div class="ml-auto flex items-center gap-1">
+              <button
+                type="button"
+                class="rounded-lg border border-neutral-300 p-1.5 hover:bg-neutral-100 dark:border-neutral-700 dark:hover:bg-neutral-800"
+                :class="
+                  calls.muted
+                    ? 'text-red-500'
+                    : 'text-neutral-600 dark:text-neutral-300'
+                "
+                data-testid="call-mute"
+                :title="calls.muted ? t('call.unmute') : t('call.mute')"
+                :aria-label="calls.muted ? t('call.unmute') : t('call.mute')"
+                @click="toggleCallMute()"
+              >
+                <svg
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="2"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  class="h-4 w-4"
+                  aria-hidden="true"
+                >
+                  <rect x="9" y="2" width="6" height="12" rx="3" />
+                  <path d="M5 10a7 7 0 0 0 14 0" />
+                  <path d="M12 17v5" />
+                </svg>
+              </button>
+              <button
+                type="button"
+                class="rounded-lg border border-neutral-300 p-1.5 hover:bg-neutral-100 dark:border-neutral-700 dark:hover:bg-neutral-800"
+                :class="
+                  calls.sharing
+                    ? 'text-indigo-600 dark:text-indigo-400'
+                    : 'text-neutral-600 dark:text-neutral-300'
+                "
+                data-testid="call-share"
+                :title="calls.sharing ? t('call.stopShare') : t('call.share')"
+                :aria-label="
+                  calls.sharing ? t('call.stopShare') : t('call.share')
+                "
+                @click="toggleSharePicker()"
+              >
+                <svg
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="2"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  class="h-4 w-4"
+                  aria-hidden="true"
+                >
+                  <rect x="2" y="3" width="20" height="14" rx="2" />
+                  <path d="M8 21h8M12 17v4" />
+                </svg>
+              </button>
+              <button
+                type="button"
+                class="rounded-lg bg-red-600 p-1.5 text-white hover:bg-red-500"
+                data-testid="call-hangup"
+                :title="t('call.hangup')"
+                :aria-label="t('call.hangup')"
+                @click="hangupCall()"
+              >
+                <svg
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="2"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  class="h-4 w-4"
+                  aria-hidden="true"
+                >
+                  <path
+                    d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72c.13.96.36 1.9.7 2.81a2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45c.91.34 1.85.57 2.81.7A2 2 0 0 1 22 16.92z"
+                    transform="rotate(135 12 12)"
+                  />
+                </svg>
+              </button>
+            </div>
+          </div>
+
+          <!-- Participant avatars with speaking rings -->
+          <div
+            class="mt-2 flex flex-wrap items-center gap-3"
+            data-testid="call-participants"
+          >
+            <div
+              v-for="uid in callParticipantIds"
+              :key="uid"
+              class="flex flex-col items-center gap-0.5"
+              data-testid="call-participant"
+            >
+              <span
+                class="rounded-full transition-shadow"
+                :class="
+                  speakingOf(uid)
+                    ? 'ring-2 ring-emerald-400 ring-offset-1 dark:ring-offset-neutral-950'
+                    : ''
+                "
+              >
+                <Avatar
+                  :username="participantRef(uid).username"
+                  :display-name="participantRef(uid).displayName"
+                  :avatar="participantRef(uid).avatar"
+                  :size="40"
+                />
+              </span>
+              <span
+                class="max-w-[64px] truncate text-[10px] text-neutral-500 dark:text-neutral-400"
+              >
+                {{ speakerName(uid) }}
+              </span>
+            </div>
+          </div>
+
+          <!-- Screen stage: remote sharer large, own capture preview -->
+          <div
+            v-if="calls.hasVideo"
+            class="relative mt-2 overflow-hidden rounded-xl bg-black/90"
+            data-testid="screen-stage"
+          >
+            <video
+              v-if="stageIsRemote"
+              ref="remoteVideoEl"
+              autoplay
+              playsinline
+              class="max-h-64 w-full object-contain"
+              data-testid="screen-remote-video"
+            ></video>
+            <video
+              v-else
+              ref="selfVideoEl"
+              autoplay
+              playsinline
+              muted
+              class="max-h-64 w-full object-contain"
+              data-testid="screen-self-video"
+            ></video>
+            <span
+              v-if="calls.remoteVideoUsers.length > 1"
+              class="absolute left-2 top-2 rounded bg-black/60 px-2 py-0.5 text-[10px] text-white"
+              data-testid="screen-multiple"
+            >
+              {{ t("call.multipleSharers") }}
+            </span>
+            <video
+              v-if="stageIsRemote && calls.sharing"
+              ref="selfThumbEl"
+              autoplay
+              playsinline
+              muted
+              class="mt-1 max-h-24 w-full object-contain opacity-80"
+              data-testid="screen-self-thumb"
+            ></video>
+          </div>
+
+          <!-- Share quality picker (pre-share) / live switcher (while sharing) -->
+          <div
+            v-if="sharePickerOpen && !calls.sharing"
+            class="mt-2 rounded-xl border border-neutral-200 p-2 dark:border-neutral-800"
+            data-testid="share-quality"
+          >
+            <p
+              class="text-[11px] font-medium text-neutral-500 dark:text-neutral-400"
+            >
+              {{ t("call.shareResolution") }}
+            </p>
+            <div class="mt-1 flex flex-wrap gap-1">
+              <button
+                v-for="res in SHARE_RESOLUTIONS"
+                :key="res.label"
+                type="button"
+                class="rounded-lg border px-2 py-1 text-[11px] font-medium"
+                :class="
+                  shareResolutionLabel === res.label
+                    ? 'border-indigo-500 bg-indigo-50 text-indigo-700 dark:bg-indigo-950 dark:text-indigo-200'
+                    : 'border-neutral-300 text-neutral-600 dark:border-neutral-700 dark:text-neutral-300'
+                "
+                data-testid="share-resolution"
+                :data-value="res.label"
+                @click="selectShareResolution(res.label)"
+              >
+                {{ shareQualityLabel(res.label) }}
+              </button>
+            </div>
+            <p
+              class="mt-2 text-[11px] font-medium text-neutral-500 dark:text-neutral-400"
+            >
+              {{ t("call.shareFrameRate") }}
+            </p>
+            <div class="mt-1 flex flex-wrap gap-1">
+              <button
+                v-for="fps in SHARE_FRAMERATES"
+                :key="fps"
+                type="button"
+                class="rounded-lg border px-2 py-1 text-[11px] font-medium"
+                :class="
+                  shareFrameRate === fps
+                    ? 'border-indigo-500 bg-indigo-50 text-indigo-700 dark:bg-indigo-950 dark:text-indigo-200'
+                    : 'border-neutral-300 text-neutral-600 dark:border-neutral-700 dark:text-neutral-300'
+                "
+                data-testid="share-fps"
+                :data-value="fps"
+                @click="selectShareFrameRate(fps)"
+              >
+                {{ shareFpsLabel(fps) }}
+              </button>
+            </div>
+            <div class="mt-2 flex justify-end gap-2">
+              <button
+                type="button"
+                class="rounded-lg border border-neutral-300 px-2 py-1 text-[11px] font-medium text-neutral-600 dark:border-neutral-700 dark:text-neutral-300"
+                data-testid="share-cancel"
+                @click="sharePickerOpen = false"
+              >
+                {{ t("call.shareCancel") }}
+              </button>
+              <button
+                type="button"
+                class="rounded-lg bg-indigo-600 px-3 py-1 text-[11px] font-medium text-white hover:bg-indigo-500"
+                data-testid="share-confirm"
+                @click="confirmShare()"
+              >
+                {{ t("call.shareStart") }}
+              </button>
+            </div>
+          </div>
+
+          <!-- While sharing: compact live quality switcher + stop -->
+          <div
+            v-else-if="calls.sharing"
+            class="mt-2 flex flex-wrap items-center gap-1 rounded-xl border border-indigo-200 p-2 dark:border-indigo-900"
+            data-testid="share-quality"
+          >
+            <button
+              v-for="res in SHARE_RESOLUTIONS"
+              :key="res.label"
+              type="button"
+              class="rounded-lg border px-2 py-1 text-[11px] font-medium"
+              :class="
+                calls.shareQuality.label === res.label
+                  ? 'border-indigo-500 bg-indigo-50 text-indigo-700 dark:bg-indigo-950 dark:text-indigo-200'
+                  : 'border-neutral-300 text-neutral-600 dark:border-neutral-700 dark:text-neutral-300'
+              "
+              data-testid="share-live-resolution"
+              :data-value="res.label"
+              @click="pickShareQuality(res.label, calls.shareQuality.frameRate)"
+            >
+              {{ shareQualityLabel(res.label) }}
+            </button>
+            <button
+              v-for="fps in SHARE_FRAMERATES"
+              :key="fps"
+              type="button"
+              class="rounded-lg border px-2 py-1 text-[11px] font-medium"
+              :class="
+                calls.shareQuality.frameRate === fps
+                  ? 'border-indigo-500 bg-indigo-50 text-indigo-700 dark:bg-indigo-950 dark:text-indigo-200'
+                  : 'border-neutral-300 text-neutral-600 dark:border-neutral-700 dark:text-neutral-300'
+              "
+              data-testid="share-live-fps"
+              :data-value="fps"
+              @click="pickShareQuality(calls.shareQuality.label, fps)"
+            >
+              {{ shareFpsLabel(fps) }}
+            </button>
+            <button
+              type="button"
+              class="ml-auto rounded-lg bg-red-600 px-2 py-1 text-[11px] font-medium text-white hover:bg-red-500"
+              data-testid="share-stop"
+              @click="stopShare()"
+            >
+              {{ t("call.stopShare") }}
+            </button>
+          </div>
+        </div>
 
         <!-- M3 safety code row: compare with the peer out-of-band -->
         <div
@@ -2988,6 +3565,30 @@ async function submitGroupInvite(): Promise<void> {
                   }}
                 </p>
 
+                <!-- M14: start a group call from the info drawer -->
+                <button
+                  type="button"
+                  class="mt-2 flex w-full items-center justify-center gap-1.5 rounded-lg bg-indigo-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-indigo-500"
+                  data-testid="group-call-start"
+                  @click="startCallFromThread()"
+                >
+                  <svg
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="2"
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                    class="h-3.5 w-3.5"
+                    aria-hidden="true"
+                  >
+                    <path
+                      d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72c.13.96.36 1.9.7 2.81a2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45c.91.34 1.85.57 2.81.7A2 2 0 0 1 22 16.92z"
+                    />
+                  </svg>
+                  {{ t("call.groupCall") }}
+                </button>
+
                 <!-- Editable group description (owner/admin) / read-only otherwise -->
                 <div v-if="groupDescriptionEditing">
                   <textarea
@@ -3716,6 +4317,93 @@ async function submitGroupInvite(): Promise<void> {
             {{ t("settings.sponsor") }}
           </p>
         </div>
+      </div>
+
+      <!-- M14 incoming call dialog -->
+      <div
+        v-if="calls.status === 'incoming'"
+        class="fixed inset-0 z-[70] flex items-center justify-center bg-black/50 p-4 backdrop-blur-md"
+        data-testid="incoming-call"
+      >
+        <div
+          class="w-full max-w-xs rounded-2xl bg-white p-5 text-center shadow-2xl dark:bg-neutral-900"
+          role="dialog"
+          aria-modal="true"
+        >
+          <div class="flex justify-center">
+            <Avatar
+              :username="calls.peer?.username ?? ''"
+              :display-name="calls.peer?.displayName"
+              :avatar="null"
+              :size="56"
+            />
+          </div>
+          <p class="mt-2 text-sm font-semibold" data-testid="incoming-caller">
+            {{ incomingCallerName }}
+          </p>
+          <p class="text-xs text-neutral-500 dark:text-neutral-400">
+            {{ t("call.incoming") }}
+          </p>
+          <div class="mt-4 flex justify-center gap-6">
+            <button
+              type="button"
+              class="flex h-11 w-11 items-center justify-center rounded-full bg-red-600 text-white hover:bg-red-500"
+              data-testid="incoming-reject"
+              :title="t('call.reject')"
+              :aria-label="t('call.reject')"
+              @click="rejectCall()"
+            >
+              <svg
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                class="h-5 w-5"
+                aria-hidden="true"
+                transform="rotate(135 12 12)"
+              >
+                <path
+                  d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72c.13.96.36 1.9.7 2.81a2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45c.91.34 1.85.57 2.81.7A2 2 0 0 1 22 16.92z"
+                />
+              </svg>
+            </button>
+            <button
+              type="button"
+              class="flex h-11 w-11 items-center justify-center rounded-full bg-emerald-600 text-white hover:bg-emerald-500"
+              data-testid="incoming-accept"
+              :title="t('call.accept')"
+              :aria-label="t('call.accept')"
+              @click="acceptCall()"
+            >
+              <svg
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                class="h-5 w-5"
+                aria-hidden="true"
+              >
+                <path
+                  d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72c.13.96.36 1.9.7 2.81a2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45c.91.34 1.85.57 2.81.7A2 2 0 0 1 22 16.92z"
+                />
+              </svg>
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <!-- M14 call toast (ended / rejected / busy / mic / share errors) -->
+      <div
+        v-if="calls.toast !== null"
+        class="fixed bottom-6 left-1/2 z-[80] -translate-x-1/2 rounded-full px-4 py-2 text-xs font-medium text-white shadow-lg"
+        :class="calls.toast.tone === 'error' ? 'bg-red-600' : 'bg-neutral-800'"
+        data-testid="call-toast"
+      >
+        {{ t(calls.toast.key) }}
       </div>
     </template>
   </AppShell>

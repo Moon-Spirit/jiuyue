@@ -32,6 +32,8 @@ import {
   isMediaRef,
   isMsgNew,
   isMsgSend,
+  isRtcSignal,
+  isRtcSignalKind,
   isSyncCursor,
   isSyncRes,
   parseFrame,
@@ -433,5 +435,146 @@ describe("M11 group frames", () => {
   it("registers both types in FRAME_TYPES", () => {
     expect(FRAME_TYPES).toContain("group.invited");
     expect(FRAME_TYPES).toContain("group.updated");
+  });
+});
+
+describe("rtc.signal frames", () => {
+  it("parses a C→S invite (no from, no participants)", () => {
+    const invite = {
+      v: 1,
+      t: "rtc.signal",
+      d: {
+        conversation_id: 3,
+        call_id: "call-1",
+        kind: "invite",
+        media: "audio",
+        to_user_id: "peer-2",
+      },
+    };
+    const frame = parseFrame(invite);
+    expect(frame.t).toBe("rtc.signal");
+    if (frame.t !== "rtc.signal") throw new Error("unexpected frame");
+    expect(frame.d.kind).toBe("invite");
+    expect(frame.d.media).toBe("audio");
+    expect(serializeFrame(frame)).toEqual(invite);
+  });
+
+  it("parses an S→C roster carrying from + participants", () => {
+    const roster = {
+      v: 1,
+      t: "rtc.signal",
+      d: {
+        conversation_id: 9,
+        call_id: "call-2",
+        kind: "roster",
+        from: { user_id: "u1", username: "alice", display_name: "Alice" },
+        participants: [
+          { user_id: "u1", username: "alice", display_name: "Alice" },
+          { user_id: "u2", username: "bob" },
+        ],
+      },
+    };
+    const frame = parseFrame(roster);
+    expect(frame.t).toBe("rtc.signal");
+    if (frame.t !== "rtc.signal") throw new Error("unexpected frame");
+    expect(frame.d.participants).toHaveLength(2);
+    expect(serializeFrame(frame)).toEqual(roster);
+  });
+
+  it("parses sdp and ice signalling payloads", () => {
+    expect(
+      isRtcSignal({
+        conversation_id: 1,
+        call_id: "c",
+        kind: "sdp",
+        sdp_type: "offer",
+        sdp: "v=0",
+      }),
+    ).toBe(true);
+    expect(
+      isRtcSignal({
+        conversation_id: 1,
+        call_id: "c",
+        kind: "ice",
+        candidate: "candidate:1 1 udp 1 1.2.3.4 5 typ host",
+        sdp_mid: "0",
+        sdp_mline_index: 0,
+      }),
+    ).toBe(true);
+  });
+
+  it("accepts every signalling kind plus roster and ended", () => {
+    for (const kind of [
+      "invite",
+      "accept",
+      "reject",
+      "join",
+      "leave",
+      "hangup",
+      "sdp",
+      "ice",
+      "roster",
+      "ended",
+    ]) {
+      expect(isRtcSignalKind(kind)).toBe(true);
+      expect(isRtcSignal({ conversation_id: 1, call_id: "c", kind })).toBe(
+        true,
+      );
+    }
+  });
+
+  it("rejects malformed rtc.signal payloads", () => {
+    // missing call_id
+    expect(isRtcSignal({ conversation_id: 1, kind: "invite" })).toBe(false);
+    // non-integer conversation_id
+    expect(
+      isRtcSignal({ conversation_id: "1", call_id: "c", kind: "invite" }),
+    ).toBe(false);
+    // unknown kind
+    expect(isRtcSignal({ conversation_id: 1, call_id: "c", kind: "wat" })).toBe(
+      false,
+    );
+    // bad media
+    expect(
+      isRtcSignal({
+        conversation_id: 1,
+        call_id: "c",
+        kind: "invite",
+        media: "video",
+      }),
+    ).toBe(false);
+    // bad sdp_type
+    expect(
+      isRtcSignal({
+        conversation_id: 1,
+        call_id: "c",
+        kind: "sdp",
+        sdp_type: "pranswer",
+      }),
+    ).toBe(false);
+    // participants not an array of refs
+    expect(
+      isRtcSignal({
+        conversation_id: 1,
+        call_id: "c",
+        kind: "roster",
+        participants: [{ username: "alice" }],
+      }),
+    ).toBe(false);
+    // malformed from
+    expect(
+      isRtcSignal({
+        conversation_id: 1,
+        call_id: "c",
+        kind: "accept",
+        from: { user_id: "u1" },
+      }),
+    ).toBe(false);
+    expect(isRtcSignalKind("roster")).toBe(true);
+    expect(isRtcSignalKind("nope")).toBe(false);
+  });
+
+  it("registers rtc.signal in FRAME_TYPES", () => {
+    expect(FRAME_TYPES).toContain("rtc.signal");
   });
 });

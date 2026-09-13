@@ -10,6 +10,11 @@ import * as olm from "../lib/crypto/olm-lite";
 import { useAuthStore } from "./auth";
 import { useWsStore } from "./ws";
 
+// These tests run the REAL WebCrypto engine plus real-timer settles. Under a
+// full-suite run (with the M14 call/WebRTC modules loaded) P-256 keygen and the
+// 40x2ms settle loops can exceed the default 5s budget, so give the file room.
+vi.setConfig({ testTimeout: 25000 });
+
 /** Controllable WebSocket double (same shape as ws.test.ts). */
 class MockWebSocket {
   static instances: MockWebSocket[] = [];
