@@ -1,4 +1,8 @@
 //! HTTP routing and handlers.
+//!
+//! The router owns only the wiring: `/health`, the realtime upgrade, and the
+//! identity routes. Each domain keeps its own handlers in its own module (or
+//! crate), so this file stays a table of contents rather than a dumping ground.
 
 use std::time::Instant;
 
@@ -10,6 +14,8 @@ use axum::{Json, Router};
 use serde::Serialize;
 
 use crate::state::AppState;
+
+pub mod auth;
 
 /// Payload returned by `GET /health`.
 ///
@@ -32,6 +38,10 @@ pub fn app(state: AppState) -> Router {
         // Realtime lives in its own crate; the server only wires the route. The
         // upgrade handler is stateless, so it takes no state out of this crate.
         .route("/ws", get(jiuyue_realtime::ws_handler))
+        // Identity is its own module; the server only mounts its routes. The
+        // handlers answer `503` when no database is configured, rather than the
+        // routes disappearing, so a misconfigured instance is diagnosable.
+        .merge(auth::router())
         .layer(middleware::from_fn(log_request))
         .with_state(state)
 }

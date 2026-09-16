@@ -15,4 +15,4 @@ pub mod state;
 pub use config::Config;
 pub use error::Error;
 pub use routes::{Health, app};
-pub use state::AppState;
+pub use state::{AppState, AuthUnavailable};

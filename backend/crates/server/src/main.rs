@@ -3,7 +3,9 @@
 use std::net::SocketAddr;
 use std::process::ExitCode;
 
+use jiuyue_auth::{AuthConfig, AuthService};
 use jiuyue_server::{AppState, Config, Error, app};
+use jiuyue_store::Store;
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
 
@@ -18,12 +20,25 @@ async fn main() -> ExitCode {
     }
 }
 
-/// Load configuration, bind the listener and serve until shutdown.
+/// Load configuration, connect the database, and serve until shutdown.
+///
+/// The order matters: configuration is validated (and a missing signing secret
+/// rejected) before anything binds a socket, and migrations run before the server
+/// accepts traffic, so a request never reaches a half-created schema.
 async fn run() -> Result<(), Error> {
     let config = Config::from_env()?;
     init_logging(&config.rust_log)?;
 
-    let state = AppState::new(config);
+    let store = Store::connect(config.require_database_url()?).await?;
+    store.migrate().await?;
+
+    let auth = AuthService::new(
+        store.pool().clone(),
+        AuthConfig::new(config.require_jwt_secret()?),
+    )
+    .await?;
+
+    let state = AppState::with_auth(config, auth);
     let address = SocketAddr::from(([0, 0, 0, 0], state.config().port));
 
     let listener = TcpListener::bind(address)

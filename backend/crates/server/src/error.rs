@@ -17,6 +17,14 @@ pub enum Error {
     #[error(transparent)]
     Config(#[from] ConfigError),
 
+    /// The identity store could not be reached or migrated.
+    #[error(transparent)]
+    Store(#[from] jiuyue_store::StoreError),
+
+    /// Identity could not be initialised (for example a rejected signing secret).
+    #[error(transparent)]
+    Auth(#[from] jiuyue_auth::AuthError),
+
     /// The listener could not bind to the requested address.
     #[error("failed to bind listener on `{address}`")]
     Bind {

@@ -1,8 +1,9 @@
-//! jiuyue WebSocket contract — the single source of truth for the realtime wire.
+//! jiuyue wire contract — the single source of truth for every external boundary.
 //!
-//! This crate owns every type that crosses the WebSocket boundary: the versioned
-//! envelopes and the events they carry. It has no runtime dependencies beyond
-//! `serde`, so it stays cheap to compile on the 2 vCPU / 2 GB production box.
+//! This crate owns every type that crosses out of the backend: the versioned
+//! WebSocket envelopes and events, and the REST request/response types of the
+//! identity module. It has no runtime dependencies beyond `serde`, so it stays
+//! cheap to compile on the 2 vCPU / 2 GB production box.
 //!
 //! The contract is one-way: the Rust types below generate the frontend's
 //! TypeScript via `ts-rs`, and the frontend imports the generated files rather
@@ -20,8 +21,13 @@
 
 #![forbid(unsafe_code)]
 
+pub mod auth;
 pub mod envelope;
 pub mod events;
 
+pub use auth::{
+    AuthSession, ErrorBody, ErrorCode, ErrorDetail, FieldError, FieldErrorCode, LoginRequest,
+    RefreshRequest, RegisterRequest, TokenPair, UserProfile, WhoAmI,
+};
 pub use envelope::{ClientEnvelope, PROTOCOL_VERSION, ServerEnvelope};
 pub use events::{ClientEvent, Ping, ServerEvent};

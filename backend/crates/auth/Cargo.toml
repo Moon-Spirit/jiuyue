@@ -1,0 +1,61 @@
+[package]
+name = "jiuyue-auth"
+description = "jiuyue identity: Argon2id password hashing, JWT access tokens and database-backed sessions"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+name = "jiuyue_auth"
+path = "src/lib.rs"
+
+[dependencies]
+jiuyue-contract = { path = "../contract" }
+serde.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+# Password hashing. The `password-hash` feature is REQUIRED: argon2 0.6 renamed
+# the old `simple` feature, and without it `PasswordHasher` / `PasswordHash` do
+# not exist at all. `default-features = false` plus these three is exactly the
+# crate's own default set, spelled out so a future default change cannot alter it.
+argon2 = { version = "0.6", default-features = false, features = [
+    "alloc",
+    "getrandom",
+    "password-hash",
+] }
+
+# jsonwebtoken v11 removed the implicit crypto backend, so exactly one must be
+# named. The research note (docs/research/rust-backend-stack-2026.md, "JWT")
+# recommends `aws_lc_rs` on the premise that rustls already brings aws-lc-rs into
+# the tree — but this workspace's rustls uses `ring`, so `aws_lc_rs` is a *new*
+# native dependency, and building `aws-lc-sys` on Windows MSVC needs NASM, which
+# is not installed here (build fails in nasm_builder.rs). `rust_crypto` is the
+# other explicit backend: pure Rust, no C toolchain, and its HMAC/SHA-2 crates are
+# already in the tree. The v11 requirement — name a backend rather than rely on an
+# implicit one — is satisfied; only the choice differs. See the task report.
+jsonwebtoken = { version = "11", default-features = false, features = ["rust_crypto"] }
+
+# Opaque refresh tokens: OS randomness to mint, SHA-256 digest to store.
+getrandom = "0.3"
+sha2 = "0.10"
+base64 = "0.22"
+# ULID primary keys, matching the `users` table convention (ADR-0003).
+ulid = "1"
+
+# `sessions` is this crate's table (ADR-0011), so this crate owns the SQL that
+# reads and writes it. The feature set mirrors `jiuyue-store` minus `migrate`:
+# queries are runtime-checked, so no database is needed at compile time.
+sqlx = { version = "0.8", default-features = false, features = [
+    "postgres",
+    "runtime-tokio",
+    "tls-rustls",
+    "time",
+] }
+
+[dev-dependencies]
+tokio.workspace = true
