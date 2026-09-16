@@ -2,13 +2,25 @@
 import type { MessageView } from "./MessageView";
 
 /**
- * `GET /conversations/{id}/messages` response.
+ * `GET /conversations/{id}/messages` response: one page of history.
  *
- * A bounded window (the most recent messages), not a page: cursor pagination is
- * ticket #10 and deliberately absent here.
+ * Ordering is explicit and deterministic: `messages` is always ascending by
+ * `seq` (oldest first), whatever page was requested. Concatenating page N+1
+ * (fetched with `before = next_before`) in front of page N reconstructs the
+ * whole history with no duplicates and no gaps.
  */
 export type MessageList = { 
 /**
- * The returned Messages, oldest first so the list renders top-to-bottom.
+ * The page's Messages, oldest first (ascending `seq`), so the list renders
+ * top-to-bottom. Empty when `before` points before the first Message.
  */
-messages: Array<MessageView>, };
+messages: Array<MessageView>, 
+/**
+ * The cursor for the next older page: pass this as `before` to fetch it.
+ * `null` when there is nothing older.
+ */
+next_before: number | null, 
+/**
+ * Whether older Messages exist beyond this page.
+ */
+has_more: boolean, };

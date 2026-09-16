@@ -42,6 +42,9 @@
 
 > 应用监听 `0.0.0.0:<PORT>`（`backend/crates/server/src/main.rs`），配置里没有绑定地址开关。
 > 因此**必须**用防火墙挡住 8080，只让本机 Caddy 访问（见 §11）。
+>
+> **glibc 下限**：制品在 `ubuntu-24.04` 上构建，运行时 glibc ≥ 2.39，即 Ubuntu 24.04+ / Debian 13；
+> Debian 12 未验证。原因与替代方案见 §4.1。
 
 ---
 
@@ -75,16 +78,54 @@ sudo bash deploy/provision.sh --domain chat.example.com --acme-email ops@example
 
 ## 4. 发布与部署（deploy）
 
-### 4.1 制品接口（由 ticket #44 的 CI 发布任务实现）
+### 4.1 制品接口（由 `.github/workflows/release.yml` 实现，ticket #44）
 
-| 项     | 约定                                                             |
-| ------ | ---------------------------------------------------------------- |
-| 文件名 | `jiuyue-<version>-x86_64-unknown-linux-gnu.tar.gz`               |
-| 内容   | `bin/jiuyue-server`（可执行）、`dist/`（`frontend/dist` 的内容） |
-| 校验   | 同名 `.sha256` 伴随文件（`sha256sum` 格式）                      |
-| 拉取   | HTTPS 下载，或本地路径                                           |
+产物发布在 **GitHub Releases** 资产上（没有对象存储、没有镜像仓库，见 ADR-0010）。
+打一个 `v*` 标签触发构建与发布；`push` 到 `main` 也会构建并冒烟，但没有标签就不发布。
 
-发布前可这样打包（示例，CI 里做；**不要在服务器上编译**）：
+| 项       | 约定                                                                                                      |
+| -------- | --------------------------------------------------------------------------------------------------------- |
+| 版本号   | `<version>` = git 标签去掉前导 `v`（标签 `v1.2.3` → `1.2.3`），同时进文件名与 `/health`                   |
+| 文件名   | `jiuyue-<version>-x86_64-unknown-linux-gnu.tar.gz`                                                        |
+| 内容     | `bin/jiuyue-server`（可执行）、`dist/`（`frontend/dist` 的内容）、`VERSION`（可追溯元数据）               |
+| 校验     | 同名 `.sha256` 伴随文件（`sha256sum` 标准输出：`<64-hex>` + 两个空格 + 文件名；`deploy.sh` 取首行第一列） |
+| 拉取     | HTTPS 下载，或本地路径                                                                                    |
+| 构建基座 | `ubuntu-24.04` runner；后端 target `x86_64-unknown-linux-gnu`，release profile                            |
+
+`VERSION` 文件（每行 `key=value`；`deploy.sh` 不解包读取它，仅供人/脚本排查）：
+
+```
+version=1.2.3
+tag=v1.2.3
+commit=<40-hex>
+built_at=<ISO-8601 UTC>
+target=x86_64-unknown-linux-gnu
+```
+
+**URL 模式**（`<tag>` 是标签，`<version>` 是去掉前导 `v` 的版本）：
+
+```
+https://github.com/Moon-Spirit/jiuyue/releases/download/<tag>/jiuyue-<version>-x86_64-unknown-linux-gnu.tar.gz
+https://github.com/Moon-Spirit/jiuyue/releases/download/<tag>/jiuyue-<version>-x86_64-unknown-linux-gnu.tar.gz.sha256
+```
+
+`deploy.sh` 会自动去取 `<url>.sha256` 当校验，所以给 `--artifact` 一个 URL 就够：
+
+```bash
+sudo bash deploy/deploy.sh --artifact \
+  https://github.com/Moon-Spirit/jiuyue/releases/download/v1.2.3/jiuyue-1.2.3-x86_64-unknown-linux-gnu.tar.gz
+```
+
+**可追溯性**：`version`、提交与构建时间可从三处取到 —— Release 页面与资产名里的 `<version>`、制品内的
+`VERSION` 文件（`commit` / `built_at`）、以及运行中服务的 `GET /health`（`version` 字段，构建时经
+`JIUYUE_BUILD_VERSION` 编译进二进制，所以标签构建报告的是标签版本而不是 crate 的 `0.1.0`）。
+
+**构建基座与 glibc**：制品在 `ubuntu-24.04` runner 上链接，运行时依赖该基座的 glibc（2.39）。
+因此 §2 的目标机矩阵里 Ubuntu 24.04+ 与 Debian 13 有把握，**Debian 12（glibc 2.36）未经验证**；
+若实测缺符号，需要换用更低 glibc 的构建基座（例如 musl 静态构建）或自托管 runner。冒烟任务在**同一个**
+runner 上执行，它证明不了更低 glibc 的兼容性。
+
+发布前若要在本地复现打包（示例，**不要在服务器上编译**；CI 用同一套布局）：
 
 ```bash
 cargo build --manifest-path backend/Cargo.toml --release --bin jiuyue-server
@@ -92,7 +133,8 @@ pnpm --dir frontend build
 mkdir -p pkg/bin pkg/dist
 install -m 0755 backend/target/release/jiuyue-server pkg/bin/jiuyue-server
 cp -a frontend/dist/. pkg/dist/
-tar -C pkg -czf "jiuyue-${VERSION}-x86_64-unknown-linux-gnu.tar.gz" bin dist
+printf 'version=%s\ntarget=x86_64-unknown-linux-gnu\n' "${VERSION}" > pkg/VERSION
+tar -C pkg -czf "jiuyue-${VERSION}-x86_64-unknown-linux-gnu.tar.gz" bin dist VERSION
 sha256sum jiuyue-*.tar.gz > jiuyue-*.tar.gz.sha256
 ```
 
@@ -325,35 +367,42 @@ ufw enable
 
 ## 13. 验证状态（诚实清单）
 
-| 检查项                                              | 在哪里验证                   | 状态        |
-| --------------------------------------------------- | ---------------------------- | ----------- |
-| Caddyfile 语法 / 结构                               | CI `caddy validate`          | CI 每次推送 |
-| systemd unit 与 drop-in 语法                        | CI `systemd-analyze verify`  | CI 每次推送 |
-| 部署脚本语法 / lint                                 | CI `bash -n` + `shellcheck`  | CI 每次推送 |
-| 无 CRLF、env 模板变量齐全                           | CI                           | CI 每次推送 |
-| 证书签发/续期、HTTP→HTTPS、真实域名路由             | 需要真实服务器与域名         | **未验证**  |
-| `MemoryMax`/`LimitNOFILE` 的实际生效                | 需要真实服务器               | **未验证**  |
-| `deploy.sh` 端到端（下载→校验→切换→重启→健康→回滚） | 需要真实服务器与 systemd     | **未验证**  |
-| PostgreSQL 调参、swap 的实际表现                    | 需要真实服务器负载           | **未验证**  |
-| Caddy 重载时的 WebSocket 保留行为                   | 需要真实浏览器与 live 连接   | **未验证**  |
-| 制品打包内容（`bin/`+`dist/`）                      | 由 ticket #44 的发布任务产生 | **未验证**  |
+| 检查项                                                            | 在哪里验证                  | 状态                       |
+| ----------------------------------------------------------------- | --------------------------- | -------------------------- |
+| Caddyfile 语法 / 结构                                             | CI `caddy validate`         | CI 每次推送                |
+| systemd unit 与 drop-in 语法                                      | CI `systemd-analyze verify` | CI 每次推送                |
+| 部署脚本语法 / lint                                               | CI `bash -n` + `shellcheck` | CI 每次推送                |
+| 无 CRLF、env 模板变量齐全                                         | CI                          | CI 每次推送                |
+| 证书签发/续期、HTTP→HTTPS、真实域名路由                           | 需要真实服务器与域名        | **未验证**                 |
+| `MemoryMax`/`LimitNOFILE` 的实际生效                              | 需要真实服务器              | **未验证**                 |
+| `deploy.sh` 端到端（下载→校验→切换→重启→健康→回滚）               | 需要真实服务器与 systemd    | **未验证**                 |
+| PostgreSQL 调参、swap 的实际表现                                  | 需要真实服务器负载          | **未验证**                 |
+| Caddy 重载时的 WebSocket 保留行为                                 | 需要真实浏览器与 live 连接  | **未验证**                 |
+| 制品打包内容（`bin/` + `dist/` + `VERSION`）                      | CI `Release` 工作流冒烟任务 | CI 每次 push main / 标签   |
+| 制品 `.sha256` 侧车能被 `sha256sum -c` 验证                       | CI `Release` 工作流冒烟任务 | CI 每次 push main / 标签   |
+| 制品能在 Linux 上真跑（真 PostgreSQL，`/health` = ok 且版本一致） | CI `Release` 工作流冒烟任务 | CI 每次 push main / 标签   |
+| `deploy.sh` 端到端（假 systemd + 真二进制 + 真健康检查）          | CI `Release` 工作流冒烟任务 | CI 每次 push main / 标签   |
+| GitHub Release 发布（`v*` 标签 → tar.gz + 侧车可下载）            | 首次打 `v*` 标签时          | **未验证**（仓库尚无标签） |
 
 > 本地开发机是 Windows，无法运行 systemd 或 Caddy，所以上述"未验证"项只能靠 CI 或真实服务器确认。
-> `deploy.sh` 目前**只**通过语法/lint 检查，没有被真正执行过——这是已知缺口，建议后续加一个在 Linux runner 上
-> 用假 systemd/假健康端点跑一遍的集成测试。
+> `deploy.sh` 现在不再只靠语法检查：`Release` 工作流在 Linux runner 上用**假 systemd + 真二进制 + 真
+> PostgreSQL** 完整跑一遍（下载 → 校验 → 解包 → 切换软链接 → `systemctl restart` → 轮询 `/health`），
+> 见 `.github/workflows/release.yml` 的 `smoke` 任务。仍属"未验证"的是真实服务器上的证书签发、
+> 真实 systemd/cgroup 限额、以及发布标签这条路径（仓库还没有标签）。
 
 ---
 
 ## 14. 文件清单
 
-| 文件                                                                  | 作用                                                     |
-| --------------------------------------------------------------------- | -------------------------------------------------------- |
-| `deploy/systemd/jiuyue.service`                                       | 后端 unit：非特权用户、资源上限、加固、PG 就绪门禁       |
-| `deploy/systemd/drop-ins/postgresql@16-main.service.d/10-memory.conf` | PostgreSQL 内存上限与 OOM 保护                           |
-| `deploy/systemd/drop-ins/caddy.service.d/10-jiuyue-env.conf`          | Caddy 的环境文件与内存上限                               |
-| `deploy/Caddyfile`                                                    | 自动 HTTPS + `/api` 反向代理 + `/ws` 调优 + 静态 SPA     |
-| `deploy/deploy.sh`                                                    | 唯一发布入口：校验制品、切换、重启、健康检查、失败回滚   |
-| `deploy/provision.sh`                                                 | 一次性幂等初始化（包/用户/目录/swap/PG/Caddy/密钥/unit） |
-| `deploy/postgresql/jiuyue-tuning.conf`                                | PostgreSQL 16 调参 drop-in                               |
-| `deploy/env/jiuyue.env.example`                                       | 运行时变量模板（占位符，无真实密钥）                     |
-| `.github/workflows/deploy-validate.yml`                               | 每次推送校验上述全部制品                                 |
+| 文件                                                                  | 作用                                                           |
+| --------------------------------------------------------------------- | -------------------------------------------------------------- |
+| `deploy/systemd/jiuyue.service`                                       | 后端 unit：非特权用户、资源上限、加固、PG 就绪门禁             |
+| `deploy/systemd/drop-ins/postgresql@16-main.service.d/10-memory.conf` | PostgreSQL 内存上限与 OOM 保护                                 |
+| `deploy/systemd/drop-ins/caddy.service.d/10-jiuyue-env.conf`          | Caddy 的环境文件与内存上限                                     |
+| `deploy/Caddyfile`                                                    | 自动 HTTPS + `/api` 反向代理 + `/ws` 调优 + 静态 SPA           |
+| `deploy/deploy.sh`                                                    | 唯一发布入口：校验制品、切换、重启、健康检查、失败回滚         |
+| `deploy/provision.sh`                                                 | 一次性幂等初始化（包/用户/目录/swap/PG/Caddy/密钥/unit）       |
+| `deploy/postgresql/jiuyue-tuning.conf`                                | PostgreSQL 16 调参 drop-in                                     |
+| `deploy/env/jiuyue.env.example`                                       | 运行时变量模板（占位符，无真实密钥）                           |
+| `.github/workflows/deploy-validate.yml`                               | 每次推送校验上述全部制品                                       |
+| `.github/workflows/release.yml`                                       | 构建发布制品（tar.gz + `.sha256`）、冒烟真跑、标签时发 Release |

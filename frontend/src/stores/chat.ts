@@ -113,6 +113,11 @@ function upsert(list: ChatMessage[], message: ChatMessage): void {
  * subscribes to the chat events `realtime` forwards — so the only dependency
  * direction is `chat → realtime, auth`.
  *
+ * History is paged backwards on the Conversation's Sequence Number:
+ * `loadMessages` fetches the newest page, and `loadOlder` walks to the page
+ * before the oldest Message held. Every merge goes through {@link upsert}, so a
+ * Message at a page boundary is reconciled rather than duplicated.
+ *
  * Network calls go through `api/client` and the socket through `realtime`, so
  * tests substitute `fetch` and the global `WebSocket` — never a store function.
  */
@@ -122,8 +127,17 @@ export const useChatStore = defineStore("chat", () => {
   const messagesByConversation = ref<Record<string, ChatMessage[]>>({});
   const loadingConversations = ref(false);
   const loadingMessages = ref(false);
+  const loadingOlder = ref(false);
   const errorMessage = ref<string | null>(null);
   const notice = ref<string | null>(null);
+
+  /**
+   * The backwards cursor per Conversation: the `seq` to pass as `before` for the
+   * next older page, `null` once the beginning has been reached.
+   */
+  const nextBeforeByConversation = ref<Record<string, number | null>>({});
+  /** Whether a Conversation has history older than what is loaded. */
+  const hasMoreByConversation = ref<Record<string, boolean>>({});
 
   const activeConversation = computed<ConversationSummary | null>(
     () =>
@@ -137,6 +151,13 @@ export const useChatStore = defineStore("chat", () => {
     const id = activeConversationId.value;
     if (id === null) return [];
     return [...(messagesByConversation.value[id] ?? [])].sort(compareMessages);
+  });
+
+  /** Whether the active Conversation has older history to page back into. */
+  const hasMoreHistory = computed<boolean>(() => {
+    const id = activeConversationId.value;
+    if (id === null) return false;
+    return hasMoreByConversation.value[id] ?? false;
   });
 
   /** The bucket for a Conversation, created on first use. */
@@ -231,7 +252,13 @@ export const useChatStore = defineStore("chat", () => {
     }
   }
 
-  /** Fetch the recent history of a Conversation, keeping local pending bubbles. */
+  /**
+   * Fetch the newest page of a Conversation's history, keeping local pending
+   * bubbles and the pagination cursor in sync.
+   *
+   * A page is the most recent `DEFAULT_MESSAGE_PAGE_SIZE` Messages; the server
+   * hands back `next_before` / `has_more`, which is what {@link loadOlder} walks.
+   */
   async function loadMessages(conversationId: string): Promise<void> {
     const token = accessToken();
     if (token === null) return;
@@ -250,10 +277,59 @@ export const useChatStore = defineStore("chat", () => {
       for (const view of payload.messages) list.push(fromView(view, "sent"));
       // Local not-yet-acknowledged bubbles survive a history reload.
       for (const message of pending) list.push(message);
+
+      nextBeforeByConversation.value[conversationId] =
+        payload.next_before ?? null;
+      hasMoreByConversation.value[conversationId] = payload.has_more === true;
     } catch (cause) {
       applyError(cause);
     } finally {
       loadingMessages.value = false;
+    }
+  }
+
+  /**
+   * Load the page of history older than the oldest Message already held.
+   *
+   * The cursor is the Conversation's Sequence Number, so this is immune to the
+   * bug that makes `offset`-based paging lose or repeat rows while new Messages
+   * arrive: the boundary is anchored to a `seq`, not to a count that shifts.
+   * Messages are merged through {@link upsert}, so a Message that appears in both
+   * the loaded list and the older page is kept exactly once.
+   *
+   * Returns whether a page was actually requested.
+   */
+  async function loadOlder(): Promise<boolean> {
+    const conversationId = activeConversationId.value;
+    if (conversationId === null) return false;
+    if (loadingOlder.value) return false;
+    if (hasMoreByConversation.value[conversationId] !== true) return false;
+
+    const before = nextBeforeByConversation.value[conversationId];
+    if (before === null || before === undefined) return false;
+
+    const token = accessToken();
+    if (token === null) return false;
+
+    loadingOlder.value = true;
+    errorMessage.value = null;
+    try {
+      const payload = await apiGetAuthed<MessageList>(
+        `/conversations/${conversationId}/messages?before=${before}`,
+        token,
+      );
+      const list = bucket(conversationId);
+      for (const view of payload.messages) upsert(list, fromView(view, "sent"));
+
+      nextBeforeByConversation.value[conversationId] =
+        payload.next_before ?? null;
+      hasMoreByConversation.value[conversationId] = payload.has_more === true;
+      return true;
+    } catch (cause) {
+      applyError(cause);
+      return false;
+    } finally {
+      loadingOlder.value = false;
     }
   }
 
@@ -410,13 +486,16 @@ export const useChatStore = defineStore("chat", () => {
     activeConversationId,
     activeConversation,
     messages,
+    hasMoreHistory,
     loadingConversations,
     loadingMessages,
+    loadingOlder,
     errorMessage,
     notice,
     loadConversations,
     startDirect,
     openConversation,
+    loadOlder,
     sendMessage,
     retry,
     clearNotice,

@@ -325,6 +325,117 @@ describe("useChatStore", () => {
     expect(store.messages[0]?.state).toBe("sent");
   });
 
+  it("prepends an older page and keeps the boundary message exactly once", async () => {
+    const route = messagesRoute();
+    stubFetch({
+      "/api/conversations/direct": [() => jsonResponse(conversationPayload())],
+      [route]: [
+        () =>
+          jsonResponse({
+            messages: [
+              messagePayload({ id: "M8", client_msg_id: "k8", seq: 8 }),
+              messagePayload({ id: "M9", client_msg_id: "k9", seq: 9 }),
+              messagePayload({ id: "M10", client_msg_id: "k10", seq: 10 }),
+            ],
+            next_before: 8,
+            has_more: true,
+          }),
+      ],
+      [`${route}?before=8`]: [
+        () =>
+          jsonResponse({
+            // seq 8 deliberately overlaps the already-loaded page: the boundary
+            // must deduplicate rather than duplicate the bubble.
+            messages: [
+              messagePayload({ id: "M6", client_msg_id: "k6", seq: 6 }),
+              messagePayload({ id: "M7", client_msg_id: "k7", seq: 7 }),
+              messagePayload({ id: "M8", client_msg_id: "k8", seq: 8 }),
+            ],
+            next_before: 6,
+            has_more: true,
+          }),
+      ],
+    });
+
+    const store = useChatStore();
+    await store.startDirect("bob");
+
+    expect(store.messages.map((entry) => entry.seq)).toEqual([8, 9, 10]);
+    expect(store.hasMoreHistory).toBe(true);
+
+    const loaded = await store.loadOlder();
+
+    expect(loaded).toBe(true);
+    expect(store.messages.map((entry) => entry.seq)).toEqual([6, 7, 8, 9, 10]);
+    expect(store.messages).toHaveLength(5);
+    expect(store.hasMoreHistory).toBe(true);
+  });
+
+  it("stops paging once the beginning of the conversation is reached", async () => {
+    const route = messagesRoute();
+    const fetchMock = stubFetch({
+      "/api/conversations/direct": [() => jsonResponse(conversationPayload())],
+      [route]: [
+        () =>
+          jsonResponse({
+            messages: [
+              messagePayload({ id: "M1", client_msg_id: "k1", seq: 1 }),
+            ],
+            next_before: null,
+            has_more: false,
+          }),
+      ],
+    });
+
+    const store = useChatStore();
+    await store.startDirect("bob");
+
+    expect(store.hasMoreHistory).toBe(false);
+    expect(await store.loadOlder()).toBe(false);
+    // Only the create and the newest page were requested; no older fetch happened.
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps a pending optimistic bubble when an older page is prepended", async () => {
+    const route = messagesRoute();
+    stubFetch({
+      "/api/conversations/direct": [() => jsonResponse(conversationPayload())],
+      [route]: [
+        () =>
+          jsonResponse({
+            messages: [
+              messagePayload({ id: "M5", client_msg_id: "k5", seq: 5 }),
+            ],
+            next_before: 5,
+            has_more: true,
+          }),
+      ],
+      [`${route}?before=5`]: [
+        () =>
+          jsonResponse({
+            messages: [
+              messagePayload({ id: "M4", client_msg_id: "k4", seq: 4 }),
+            ],
+            next_before: 4,
+            has_more: true,
+          }),
+      ],
+    });
+
+    const store = useChatStore();
+    await store.startDirect("bob");
+
+    // No socket is open, so the send is marked failed — but its bubble stays.
+    expect(store.sendMessage("待发送")).toBe(false);
+    const pending = store.messages[1];
+    expect(pending?.seq).toBeNull();
+
+    await store.loadOlder();
+
+    expect(store.messages.map((entry) => entry.seq)).toEqual([4, 5, null]);
+    expect(store.messages[2]?.clientMsgId).toBe(pending?.clientMsgId);
+  });
+
   it("starts a direct conversation through the API and focuses it", async () => {
     const fetchMock = stubFetch({
       "/api/conversations/direct": [() => jsonResponse(conversationPayload())],

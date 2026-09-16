@@ -32,8 +32,9 @@ pub use auth::{
 };
 pub use chat::{
     ConversationCreated, ConversationKind, ConversationList, ConversationSummary,
-    CreateDirectConversationRequest, MAX_CLIENT_MSG_ID_BYTES, MAX_MESSAGE_BODY_CHARS, MessageAck,
-    MessageList, MessageRejected, MessageView, NewMessage, PeerSummary, SendMessage,
+    CreateDirectConversationRequest, DEFAULT_MESSAGE_PAGE_SIZE, MAX_CLIENT_MSG_ID_BYTES,
+    MAX_MESSAGE_BODY_CHARS, MAX_MESSAGE_PAGE_SIZE, MessageAck, MessageList, MessagePageQuery,
+    MessageRejected, MessageView, NewMessage, PeerSummary, SendMessage,
 };
 pub use envelope::{ClientEnvelope, PROTOCOL_VERSION, ServerEnvelope};
 pub use events::{ClientEvent, Ping, ServerEvent};

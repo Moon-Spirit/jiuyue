@@ -1,0 +1,342 @@
+# Release —— CI 构建并发布可部署的二进制制品（无容器，ADR-0010）
+#
+# 这个工作流接管 issue #44 的验收标准（原表述"构建推送镜像"，随 ADR-0010
+# 改为"构建并发布二进制制品"）。它产出的是 `deploy/deploy.sh` 唯一认识的
+# 制品：一个 tar.gz + 同名 `.sha256`，解包后是 `bin/jiuyue-server` + `dist/`。
+#
+# 触发：
+#   * push 到 main   —— 构建 + 冒烟（把发布链路在每次合并后都真跑一遍）
+#   * push v* 标签   —— 额外把 tar.gz / .sha256 传成 GitHub Release 资产
+#   * workflow_dispatch —— 手工构建（可选 version 输入）
+#
+# 服务器永不编译 Rust（2C2G 跑 LTO release 会 OOM，见 AGENTS.md）：构建只发生
+# 在 CI runner 上，服务器只做"下载制品 → 校验 → 切换 → 重启"。
+#
+# 不使用任何容器：PostgreSQL 直接 apt 装在 runner 上，`services: {}` 明确
+# 拒绝 service container，打包就是 tar，冒烟就是直接执行二进制。
+
+name: Release
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "构建用的版本号（默认 0.0.0-dev.<short-sha>；打标签时以标签为准）"
+        required: false
+        type: string
+
+# 默认最小权限；只有 publish 任务需要写权限，在任务上单独提权。
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  TARGET: x86_64-unknown-linux-gnu
+
+jobs:
+  build:
+    name: 构建制品（backend release + frontend dist）
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    services: {} # 不使用 service container（ADR-0010）
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      tag: ${{ steps.meta.outputs.tag }}
+      commit: ${{ steps.meta.outputs.commit }}
+      built_at: ${{ steps.meta.outputs.built_at }}
+      archive: ${{ steps.meta.outputs.archive }}
+      sha256: ${{ steps.package.outputs.sha256 }}
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: 计算版本 / 提交 / 构建时间
+        id: meta
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          commit="$(git rev-parse HEAD)"
+          short="$(git rev-parse --short HEAD)"
+          built_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          tag=""
+          version=""
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            # 打标签时，标签就是版本的唯一真源（制品名与 /health 都用它）。
+            tag="${GITHUB_REF#refs/tags/}"
+            version="${tag#v}"
+          else
+            version="${INPUT_VERSION:-0.0.0-dev.${short}}"
+          fi
+          # 版本号会进文件名与 URL，收敛到安全字符集。
+          version="$(printf '%s' "$version" | tr -c 'A-Za-z0-9._-' '_')"
+          archive="jiuyue-${version}-${TARGET}.tar.gz"
+          {
+            echo "version=${version}"
+            echo "tag=${tag}"
+            echo "commit=${commit}"
+            echo "built_at=${built_at}"
+            echo "archive=${archive}"
+          } >> "$GITHUB_OUTPUT"
+          echo "version=${version}"
+          echo "tag=${tag:-<none>}"
+          echo "commit=${commit}"
+          echo "archive=${archive}"
+
+      - name: 安装 Rust 工具链
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add "${TARGET}"
+          rustc --version
+          cargo --version
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: backend
+          # 与 CI 任务的 debug 缓存分开，避免互相挤占。
+          key: release
+
+      - name: 构建后端（release，x86_64-unknown-linux-gnu）
+        working-directory: backend
+        env:
+          # 编译进二进制：/health 于是 보고하는版本就是这次发布的版本。
+          JIUYUE_BUILD_VERSION: ${{ steps.meta.outputs.version }}
+        run: cargo build --release --locked --bin jiuyue-server --target "${TARGET}"
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+
+      - name: 构建前端（Vite 生产包）
+        working-directory: frontend
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build
+
+      - name: 打包制品 + 校验和
+        id: package
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          COMMIT: ${{ steps.meta.outputs.commit }}
+          BUILT_AT: ${{ steps.meta.outputs.built_at }}
+          ARCHIVE: ${{ steps.meta.outputs.archive }}
+        run: |
+          set -euo pipefail
+          pkg="$(mktemp -d)/pkg"
+          mkdir -p "${pkg}/bin" "${pkg}/dist"
+          install -m 0755 "backend/target/${TARGET}/release/jiuyue-server" "${pkg}/bin/jiuyue-server"
+          cp -a frontend/dist/. "${pkg}/dist/"
+          # 可追溯性随制品走：版本 / 提交 / 构建时间 / 目标三元组。deploy.sh
+          # 只要求 bin/ 与 dist/，额外的 VERSION 文件被明确允许（见脚本头部注释）。
+          cat > "${pkg}/VERSION" <<EOF
+          version=${VERSION}
+          tag=${TAG}
+          commit=${COMMIT}
+          built_at=${BUILT_AT}
+          target=${TARGET}
+          EOF
+          tar -C "${pkg}" -czf "${ARCHIVE}" bin dist VERSION
+          sha256sum "${ARCHIVE}" > "${ARCHIVE}.sha256"
+          echo "sha256=$(awk 'NR==1{print $1}' "${ARCHIVE}.sha256")" >> "$GITHUB_OUTPUT"
+          echo "--- artifact contents ---"
+          tar -tzf "${ARCHIVE}"
+          echo "--- checksum sidecar ---"
+          cat "${ARCHIVE}.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-archive
+          path: |
+            ${{ steps.meta.outputs.archive }}
+            ${{ steps.meta.outputs.archive }}.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+  smoke:
+    name: 冒烟（校验 / 解包 / 真跑 /health / deploy.sh）
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    services: {} # 不使用 service container（ADR-0010）
+    env:
+      VERSION: ${{ needs.build.outputs.version }}
+      ARCHIVE: ${{ needs.build.outputs.archive }}
+      # 与 CI 相同的原生 PostgreSQL 约定，不另造一套。
+      DATABASE_URL: postgres://jiuyue:jiuyue_dev_password@localhost:5432/jiuyue_release
+      JWT_SECRET: ci-only-release-secret-not-used-anywhere-0123456789
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: 安装 PostgreSQL 16（原生，非容器）
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-16 postgresql-client-16
+          sudo systemctl start postgresql
+          sudo -u postgres psql -c "CREATE ROLE jiuyue LOGIN PASSWORD 'jiuyue_dev_password' SUPERUSER;"
+          sudo -u postgres psql -c "CREATE DATABASE jiuyue_release OWNER jiuyue;"
+          pg_isready -h localhost -p 5432
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-archive
+          path: artifact
+
+      - name: 校验 sha256（deploy.sh 侧车格式）
+        working-directory: artifact
+        run: |
+          set -euo pipefail
+          ls -l
+          sha256sum -c ./*.tar.gz.sha256
+          echo "sha256 OK"
+
+      - name: 干净目录解包并核对 deploy.sh 的布局契约
+        run: |
+          set -euo pipefail
+          mkdir -p unpacked
+          tar -xzf "artifact/${ARCHIVE}" -C unpacked
+          # 与 deploy.sh 的 extract_and_validate() 完全相同的两条断言。
+          test -f unpacked/bin/jiuyue-server || { echo "::error::malformed artifact: bin/jiuyue-server is missing"; exit 1; }
+          test -f unpacked/dist/index.html || { echo "::error::malformed artifact: dist/index.html is missing"; exit 1; }
+          test -s unpacked/VERSION
+          echo "--- artifact layout ---"
+          find unpacked -maxdepth 2 | sort
+          echo "--- VERSION (traceability) ---"
+          cat unpacked/VERSION
+
+      - name: 真跑制品：启动二进制并访问 /health（真实 PostgreSQL）
+        env:
+          PORT: "8081"
+          RUST_LOG: info
+        run: |
+          set -euo pipefail
+          # 像 systemd 那样从解包目录直接执行二进制；迁移在启动时自动施加。
+          ./unpacked/bin/jiuyue-server > server-8081.log 2>&1 &
+          pid=$!
+          healthy=0
+          for _ in $(seq 1 60); do
+            if curl -fsS --max-time 3 http://127.0.0.1:8081/health >/dev/null 2>&1; then
+              healthy=1
+              break
+            fi
+            if ! kill -0 "$pid" 2>/dev/null; then
+              echo "::error::server exited before becoming healthy"
+              cat server-8081.log
+              exit 1
+            fi
+            sleep 1
+          done
+          if [ "$healthy" -ne 1 ]; then
+            echo "::error::/health never became reachable"
+            cat server-8081.log
+            exit 1
+          fi
+          body="$(curl -fsS --max-time 3 http://127.0.0.1:8081/health)"
+          echo "/health -> ${body}"
+          printf '%s' "$body" | grep -q '"status":"ok"' \
+            || { echo "::error::/health did not report status ok"; exit 1; }
+          # 制品必须报告它被构建时的版本，而不是 0.1.0。
+          printf '%s' "$body" | grep -q "\"version\":\"${VERSION}\"" \
+            || { echo "::error::/health version != ${VERSION}"; exit 1; }
+          kill "$pid" 2>/dev/null || true
+          wait "$pid" 2>/dev/null || true
+          echo "artifact runs: status ok, version ${VERSION}"
+
+      - name: 端到端：用 deploy.sh 部署该制品（假 systemd，真二进制）
+        run: |
+          set -euo pipefail
+          root="${RUNNER_TEMP}/deploy-e2e"
+          mkdir -p "${root}/app" "${root}/data" "${root}/etc" "${root}/run" "${root}/fakebin"
+          cat > "${root}/etc/jiuyue.env" <<EOF
+          DATABASE_URL=${DATABASE_URL}
+          JWT_SECRET=${JWT_SECRET}
+          PORT=8080
+          RUST_LOG=info
+          EOF
+          sudo groupadd -f jiuyue
+          # deploy.sh 会调用 `systemctl restart jiuyue`；CI 里没有真实 unit，
+          # 这个 shim 代替 systemd 启动刚装好的 release 里的真二进制。
+          cat > "${root}/fakebin/systemctl" <<'SHIM'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          if [ "${1:-}" = restart ] && [ "${2:-}" = jiuyue ]; then
+            set -a
+            # shellcheck disable=SC1090
+            . "${ENV_FILE}"
+            set +a
+            nohup "${APP_ROOT}/current/bin/jiuyue-server" >>"${SMOKE_LOG}" 2>&1 &
+            echo $! >"${SMOKE_PID}"
+          fi
+          exit 0
+          SHIM
+          chmod 0755 "${root}/fakebin/systemctl"
+          # sudo 会重置 PATH，所以显式用 env 把 shim 放到 PATH 最前面，并把
+          # deploy.sh 支持的环境变量覆盖全部指向临时目录（不碰真实 /opt）。
+          sudo env \
+            "PATH=${root}/fakebin:${PATH}" \
+            APP_ROOT="${root}/app" \
+            RELEASES_DIR="${root}/app/releases" \
+            CURRENT_LINK="${root}/app/current" \
+            DATA_DIR="${root}/data" \
+            ENV_FILE="${root}/etc/jiuyue.env" \
+            SERVICE=jiuyue \
+            LOCK_FILE="${root}/run/deploy.lock" \
+            HEALTH_URL=http://127.0.0.1:8080/health \
+            HEALTH_TIMEOUT=60 \
+            SMOKE_LOG="${root}/server.log" \
+            SMOKE_PID="${root}/server.pid" \
+            bash deploy/deploy.sh --artifact "${PWD}/artifact/${ARCHIVE}" --version "${VERSION}"
+          test -L "${root}/app/current"
+          test -f "${root}/app/current/dist/index.html"
+          test -x "${root}/app/current/bin/jiuyue-server"
+          echo "deploy.sh installed release: $(readlink -f "${root}/app/current")"
+          # 服务是 root（经 sudo）起的，用 sudo 收尾，别留给 runner 退出时擦除。
+          sudo kill "$(cat "${root}/server.pid")" 2>/dev/null || true
+
+  publish:
+    name: 发布 GitHub Release（仅 v* 标签）
+    needs: [build, smoke]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write # 只有这个任务需要写权限
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-archive
+          path: artifact
+
+      - name: 创建 Release 并上传制品
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.build.outputs.tag }}
+          VERSION: ${{ needs.build.outputs.version }}
+          COMMIT: ${{ needs.build.outputs.commit }}
+          BUILT_AT: ${{ needs.build.outputs.built_at }}
+          SHA256: ${{ needs.build.outputs.sha256 }}
+          ARCHIVE: ${{ needs.build.outputs.archive }}
+        run: |
+          set -euo pipefail
+          notes="$(printf 'Version: `%s`\nCommit: `%s`\nBuilt at: %s (UTC)\nTarget: `%s`\nSHA-256: `%s`\n\nDeploy with:\n\n    sudo bash deploy/deploy.sh --artifact https://github.com/%s/releases/download/%s/%s\n' \
+            "$VERSION" "$COMMIT" "$BUILT_AT" "${TARGET}" "$SHA256" \
+            "${GITHUB_REPOSITORY}" "$TAG" "$ARCHIVE")"
+          cd artifact
+          gh release create "${TAG}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "jiuyue ${TAG}" \
+            --notes "${notes}" \
+            --verify-tag \
+            ./*.tar.gz ./*.tar.gz.sha256
+          echo "published release ${TAG}"

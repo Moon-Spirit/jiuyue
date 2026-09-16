@@ -21,8 +21,10 @@ const {
   activeConversation,
   activeConversationId,
   messages,
+  hasMoreHistory,
   loadingConversations,
   loadingMessages,
+  loadingOlder,
   errorMessage,
   notice,
 } = storeToRefs(chat);
@@ -181,7 +183,10 @@ async function signOut(): Promise<void> {
             :messages="messages"
             :current-user-id="currentUserId"
             :loading="loadingMessages"
+            :has-more="hasMoreHistory"
+            :loading-older="loadingOlder"
             @retry="chat.retry($event)"
+            @load-older="chat.loadOlder()"
           />
         </div>
 

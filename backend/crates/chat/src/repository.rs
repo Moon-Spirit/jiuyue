@@ -80,6 +80,32 @@ const MESSAGE_COLUMNS: &str = "\
     id::text AS id, conversation_id::text AS conversation_id, seq, \
     sender_id::text AS sender_id, client_msg_id, body, created_at";
 
+/// One page of history, walking backwards from an exclusive `seq` cursor.
+///
+/// The inner `ORDER BY seq DESC LIMIT` is served by the `messages_conversation_seq_key`
+/// index (its leading columns are exactly `(conversation_id, seq)`), so the range
+/// scan never materialises the Conversation. The outer `ORDER BY seq ASC` sorts
+/// only the page's rows — `limit + 1` of them — never the whole Conversation.
+const SELECT_MESSAGE_PAGE_BEFORE: &str = "\
+    SELECT {columns} FROM ( \
+        SELECT {columns} FROM messages \
+        WHERE conversation_id = $1 AND seq < $2 \
+        ORDER BY seq DESC LIMIT $3 \
+    ) AS page ORDER BY seq ASC";
+
+/// The newest page, for a request that carries no cursor.
+const SELECT_MESSAGE_PAGE_LATEST: &str = "\
+    SELECT {columns} FROM ( \
+        SELECT {columns} FROM messages \
+        WHERE conversation_id = $1 \
+        ORDER BY seq DESC LIMIT $2 \
+    ) AS page ORDER BY seq ASC";
+
+/// Fill a page query's column list in, so the projection is stated once.
+fn page_query(template: &str) -> String {
+    template.replace("{columns}", MESSAGE_COLUMNS)
+}
+
 const SELECT_MESSAGE_BY_CLIENT_ID: &str = "\
     SELECT id::text AS id, conversation_id::text AS conversation_id, seq, \
            sender_id::text AS sender_id, client_msg_id, body, created_at \
@@ -341,26 +367,52 @@ impl ChatRepository {
         }
     }
 
-    /// The most recent `limit` Messages of a Conversation, oldest first.
-    pub async fn list_recent_messages(
+    /// One page of a Conversation's history, oldest first.
+    ///
+    /// `before` is an exclusive Sequence Number cursor (`None` reads the newest
+    /// page). Returns `(rows, has_more)`: the query reads `limit + 1` rows so that
+    /// the presence of an extra, older row is the answer to "is there more?" —
+    /// which is then dropped, leaving exactly one stable page.
+    ///
+    /// The page is selected and ordered by the `(conversation_id, seq)` index, so
+    /// it neither scans nor sorts the Conversation.
+    pub async fn list_message_page(
         &self,
         conversation_id: &str,
+        before: Option<i64>,
         limit: i64,
-    ) -> Result<Vec<MessageRow>, ChatError> {
-        let query = format!(
-            "SELECT {MESSAGE_COLUMNS} FROM ( \
-                 SELECT {MESSAGE_COLUMNS} FROM messages \
-                 WHERE conversation_id = $1 ORDER BY seq DESC LIMIT $2 \
-             ) AS recent ORDER BY seq ASC"
-        );
+    ) -> Result<(Vec<MessageRow>, bool), ChatError> {
+        let probe = limit.saturating_add(1);
 
-        sqlx::query(&query)
-            .bind(conversation_id)
-            .bind(limit)
-            .fetch_all(&self.pool)
-            .await
-            .map(|rows| rows.iter().map(message_from_row).collect())
-            .map_err(ChatError::Database)
+        let rows = match before {
+            Some(cursor) => {
+                sqlx::query(&page_query(SELECT_MESSAGE_PAGE_BEFORE))
+                    .bind(conversation_id)
+                    .bind(cursor)
+                    .bind(probe)
+                    .fetch_all(&self.pool)
+                    .await
+            }
+            None => {
+                sqlx::query(&page_query(SELECT_MESSAGE_PAGE_LATEST))
+                    .bind(conversation_id)
+                    .bind(probe)
+                    .fetch_all(&self.pool)
+                    .await
+            }
+        }
+        .map_err(ChatError::Database)?;
+
+        let mut messages: Vec<MessageRow> = rows.iter().map(message_from_row).collect();
+        // The probe row is the oldest of the batch; it exists only to answer
+        // "has_more". Nothing about the cursor changes on a later page, which is
+        // the whole point of cursor pagination.
+        let has_more = messages.len() as i64 > limit;
+        if has_more {
+            messages.remove(0);
+        }
+
+        Ok((messages, has_more))
     }
 }
 

@@ -14,18 +14,13 @@ use sqlx::PgPool;
 use sqlx::types::time::OffsetDateTime;
 
 use jiuyue_contract::{
-    ConversationKind, ConversationSummary, FieldError, FieldErrorCode, MAX_CLIENT_MSG_ID_BYTES,
-    MAX_MESSAGE_BODY_CHARS, MessageView, PeerSummary, SendMessage,
+    ConversationKind, ConversationSummary, DEFAULT_MESSAGE_PAGE_SIZE, FieldError, FieldErrorCode,
+    MAX_CLIENT_MSG_ID_BYTES, MAX_MESSAGE_BODY_CHARS, MAX_MESSAGE_PAGE_SIZE, MessageList,
+    MessagePageQuery, MessageView, PeerSummary, SendMessage,
 };
 
 use crate::error::ChatError;
 use crate::repository::{ChatRepository, ConversationRow, MessageRow, NewMessageRow, PeerRow};
-
-/// How many Messages a fresh conversation open returns.
-///
-/// A bounded window, not a page: ticket #10 replaces it with cursor pagination,
-/// and this constant is the seam it will widen.
-pub const RECENT_MESSAGE_LIMIT: i64 = 50;
 
 /// The notification one Participant should receive when a Conversation is created.
 ///
@@ -186,7 +181,12 @@ impl ChatService {
             .collect())
     }
 
-    /// The most recent Messages of a Conversation, oldest first.
+    /// One page of a Conversation's history, oldest first.
+    ///
+    /// The page is a cursor walk on the Sequence Number (ADR-0003): no cursor
+    /// reads the newest page, and the response's `next_before` reads the page
+    /// before it. `limit` is advisory — it is clamped by [`page_size`] so a client
+    /// cannot pull the whole Conversation in one request.
     ///
     /// Reading history requires being a Participant: a non-member is refused with
     /// [`ChatError::NotAParticipant`], and a Conversation that does not exist with
@@ -195,20 +195,34 @@ impl ChatService {
         &self,
         caller_id: &str,
         conversation_id: &str,
-    ) -> Result<Vec<MessageView>, ChatError> {
+        page: MessagePageQuery,
+    ) -> Result<MessageList, ChatError> {
         if !is_ulid(conversation_id) {
             return Err(ChatError::ConversationNotFound);
         }
 
         require_participant(&self.repository, conversation_id, caller_id).await?;
 
-        Ok(self
+        let limit = page_size(page.limit);
+        let (rows, has_more) = self
             .repository
-            .list_recent_messages(conversation_id, RECENT_MESSAGE_LIMIT)
-            .await?
-            .into_iter()
-            .map(message_view)
-            .collect())
+            .list_message_page(conversation_id, page.before, limit)
+            .await?;
+
+        // The cursor for the next older page is the Sequence Number of this
+        // page's oldest Message. It is only meaningful when a probe row proved an
+        // older page exists, so `has_more` gates it.
+        let next_before = if has_more {
+            rows.first().map(|row| row.seq)
+        } else {
+            None
+        };
+
+        Ok(MessageList {
+            messages: rows.into_iter().map(message_view).collect(),
+            next_before,
+            has_more,
+        })
     }
 
     /// Store a text Message, or return the one this idempotency key already wrote.
@@ -264,6 +278,18 @@ async fn require_participant(
         Some(true) => Ok(()),
         Some(false) => Err(ChatError::NotAParticipant),
     }
+}
+
+/// The effective page size for a history request.
+///
+/// A missing `limit` takes the default and an out-of-range one is clamped to
+/// `[1, MAX_MESSAGE_PAGE_SIZE]` — deliberately not rejected, so an over-eager
+/// client still gets a useful page instead of an error, but never more rows than
+/// the box can afford to materialise.
+fn page_size(requested: Option<i64>) -> i64 {
+    requested
+        .unwrap_or(DEFAULT_MESSAGE_PAGE_SIZE)
+        .clamp(1, MAX_MESSAGE_PAGE_SIZE)
 }
 
 /// Check the fields of a send before any database work.
@@ -399,8 +425,8 @@ fn unix_millis(value: OffsetDateTime) -> i64 {
 mod tests {
     use sqlx::types::time::OffsetDateTime;
 
-    use super::{canonical_direct_key, is_ulid, kind_from, unix_millis};
-    use jiuyue_contract::ConversationKind;
+    use super::{canonical_direct_key, is_ulid, kind_from, page_size, unix_millis};
+    use jiuyue_contract::{ConversationKind, DEFAULT_MESSAGE_PAGE_SIZE, MAX_MESSAGE_PAGE_SIZE};
 
     #[test]
     fn the_pair_key_does_not_depend_on_argument_order() {
@@ -430,6 +456,20 @@ mod tests {
     fn the_stored_kind_maps_onto_the_wire_enum() {
         assert_eq!(kind_from("direct"), ConversationKind::Direct);
         assert_eq!(kind_from("group"), ConversationKind::Group);
+    }
+
+    #[test]
+    fn a_page_size_is_defaulted_when_missing_and_clamped_when_absurd() {
+        assert_eq!(page_size(None), DEFAULT_MESSAGE_PAGE_SIZE);
+        assert_eq!(page_size(Some(10)), 10);
+        assert_eq!(page_size(Some(0)), 1, "zero clamps up to one row");
+        assert_eq!(page_size(Some(-25)), 1, "a negative limit clamps up to one");
+        assert_eq!(
+            page_size(Some(1_000_000)),
+            MAX_MESSAGE_PAGE_SIZE,
+            "an absurd limit is clamped, never honoured"
+        );
+        assert_eq!(page_size(Some(i64::MAX)), MAX_MESSAGE_PAGE_SIZE);
     }
 
     #[test]

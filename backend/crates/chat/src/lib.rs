@@ -17,10 +17,11 @@
 //! # What this crate does not do
 //!
 //! It does not know about HTTP or WebSockets: it returns data and lets
-//! `jiuyue-server` and `jiuyue-realtime` deliver it. It does not paginate history
-//! (ticket #10), repair reconnects (ticket #11), or model Groups, attachments,
-//! reactions or read state (later tickets). The schema and the service are shaped
-//! so those can be added without replacing this module.
+//! `jiuyue-server` and `jiuyue-realtime` deliver it. It paginates history
+//! backwards on the Sequence Number cursor (ticket #11), but does not repair
+//! reconnects (a separate ticket) or model Groups, attachments, reactions or read
+//! state (later tickets). The schema and the service are shaped so those can be
+//! added without replacing this module.
 //!
 //! # Retry safety
 //!
@@ -37,6 +38,4 @@ mod service;
 
 pub use error::ChatError;
 pub use repository::ChatRepository;
-pub use service::{
-    ChatService, ConversationNotice, OpenedConversation, RECENT_MESSAGE_LIMIT, SentMessage,
-};
+pub use service::{ChatService, ConversationNotice, OpenedConversation, SentMessage};

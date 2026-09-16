@@ -41,7 +41,10 @@ async fn health_reports_ok_with_expected_body() {
     let payload: Value = serde_json::from_slice(&body).expect("body must be JSON");
 
     assert_eq!(payload["status"], "ok");
-    assert_eq!(payload["version"], env!("CARGO_PKG_VERSION"));
+    // Same source of truth the handler uses. The release pipeline can override it
+    // at compile time (`JIUYUE_BUILD_VERSION`), so the test must not hard-code the
+    // workspace crate version.
+    assert_eq!(payload["version"], jiuyue_server::routes::VERSION);
 
     let uptime = payload["uptime_s"]
         .as_u64()

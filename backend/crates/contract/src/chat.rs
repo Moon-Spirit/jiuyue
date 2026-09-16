@@ -33,6 +33,16 @@ pub const MAX_MESSAGE_BODY_CHARS: usize = 4000;
 /// Hard cap on a Client Message ID, in bytes.
 pub const MAX_CLIENT_MSG_ID_BYTES: usize = 128;
 
+/// Default number of Messages in a history page when the request omits `limit`.
+pub const DEFAULT_MESSAGE_PAGE_SIZE: i64 = 50;
+
+/// Hard cap on a history page.
+///
+/// A client must not be able to ask for a whole Conversation in one request: an
+/// unbounded page is a memory bomb on the 2 vCPU / 2 GB production box. A
+/// `limit` above this is clamped, never honoured.
+pub const MAX_MESSAGE_PAGE_SIZE: i64 = 100;
+
 /// Kind of Conversation (CONTEXT.md: Conversation).
 ///
 /// Serialised lowercase because the value is stored verbatim in
@@ -122,15 +132,51 @@ pub struct ConversationList {
     pub conversations: Vec<ConversationSummary>,
 }
 
-/// `GET /conversations/{id}/messages` response.
+/// Query parameters of `GET /conversations/{id}/messages`.
 ///
-/// A bounded window (the most recent messages), not a page: cursor pagination is
-/// ticket #10 and deliberately absent here.
+/// The cursor is the Conversation's Sequence Number, the ordering authority
+/// (ADR-0003). A page is "the `limit` Messages with the highest `seq` strictly
+/// below `before`", walked **backwards**: omit `before` for the newest page, then
+/// pass the response's `next_before` to load the page before it.
+///
+/// Cursor-on-`seq` is what makes page boundaries correct under concurrent sends.
+/// `LIMIT/OFFSET` shifts by one every time an older row appears, so a client
+/// paging through it loses or repeats a Message; a `seq` cursor cannot, because
+/// it is anchored to a value that does not move.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct MessagePageQuery {
+    /// Exclusive cursor: return Messages with `seq < before`.
+    ///
+    /// Omit to read the most recent page. A `before` outside the Conversation's
+    /// range (below `1`, or above its newest Message) is not an error: it yields
+    /// an empty page or the most recent one.
+    #[ts(type = "number | null")]
+    pub before: Option<i64>,
+    /// Page size, clamped to `[1, MAX_MESSAGE_PAGE_SIZE]`; defaults to
+    /// `DEFAULT_MESSAGE_PAGE_SIZE` when omitted.
+    #[ts(type = "number | null")]
+    pub limit: Option<i64>,
+}
+
+/// `GET /conversations/{id}/messages` response: one page of history.
+///
+/// Ordering is explicit and deterministic: `messages` is always ascending by
+/// `seq` (oldest first), whatever page was requested. Concatenating page N+1
+/// (fetched with `before = next_before`) in front of page N reconstructs the
+/// whole history with no duplicates and no gaps.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct MessageList {
-    /// The returned Messages, oldest first so the list renders top-to-bottom.
+    /// The page's Messages, oldest first (ascending `seq`), so the list renders
+    /// top-to-bottom. Empty when `before` points before the first Message.
     pub messages: Vec<MessageView>,
+    /// The cursor for the next older page: pass this as `before` to fetch it.
+    /// `null` when there is nothing older.
+    #[ts(type = "number | null")]
+    pub next_before: Option<i64>,
+    /// Whether older Messages exist beyond this page.
+    pub has_more: bool,
 }
 
 /// `ClientEvent::SendMessage` payload.

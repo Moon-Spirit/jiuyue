@@ -6,11 +6,13 @@
 //! test, and none of them exist in a mock.
 //!
 //! One test binary split into modules: `support` holds the harness, `conversations`
-//! the Conversation lifecycle, `messaging` the send path, and `realtime` the socket
-//! behaviour. Each test creates its own schema, so the suite runs in parallel and
-//! repeatedly without cleanup.
+//! the Conversation lifecycle, `messaging` the send path, `pagination` the
+//! Sequence-Number cursor walk, and `realtime` the socket behaviour. Each test
+//! creates its own schema, so the suite runs in parallel and repeatedly without
+//! cleanup.
 
 mod conversations;
 mod messaging;
+mod pagination;
 mod realtime;
 mod support;

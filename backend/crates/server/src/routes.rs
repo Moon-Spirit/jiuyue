@@ -20,6 +20,17 @@ pub mod auth;
 pub mod chat;
 pub mod realtime;
 
+/// Version string compiled into the binary.
+///
+/// The release pipeline sets `JIUYUE_BUILD_VERSION` to the git tag it is
+/// building (without the leading `v`) so `GET /health` can be traced back to the
+/// release that was deployed. A local `cargo build` does not set it and falls
+/// back to the workspace crate version.
+pub const VERSION: &str = match option_env!("JIUYUE_BUILD_VERSION") {
+    Some(version) => version,
+    None => env!("CARGO_PKG_VERSION"),
+};
+
 /// Payload returned by `GET /health`.
 ///
 /// The shape is part of the contract, so the type stays `serde`-serialisable and
@@ -28,7 +39,7 @@ pub mod realtime;
 pub struct Health {
     /// Always `"ok"` while the process is serving traffic.
     pub status: &'static str,
-    /// Crate version compiled into the binary.
+    /// Version the binary was built with — see [`VERSION`].
     pub version: &'static str,
     /// Whole seconds since the process started.
     pub uptime_s: u64,
@@ -56,7 +67,7 @@ pub fn app(state: AppState) -> Router {
 async fn health(State(state): State<AppState>) -> Json<Health> {
     Json(Health {
         status: "ok",
-        version: env!("CARGO_PKG_VERSION"),
+        version: VERSION,
         uptime_s: state.uptime().as_secs(),
     })
 }
@@ -78,4 +89,20 @@ async fn log_request(request: Request, next: Next) -> Response {
     );
 
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::VERSION;
+
+    /// The release pipeline compiles with `JIUYUE_BUILD_VERSION` set to the git
+    /// tag; a local/dev build compiles without it. Either way `/health` must
+    /// report what was compiled in, never a blank string.
+    #[test]
+    fn version_follows_the_build_override() {
+        match option_env!("JIUYUE_BUILD_VERSION") {
+            Some(build) => assert_eq!(VERSION, build),
+            None => assert_eq!(VERSION, env!("CARGO_PKG_VERSION")),
+        }
+    }
 }
