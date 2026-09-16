@@ -29,6 +29,9 @@ pub struct Health {
 pub fn app(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
+        // Realtime lives in its own crate; the server only wires the route. The
+        // upgrade handler is stateless, so it takes no state out of this crate.
+        .route("/ws", get(jiuyue_realtime::ws_handler))
         .layer(middleware::from_fn(log_request))
         .with_state(state)
 }

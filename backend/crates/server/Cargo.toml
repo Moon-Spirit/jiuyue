@@ -21,6 +21,7 @@ path = "src/main.rs"
 [dependencies]
 axum.workspace = true
 dotenvy.workspace = true
+jiuyue-realtime = { path = "../realtime" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -28,7 +29,13 @@ tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
-# Only exercised by the integration tests (`tower::ServiceExt::oneshot`), so it
-# lives here rather than in the shipped dependency set.
+# Only exercised by the integration tests, so these live here rather than in the
+# shipped dependency set. `tower` drives the in-process router; the WebSocket
+# tests bind a real socket and connect a real client. `jiuyue-contract` is
+# already a transitive dependency of the server; it is direct only so the tests
+# can assert the envelope shape.
 [dev-dependencies]
+futures-util = { version = "0.3", features = ["sink"] }
+jiuyue-contract = { path = "../contract" }
+tokio-tungstenite = "0.29"
 tower.workspace = true

@@ -1,13 +1,50 @@
 <script setup lang="ts">
 import { storeToRefs } from "pinia";
-import { onMounted } from "vue";
+import { computed, onMounted, onUnmounted } from "vue";
+import type { SocketStatus } from "../api/ws";
 import { useHealthStore } from "../stores/health";
+import { useRealtimeStore } from "../stores/realtime";
 
 const health = useHealthStore();
 const { status, version, loading, error } = storeToRefs(health);
 
+const realtime = useRealtimeStore();
+const { status: socketStatus, sequence, serverTimeMs } = storeToRefs(realtime);
+
+const statusLabels: Record<SocketStatus, string> = {
+  idle: "未连接",
+  connecting: "连接中…",
+  open: "已连接",
+  reconnecting: "重连中…",
+  closed: "已断开",
+};
+
+const statusTones: Record<SocketStatus, string> = {
+  idle: "text-zinc-500 dark:text-zinc-400",
+  connecting: "text-amber-600 dark:text-amber-400",
+  open: "text-emerald-600 dark:text-emerald-400",
+  reconnecting: "text-amber-600 dark:text-amber-400",
+  closed: "text-red-600 dark:text-red-400",
+};
+
+const socketLabel = computed(() => statusLabels[socketStatus.value]);
+const socketTone = computed(() => statusTones[socketStatus.value]);
+
+const lastPingLabel = computed(() =>
+  serverTimeMs.value === null
+    ? "—"
+    : new Date(serverTimeMs.value).toLocaleTimeString("zh-CN", {
+        hour12: false,
+      }),
+);
+
 onMounted(() => {
   void health.fetchHealth();
+  realtime.connect();
+});
+
+onUnmounted(() => {
+  realtime.disconnect();
 });
 </script>
 
@@ -65,6 +102,36 @@ onMounted(() => {
       >
         重新检测
       </button>
+
+      <div class="mt-8 border-t border-zinc-200 pt-6 dark:border-zinc-800">
+        <h2 class="text-sm font-semibold tracking-tight">
+          实时通道（WebSocket /ws）
+        </h2>
+        <p class="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
+          连接后服务端推送的第一个事件即为 Ping 心跳。
+        </p>
+
+        <dl class="mt-4 space-y-3 text-sm" data-test="realtime-panel">
+          <div class="flex items-baseline justify-between gap-4">
+            <dt class="text-zinc-500 dark:text-zinc-400">连接状态</dt>
+            <dd class="font-medium" :class="socketTone">{{ socketLabel }}</dd>
+          </div>
+          <div class="flex items-baseline justify-between gap-4">
+            <dt class="text-zinc-500 dark:text-zinc-400">
+              最近 Ping（服务端时间）
+            </dt>
+            <dd class="font-mono" data-test="last-ping">
+              {{ lastPingLabel }}
+            </dd>
+          </div>
+          <div class="flex items-baseline justify-between gap-4">
+            <dt class="text-zinc-500 dark:text-zinc-400">连接序列号</dt>
+            <dd class="font-mono" data-test="last-sequence">
+              {{ sequence ?? "—" }}
+            </dd>
+          </div>
+        </dl>
+      </div>
     </section>
   </main>
 </template>

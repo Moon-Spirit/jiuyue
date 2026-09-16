@@ -1,10 +1,11 @@
 # jiuyue backend — Cargo workspace root.
 #
-# The workspace is intentionally thin: one member crate today (`jiuyue-server`),
-# with room for further crates (db, ws, media) as later tickets land.
+# The workspace is thin: each domain gets its own crate (`jiuyue-server`,
+# `jiuyue-store`, `jiuyue-contract`, ...) so modules stay independently
+# replaceable. The glob lets a new crate be added without editing this file.
 [workspace]
 resolver = "3"
-members = ["crates/server"]
+members = ["crates/*"]
 
 [workspace.package]
 version = "0.1.0"

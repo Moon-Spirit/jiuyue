@@ -1,0 +1,35 @@
+[package]
+name = "jiuyue-store"
+description = "jiuyue persistence layer: PostgreSQL pool, embedded migrations and repositories"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+name = "jiuyue_store"
+path = "src/lib.rs"
+
+[dependencies]
+thiserror.workspace = true
+
+# `default-features = false` drops `any` / `json` so the dependency surface stays
+# exactly what the store needs. `macros` is required by `sqlx::migrate!`, which
+# embeds SQL files at compile time and never needs a database to be reachable
+# (unlike the compile-time checked `query!` macros, which this crate does not use).
+# `time` is the timestamp type shared with the schema; `tls-rustls` avoids a
+# native-tls/OpenSSL system dependency on the 2C2G production box.
+sqlx = { version = "0.8", default-features = false, features = [
+    "postgres",
+    "migrate",
+    "macros",
+    "runtime-tokio",
+    "tls-rustls",
+    "time",
+] }
+
+[dev-dependencies]
+# Integration tests drive real PostgreSQL through `#[tokio::test]`.
+tokio.workspace = true

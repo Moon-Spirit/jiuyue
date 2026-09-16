@@ -17,6 +17,14 @@ export default defineConfig({
         changeOrigin: true,
         rewrite: (path) => path.replace(/^\/api/, ""),
       },
+      // The realtime channel is same-origin too: `/ws` is upgraded and
+      // forwarded to the backend untouched, so the client never needs a
+      // separate host or port.
+      "/ws": {
+        target: "ws://localhost:8080",
+        ws: true,
+        changeOrigin: true,
+      },
     },
   },
   test: {

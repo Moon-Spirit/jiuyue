@@ -1,0 +1,20 @@
+[package]
+name = "jiuyue-realtime"
+description = "jiuyue WebSocket realtime gateway: upgrade, framing limits, connection sequence"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+# `ws` is not an axum default feature; enable it here rather than widening the
+# workspace default set for every other crate.
+axum = { workspace = true, features = ["ws"] }
+futures-util = { version = "0.3", features = ["sink"] }
+jiuyue-contract = { path = "../contract" }
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true

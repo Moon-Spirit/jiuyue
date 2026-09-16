@@ -1,0 +1,9 @@
+# Repository-level Cargo configuration.
+#
+# ts-rs writes generated TypeScript to `TS_RS_EXPORT_DIR`. Setting it here (not
+# only in scripts/gen-contract.ps1) means a plain `cargo test` refreshes the
+# committed contract in place instead of creating a stray `bindings/` directory.
+# `relative = true` resolves the path against this file's parent, so the value is
+# independent of the shell's working directory.
+[env]
+TS_RS_EXPORT_DIR = { value = "frontend/src/generated", relative = true }

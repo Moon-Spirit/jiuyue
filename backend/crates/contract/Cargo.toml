@@ -1,0 +1,22 @@
+[package]
+name = "jiuyue-contract"
+description = "Single source of truth for the jiuyue WebSocket wire contract"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+serde.workspace = true
+
+# The TypeScript contract is generated from these types, never hand-written.
+# `serde-compat` (the only default feature) makes ts-rs honour the serde
+# `tag`/`content`/`rename` attributes, so the wire shape and the TS shape can
+# not drift. The optional `format` feature pulls in dprint, which the box does
+# not need; ts-rs output is already deterministic without it.
+ts-rs = { version = "12", default-features = false, features = ["serde-compat"] }
+
+[dev-dependencies]
+serde_json.workspace = true
