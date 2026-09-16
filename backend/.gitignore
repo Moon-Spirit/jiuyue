@@ -1,0 +1,3 @@
+# Rust build output. The repository root .gitignore already covers `**/target/`;
+# this entry keeps `backend/` self-contained if it is ever extracted.
+/target

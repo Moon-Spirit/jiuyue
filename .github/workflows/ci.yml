@@ -1,0 +1,93 @@
+# CI —— 不使用容器：PostgreSQL 直接装在 runner 上（见 ADR-0010）
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  backend:
+    name: 后端（fmt / clippy / test）
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    services: {} # 明确不使用 service container
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: 安装 PostgreSQL 16（原生，非容器）
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-16 postgresql-client-16
+          sudo systemctl start postgresql
+          sudo -u postgres psql -c "CREATE ROLE jiuyue LOGIN PASSWORD 'jiuyue_dev_password' SUPERUSER;"
+          sudo -u postgres psql -c "CREATE DATABASE jiuyue_dev OWNER jiuyue;"
+          sudo -u postgres psql -c "CREATE DATABASE jiuyue_test OWNER jiuyue;"
+          pg_isready -h localhost -p 5432
+
+      - name: 安装 Rust 工具链
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt,clippy
+          rustup default stable
+          rustc --version
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: backend
+
+      - name: 格式检查
+        working-directory: backend
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        working-directory: backend
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: 测试
+        working-directory: backend
+        env:
+          DATABASE_URL: postgres://jiuyue:jiuyue_dev_password@localhost:5432/jiuyue_test
+          TEST_DATABASE_URL: postgres://jiuyue:jiuyue_dev_password@localhost:5432/jiuyue_test
+        run: cargo test --all-features
+
+  frontend:
+    name: 前端（type-check / test / build）
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+
+      - name: 安装依赖
+        working-directory: frontend
+        run: pnpm install --frozen-lockfile
+
+      - name: 类型检查
+        working-directory: frontend
+        run: pnpm type-check
+
+      - name: 测试
+        working-directory: frontend
+        run: pnpm test
+
+      - name: 构建
+        working-directory: frontend
+        run: pnpm build

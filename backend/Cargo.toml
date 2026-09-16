@@ -1,0 +1,32 @@
+# jiuyue backend — Cargo workspace root.
+#
+# The workspace is intentionally thin: one member crate today (`jiuyue-server`),
+# with room for further crates (db, ws, media) as later tickets land.
+[workspace]
+resolver = "3"
+members = ["crates/server"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "LGPL-3.0"
+repository = "https://github.com/Moon-Spirit/jiuyue"
+
+[workspace.dependencies]
+axum = "0.8"
+dotenvy = "0.15"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tower = "0.5"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Sized for a 2 vCPU / 2 GB single-node box: single codegen unit and thin LTO
+# trade a little build time for a smaller, faster release binary.
+[profile.release]
+codegen-units = 1
+lto = "thin"
+strip = true

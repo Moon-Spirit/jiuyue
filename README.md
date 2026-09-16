@@ -2,7 +2,7 @@
 
 一个产品级即时通讯应用：单聊 / 群聊 / 音视频通话 / 端到端加密秘密聊天 / 离线推送 / 管理后台。
 
-**状态：规划阶段** —— 架构决策与领域模型已落定，实现尚未开始。
+**状态：实现中** —— 架构决策、领域模型与产品规格已落定；脚手架正在搭建。
 
 ---
 
@@ -12,13 +12,13 @@
 | ----------- | ---------------------------------------------------------------------------------------------------- |
 | 后端        | Rust + Axum（WebSocket 实时 + REST）                                                                 |
 | 数据库      | PostgreSQL 16（sqlx）                                                                                |
-| 缓存 / 状态 | Redis                                                                                                |
+| 缓存 / 状态 | 进程内实现为主（presence / 限流 / 广播）；多节点时启用 Redis                                         |
 | 前端        | Vue 3 + Vite + TypeScript + Pinia 4                                                                  |
 | 样式        | Tailwind CSS v4 + Reka UI + Naive UI                                                                 |
 | 桌面        | Tauri v2（Windows / macOS）+ Electron（Linux，见 [ADR-0008](./docs/adr/0008-dual-desktop-shell.md)） |
 | 音视频      | 1:1 走 P2P WebRTC + coturn；群组走 LiveKit                                                           |
 | 端到端加密  | vodozemac（Olm 双棘轮）                                                                              |
-| 部署        | Docker Compose + Caddy + GitHub Actions                                                              |
+| 部署        | systemd + Caddy + GitHub Actions（**不使用容器**，见 [ADR-0010](./docs/adr/0010-no-containers.md)）  |
 
 ---
 
@@ -45,11 +45,17 @@
 
 - 一对一语音 / 视频通话（独立窗口）
 - 群组语音 / 视频通话
+- 屏幕共享（720p / 1080p / 1440p / 2160p × 60–360 Hz 可选档位）
 
 **端到端加密**
 
 - 秘密聊天（Olm 双棘轮，单设备、不漫游、服务端不可搜索）
 - 安全码（数字 + emoji）独立验证
+
+**媒体质量**
+
+- 语音消息与通话音频为音乐级（Opus 48 kHz 立体声、高码率）
+- 上传的音频 / 音乐文件不做有损转码，原样存储
 
 **通知与运营**
 
@@ -60,12 +66,13 @@
 
 ## 文档
 
-| 文档                                 | 内容                                     |
-| ------------------------------------ | ---------------------------------------- |
-| [`CONTEXT.md`](./CONTEXT.md)         | 领域通用语言（术语表，命名以它为准）     |
-| [`docs/adr/`](./docs/adr/)           | 架构决策记录（含已否决的替代方案与理由） |
-| [`docs/research/`](./docs/research/) | 技术调研归档（后端框架、E2EE、部署调参） |
-| [`AGENTS.md`](./AGENTS.md)           | 项目级开发约束与常用命令                 |
+| 文档                                 | 内容                                             |
+| ------------------------------------ | ------------------------------------------------ |
+| [`CONTEXT.md`](./CONTEXT.md)         | 领域通用语言（术语表，命名以它为准）             |
+| [`docs/spec/`](./docs/spec/)         | 产品规格（180 条用户故事与实现决策）             |
+| [`docs/adr/`](./docs/adr/)           | 架构决策记录（含已否决的替代方案与理由）         |
+| [`docs/research/`](./docs/research/) | 技术调研归档（后端框架、E2EE、音视频、部署调参） |
+| [`AGENTS.md`](./AGENTS.md)           | 项目级开发约束与常用命令                         |
 
 ---
 
@@ -75,10 +82,9 @@
 
 ### 环境要求
 
-- Rust 工具链（rustup）
+- Rust 工具链（rustup，MSVC toolchain）
 - Node.js 24+ 与 pnpm
-- Docker（本地全栈）
-- PostgreSQL 16 / Redis（或直接用 Docker Compose）
+- PostgreSQL 16（原生安装，**不需要 Docker**）
 
 ---
 
