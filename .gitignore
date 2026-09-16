@@ -1,0 +1,25 @@
+﻿# Rust
+**/target/
+# Node
+node_modules/
+dist/
+dist-ssr/
+*.local
+# Env
+.env
+.env.*
+!.env.example
+# Tauri
+**/src-tauri/target/
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+# Agent session state & generated indexes
+.omo/run-continuation/
+.codegraph/
+# Runtime data (local dev)
+data/
+uploads/
+# Logs
+*.log
