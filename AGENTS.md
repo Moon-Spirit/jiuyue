@@ -43,7 +43,9 @@ _每一项的选择理由与已否决的替代方案见 `docs/adr/`。改动前�
 │   └── research/     调研归档
 ├── backend/          Rust workspace
 ├── frontend/         Vue 3 + Vite + TS
-├── desktop/          Tauri v2 壳
+├── desktop/
+│   ├── tauri/        Tauri v2 壳（Windows / macOS）
+│   └── electron/     Electron 壳（Linux 专用，见 ADR-0008）
 └── deploy/           Compose / Caddy / 运维脚本
 ```
 
@@ -69,7 +71,8 @@ _每一项的选择理由与已否决的替代方案见 `docs/adr/`。改动前�
 - **秘密聊天不得参与内容审核**：审核只覆盖 Cloud Conversation，代码与文档都不例外。
 - **最低 macOS 13**：Tailwind v4 需要 Safari 16.4+，与 Tauri 默认构建目标冲突，必须显式对齐。
 - **通话必须在独立窗口**：语音/视频通话不得实现为应用内浮层或覆盖层，必须是独立 OS 窗口，与主窗口生命周期解耦。这是产品硬需求，不是样式偏好。
-- **Linux 桌面端必须能通话**：Linux 桌面客户端必须支持语音/视频通话，不接受"Linux 用户请用浏览器"的降级。桌面壳选型受此约束（Tauri 的 Linux WebView 缺失 WebRTC，解决方案见 ADR）。
+- **Linux 桌面端必须能通话**：Linux 桌面客户端必须支持语音/视频通话，不接受"Linux 用户请用浏览器"的降级。桌面端因此是**双壳**：Windows/macOS 用 Tauri v2，Linux 用 Electron（见 ADR-0008）。
+- **前端组件不得直接调用 Tauri API**：所有桌面能力必须经 `desktop-shell` 接口（`startCall` / `openCallWindow` / 屏幕共享选择器 / 通知与权限）。否则 Linux 壳无法复用同一份前端 —— 这是模块化保证，也是将来切回单壳的前提（见 ADR-0008）。
 - **界面必须有动效**：动效是验收项而非加分项。消息进出、列表切换、窗口转场、通话状态变化都要有动画，且必须尊重 `prefers-reduced-motion`。
 
 ## Agent skills

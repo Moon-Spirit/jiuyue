@@ -8,17 +8,17 @@
 
 ## 技术栈
 
-| 层          | 选型                                       |
-| ----------- | ------------------------------------------ |
-| 后端        | Rust + Axum（WebSocket 实时 + REST）       |
-| 数据库      | PostgreSQL 16（sqlx）                      |
-| 缓存 / 状态 | Redis                                      |
-| 前端        | Vue 3 + Vite + TypeScript + Pinia 4        |
-| 样式        | Tailwind CSS v4 + Reka UI + Naive UI       |
-| 桌面        | Tauri v2                                   |
-| 音视频      | 1:1 走 P2P WebRTC + coturn；群组走 LiveKit |
-| 端到端加密  | vodozemac（Olm 双棘轮）                    |
-| 部署        | Docker Compose + Caddy + GitHub Actions    |
+| 层          | 选型                                                                                                 |
+| ----------- | ---------------------------------------------------------------------------------------------------- |
+| 后端        | Rust + Axum（WebSocket 实时 + REST）                                                                 |
+| 数据库      | PostgreSQL 16（sqlx）                                                                                |
+| 缓存 / 状态 | Redis                                                                                                |
+| 前端        | Vue 3 + Vite + TypeScript + Pinia 4                                                                  |
+| 样式        | Tailwind CSS v4 + Reka UI + Naive UI                                                                 |
+| 桌面        | Tauri v2（Windows / macOS）+ Electron（Linux，见 [ADR-0008](./docs/adr/0008-dual-desktop-shell.md)） |
+| 音视频      | 1:1 走 P2P WebRTC + coturn；群组走 LiveKit                                                           |
+| 端到端加密  | vodozemac（Olm 双棘轮）                                                                              |
+| 部署        | Docker Compose + Caddy + GitHub Actions                                                              |
 
 ---
 
