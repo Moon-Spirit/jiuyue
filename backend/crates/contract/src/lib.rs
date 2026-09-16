@@ -22,12 +22,18 @@
 #![forbid(unsafe_code)]
 
 pub mod auth;
+pub mod chat;
 pub mod envelope;
 pub mod events;
 
 pub use auth::{
     AuthSession, ErrorBody, ErrorCode, ErrorDetail, FieldError, FieldErrorCode, LoginRequest,
     RefreshRequest, RegisterRequest, TokenPair, UserProfile, WhoAmI,
+};
+pub use chat::{
+    ConversationCreated, ConversationKind, ConversationList, ConversationSummary,
+    CreateDirectConversationRequest, MAX_CLIENT_MSG_ID_BYTES, MAX_MESSAGE_BODY_CHARS, MessageAck,
+    MessageList, MessageRejected, MessageView, NewMessage, PeerSummary, SendMessage,
 };
 pub use envelope::{ClientEnvelope, PROTOCOL_VERSION, ServerEnvelope};
 pub use events::{ClientEvent, Ping, ServerEvent};

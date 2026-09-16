@@ -6,12 +6,32 @@
  * produced by `scripts/gen-contract.ps1` from the Rust contract crate and is
  * guarded against drift in CI.
  *
+ * Authentication: `GET /ws` requires an access token, and the browser
+ * `WebSocket` constructor cannot set an `Authorization` header, so the token
+ * travels as a query parameter. The caller supplies a {@link TokenProvider} rather
+ * than a fixed string, so every reconnect picks up a token that has been refreshed
+ * in the meantime.
+ *
  * Reconnection is built in, not bolted on: reloading a reverse proxy (Caddy)
  * forcibly drops every WebSocket, so the client must re-establish the connection
  * on its own.
  */
 
+import type { ClientEnvelope } from "../generated/ClientEnvelope";
+import type { ClientEvent } from "../generated/ClientEvent";
 import type { ServerEnvelope } from "../generated/ServerEnvelope";
+
+/**
+ * Wire protocol version, mirroring `PROTOCOL_VERSION` in the Rust contract.
+ *
+ * `ts-rs` exports types, not constants, so this is the one value that is mirrored
+ * by hand. It is only stamped on outgoing frames; the server ignores it today and
+ * a mismatch would be a deliberate breaking change.
+ */
+const PROTOCOL_VERSION = 1;
+
+/** `WebSocket.OPEN`; spelled out so the global can be substituted in tests. */
+const READY_STATE_OPEN = 1;
 
 /** Lifecycle of the realtime socket as the UI sees it. */
 export type SocketStatus =
@@ -30,16 +50,28 @@ export interface SocketHandlers {
   readonly onStatus: (status: SocketStatus) => void;
 }
 
+/** Resolves the access token used for the next (re)connect. */
+export type TokenProvider = () => string | null;
+
+/** Construction options for {@link RealtimeSocket}. */
+export interface RealtimeOptions {
+  /** Called on every connect attempt; `null` means "not signed in, do not connect". */
+  readonly token: TokenProvider;
+  /** Backoff overrides, mainly for tests. */
+  readonly policy?: Partial<ReconnectPolicy>;
+}
+
 const DEFAULT_POLICY: ReconnectPolicy = {
   initialDelayMs: 500,
   maxDelayMs: 30_000,
   factor: 2,
 };
 
-/** Same-origin URL of the realtime endpoint, proxied to the backend in dev. */
-export function realtimeUrl(): string {
+/** Same-origin URL of the realtime endpoint, carrying the access token. */
+export function realtimeUrl(token: string | null): string {
   const scheme = window.location.protocol === "https:" ? "wss:" : "ws:";
-  return `${scheme}//${window.location.host}/ws`;
+  const base = `${scheme}//${window.location.host}/ws`;
+  return token === null ? base : `${base}?token=${encodeURIComponent(token)}`;
 }
 
 /**
@@ -90,16 +122,26 @@ export class RealtimeSocket {
   private closedByUser = false;
   private readonly policy: ReconnectPolicy;
   private readonly handlers: SocketHandlers;
+  private readonly options: RealtimeOptions;
 
-  constructor(handlers: SocketHandlers, policy: Partial<ReconnectPolicy> = {}) {
+  constructor(handlers: SocketHandlers, options: RealtimeOptions) {
     this.handlers = handlers;
-    this.policy = { ...DEFAULT_POLICY, ...policy };
+    this.options = options;
+    this.policy = { ...DEFAULT_POLICY, ...options.policy };
   }
 
   /** Open the socket, or the first reconnect attempt. Idempotent. */
   connect(): void {
     if (this.socket !== null) return;
     this.closedByUser = false;
+
+    if (this.token() === null) {
+      // Not signed in: stay idle rather than opening a socket the server will
+      // refuse. The caller retries once a session exists.
+      this.handlers.onStatus("idle");
+      return;
+    }
+
     this.open();
   }
 
@@ -112,10 +154,37 @@ export class RealtimeSocket {
     this.handlers.onStatus("closed");
   }
 
+  /**
+   * Send one client event.
+   *
+   * Returns `false` when the socket is not open, so the caller can mark the
+   * optimistic Message failed and offer a retry instead of losing it silently.
+   */
+  send(event: ClientEvent): boolean {
+    if (this.socket === null || this.socket.readyState !== READY_STATE_OPEN) {
+      return false;
+    }
+
+    const envelope: ClientEnvelope = { v: PROTOCOL_VERSION, e: event };
+    this.socket.send(JSON.stringify(envelope));
+    return true;
+  }
+
+  /** The token for this attempt, resolved fresh so a refresh is picked up. */
+  private token(): string | null {
+    return this.options.token();
+  }
+
   private open(): void {
+    const token = this.token();
+    if (token === null) {
+      this.handlers.onStatus("idle");
+      return;
+    }
+
     this.handlers.onStatus(this.attempt === 0 ? "connecting" : "reconnecting");
 
-    const socket = new WebSocket(realtimeUrl());
+    const socket = new WebSocket(realtimeUrl(token));
     this.socket = socket;
 
     socket.onopen = () => {
@@ -149,6 +218,10 @@ export class RealtimeSocket {
 
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;
+      if (this.token() === null) {
+        this.handlers.onStatus("idle");
+        return;
+      }
       this.open();
     }, delay);
   }

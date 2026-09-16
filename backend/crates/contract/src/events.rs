@@ -8,7 +8,13 @@
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
+use crate::chat::{ConversationCreated, MessageAck, MessageRejected, NewMessage, SendMessage};
+
 /// Events the server pushes to a client.
+///
+/// Variants are additive. A client that does not recognise a `t` skips the event
+/// rather than failing, which is what lets the server grow the vocabulary without
+/// a protocol version bump (ADR-0003).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(tag = "t", content = "d")]
 #[ts(export)]
@@ -16,6 +22,15 @@ pub enum ServerEvent {
     /// Connection-level heartbeat. Sent once when the connection opens and
     /// periodically afterwards.
     Ping(Ping),
+    /// A Message this connection submitted has been stored.
+    MessageAck(MessageAck),
+    /// A Message was stored in a Conversation this connection participates in.
+    /// Fanned out to every Participant, including the sender's other Devices.
+    NewMessage(NewMessage),
+    /// A Message this connection submitted was refused and was not stored.
+    MessageRejected(MessageRejected),
+    /// A Conversation this connection now participates in was created.
+    ConversationCreated(ConversationCreated),
 }
 
 /// Events a client sends to the server.
@@ -25,6 +40,8 @@ pub enum ServerEvent {
 pub enum ClientEvent {
     /// Client-side heartbeat / latency probe.
     Ping(Ping),
+    /// Post a text Message into a Conversation.
+    SendMessage(SendMessage),
 }
 
 /// Heartbeat payload shared by both directions.

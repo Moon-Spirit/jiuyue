@@ -1,0 +1,35 @@
+[package]
+name = "jiuyue-chat"
+description = "jiuyue chat domain: conversations, participants and the per-conversation message stream"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+name = "jiuyue_chat"
+path = "src/lib.rs"
+
+[dependencies]
+jiuyue-contract = { path = "../contract" }
+thiserror.workspace = true
+tracing.workspace = true
+
+# ULID primary keys, matching the `users` / `sessions` convention (ADR-0003).
+ulid = "1"
+
+# `conversations`, `conversation_members` and `messages` are this crate's tables
+# (ADR-0011), so this crate owns the SQL that reads and writes them. Queries are
+# runtime-checked, so building never needs a database — the same choice
+# `jiuyue-auth` and `jiuyue-store` made.
+sqlx = { version = "0.8", default-features = false, features = [
+    "postgres",
+    "runtime-tokio",
+    "tls-rustls",
+    "time",
+] }
+
+[dev-dependencies]
+tokio.workspace = true

@@ -13,6 +13,7 @@ publish = false
 # workspace default set for every other crate.
 axum = { workspace = true, features = ["ws"] }
 futures-util = { version = "0.3", features = ["sink"] }
+jiuyue-chat = { path = "../chat" }
 jiuyue-contract = { path = "../contract" }
 serde_json.workspace = true
 thiserror.workspace = true

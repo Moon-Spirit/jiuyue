@@ -1,0 +1,72 @@
+# Caddyfile — jiuyue edge: automatic HTTPS + reverse proxy + static frontend.
+#
+# No containers (ADR-0010): Caddy runs as the distro `caddy` systemd service and
+# this file is installed to /etc/caddy/Caddyfile by deploy/provision.sh.
+#
+# The domain is a deployment input, never a fact committed to the repo. It is
+# supplied through the environment:
+#   JIUYUE_DOMAIN      the public hostname (DNS A/AAAA must already point here)
+#   JIUYUE_ACME_EMAIL  ACME account contact for Let's Encrypt
+# On the server these live in /etc/jiuyue/caddy.env, loaded by the systemd
+# drop-in deploy/systemd/drop-ins/caddy.service.d/10-jiuyue-env.conf.
+# CI validates this file with the placeholder defaults below.
+{
+	email {$JIUYUE_ACME_EMAIL:ops@example.com}
+	# The admin API stays on the loopback default (127.0.0.1:2019); never expose it.
+	# HTTP->HTTPS redirect and certificate issuance/renewal are automatic.
+}
+
+{$JIUYUE_DOMAIN:chat.example.com} {
+	encode zstd gzip
+
+	# Baseline security headers. HSTS is safe because the site is HTTPS-only;
+	# includeSubDomains is intentionally omitted (sibling names are not ours).
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		-Server
+	}
+
+	# Access log to the journal; journald handles rotation, so no unbounded file.
+	log {
+		output stderr
+		level INFO
+	}
+
+	# --- REST API -----------------------------------------------------------
+	# Mirrors the dev-time Vite proxy (frontend/vite.config.ts): /api/* is
+	# forwarded to the backend with the /api prefix stripped, so the client uses
+	# identical paths in dev and production. This also exposes /api/health.
+	handle_path /api/* {
+		reverse_proxy 127.0.0.1:8080
+	}
+
+	# --- Realtime WebSocket -------------------------------------------------
+	# Same-origin /ws, exactly as in frontend/vite.config.ts.
+	handle /ws {
+		reverse_proxy 127.0.0.1:8080 {
+			# Never buffer: frames must reach clients immediately.
+			flush_interval -1
+			# Cull half-open sessions after a day; the client reconnects.
+			stream_timeout 24h
+			# By default a `caddy reload` (any cert/route change) forcibly closes
+			# every WebSocket. Keep existing streams open for 5m instead, so a
+			# reload does not produce a thundering herd of reconnects; new
+			# connections use the new config immediately. A hard `caddy restart`
+			# still drops everything — clients must (and do) reconnect.
+			stream_close_delay 5m
+		}
+	}
+
+	# --- Static SPA + PWA ---------------------------------------------------
+	# Served from the release symlink, so one deploy switches backend binary and
+	# frontend together. Unknown paths fall back to index.html for the SPA
+	# router; real 404s become the app's own not-found view.
+	handle {
+		root * /opt/jiuyue/current/dist
+		try_files {path} /index.html
+		file_server
+	}
+}

@@ -6,27 +6,26 @@
 //! The handlers are deliberately thin: they read the bearer token and the request
 //! metadata, hand the work to [`jiuyue_auth::AuthService`], and translate the
 //! result. The one thing they own is the *HTTP shape of failure* — every error
-//! leaves as the contract's [`ErrorBody`], so the client never has to parse a
-//! status code or a prose message to know what happened.
+//! leaves as the contract's [`ErrorBody`] via [`ApiError`], so the client never has
+//! to parse a status code or a prose message to know what happened.
 
 use axum::extract::State;
-use axum::http::{HeaderMap, StatusCode, header::AUTHORIZATION};
-use axum::response::{IntoResponse, Response};
+use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use jiuyue_auth::{AuthError, SessionContext};
+use jiuyue_auth::SessionContext;
 use jiuyue_contract::{
-    AuthSession, ErrorBody, ErrorCode, ErrorDetail, FieldError, FieldErrorCode, LoginRequest,
-    RefreshRequest, RegisterRequest, TokenPair, UserProfile, WhoAmI,
+    AuthSession, LoginRequest, RefreshRequest, RegisterRequest, TokenPair, UserProfile, WhoAmI,
 };
 
-use crate::state::{AppState, AuthUnavailable};
+use super::api::{ApiError, bearer_token};
+use crate::state::AppState;
 
 /// The `/auth` routes.
 ///
 /// Registered even when the instance has no database: the handlers then answer
-/// [`ErrorCode::Unavailable`] with `503`, which is a truthful and debuggable
-/// response, instead of the route silently 404-ing.
+/// [`jiuyue_contract::ErrorCode::Unavailable`] with `503`, which is a truthful and
+/// debuggable response, instead of the route silently 404-ing.
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/auth/register", post(register))
@@ -152,129 +151,4 @@ fn header_value(headers: &HeaderMap, name: &str) -> Option<String> {
         .get(name)
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned)
-}
-
-/// Extract the token from an `Authorization: Bearer <token>` header.
-fn bearer_token(headers: &HeaderMap) -> Result<String, ApiError> {
-    let value = headers
-        .get(AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .ok_or_else(ApiError::unauthenticated)?;
-
-    let (scheme, token) = value
-        .split_once(' ')
-        .ok_or_else(ApiError::unauthenticated)?;
-
-    if !scheme.eq_ignore_ascii_case("bearer") || token.trim().is_empty() {
-        return Err(ApiError::unauthenticated());
-    }
-
-    Ok(token.trim().to_owned())
-}
-
-/// An error response: the status plus the contract's machine-readable body.
-struct ApiError {
-    status: StatusCode,
-    body: ErrorBody,
-}
-
-impl ApiError {
-    fn new(status: StatusCode, code: ErrorCode, message: &str, fields: Vec<FieldError>) -> Self {
-        Self {
-            status,
-            body: ErrorBody {
-                error: ErrorDetail {
-                    code,
-                    message: message.to_owned(),
-                    fields,
-                },
-            },
-        }
-    }
-
-    /// The failure for a missing, malformed or rejected bearer token.
-    fn unauthenticated() -> Self {
-        Self::new(
-            StatusCode::UNAUTHORIZED,
-            ErrorCode::Unauthenticated,
-            "登录状态已失效，请重新登录",
-            Vec::new(),
-        )
-    }
-
-    /// A field-level problem that duplicates an account insert.
-    fn taken(field: &str, message: &str) -> Vec<FieldError> {
-        vec![FieldError {
-            field: field.to_owned(),
-            code: FieldErrorCode::Taken,
-            message: message.to_owned(),
-        }]
-    }
-}
-
-impl From<AuthUnavailable> for ApiError {
-    fn from(error: AuthUnavailable) -> Self {
-        tracing::warn!(%error, "identity endpoint called without a configured database");
-        Self::new(
-            StatusCode::SERVICE_UNAVAILABLE,
-            ErrorCode::Unavailable,
-            "当前实例未启用账号服务",
-            Vec::new(),
-        )
-    }
-}
-
-impl From<AuthError> for ApiError {
-    fn from(error: AuthError) -> Self {
-        match error {
-            AuthError::Validation(fields) => Self::new(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                ErrorCode::ValidationFailed,
-                "请求参数无效",
-                fields,
-            ),
-            AuthError::EmailTaken => Self::new(
-                StatusCode::CONFLICT,
-                ErrorCode::EmailTaken,
-                "该邮箱已被注册",
-                ApiError::taken("email", "该邮箱已被注册"),
-            ),
-            AuthError::UsernameTaken => Self::new(
-                StatusCode::CONFLICT,
-                ErrorCode::UsernameTaken,
-                "该用户名已被占用",
-                ApiError::taken("username", "该用户名已被占用"),
-            ),
-            AuthError::InvalidCredentials => Self::new(
-                StatusCode::UNAUTHORIZED,
-                ErrorCode::InvalidCredentials,
-                "邮箱或密码不正确",
-                Vec::new(),
-            ),
-            AuthError::Unauthenticated => Self::unauthenticated(),
-            // A token that does not verify is a credential problem, not a server
-            // fault: malformed, expired, tampered with, or foreign-signed. Log
-            // the reason (never the token) and answer 401.
-            AuthError::Token(error) => {
-                tracing::debug!(%error, "rejected an access token that did not verify");
-                Self::unauthenticated()
-            }
-            internal => {
-                // Log the cause, return none of it: the client gets a stable code.
-                tracing::error!(error = %internal, "identity request failed");
-                Self::new(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    ErrorCode::Internal,
-                    "服务器内部错误",
-                    Vec::new(),
-                )
-            }
-        }
-    }
-}
-
-impl IntoResponse for ApiError {
-    fn into_response(self) -> Response {
-        (self.status, Json(self.body)).into_response()
-    }
 }

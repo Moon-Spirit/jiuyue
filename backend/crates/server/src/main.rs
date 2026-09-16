@@ -2,9 +2,12 @@
 
 use std::net::SocketAddr;
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use jiuyue_auth::{AuthConfig, AuthService};
-use jiuyue_server::{AppState, Config, Error, app};
+use jiuyue_chat::ChatService;
+use jiuyue_realtime::RealtimeHub;
+use jiuyue_server::{AppState, Config, Error, Services, app};
 use jiuyue_store::Store;
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
@@ -32,13 +35,25 @@ async fn run() -> Result<(), Error> {
     let store = Store::connect(config.require_database_url()?).await?;
     store.migrate().await?;
 
+    // One pool, three domains: identity, chat, and the realtime gateway that
+    // composes chat into the socket path. The hub shares the chat service rather
+    // than opening its own, so a send and a history read hit the same tables.
     let auth = AuthService::new(
         store.pool().clone(),
         AuthConfig::new(config.require_jwt_secret()?),
     )
     .await?;
+    let chat = Arc::new(ChatService::new(store.pool().clone()));
+    let realtime = Arc::new(RealtimeHub::new(Arc::clone(&chat)));
 
-    let state = AppState::with_auth(config, auth);
+    let state = AppState::with_services(
+        config,
+        Services {
+            auth: Arc::new(auth),
+            chat,
+            realtime,
+        },
+    );
     let address = SocketAddr::from(([0, 0, 0, 0], state.config().port));
 
     let listener = TcpListener::bind(address)

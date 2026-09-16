@@ -7,7 +7,13 @@ const router = createRouter({
   routes: [
     {
       path: "/",
-      name: "home",
+      name: "chat",
+      component: () => import("../views/ChatView.vue"),
+      meta: { requiresAuth: true },
+    },
+    {
+      path: "/account",
+      name: "account",
       component: () => import("../views/ProtectedView.vue"),
       meta: { requiresAuth: true },
     },
@@ -38,7 +44,7 @@ router.beforeEach((to) => {
 
   // Someone already signed in has no use for the login or register form.
   if ((to.name === "login" || to.name === "register") && auth.isAuthenticated) {
-    return { name: "home" };
+    return { name: "chat" };
   }
 
   return true;

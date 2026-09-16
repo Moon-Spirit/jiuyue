@@ -24,10 +24,13 @@ describe("HealthView", () => {
     // The view opens the realtime channel on mount; substitute the network
     // boundary so no real socket is created.
     vi.stubGlobal("WebSocket", FakeWebSocket);
+    // The socket authenticates with the session's access token.
+    window.localStorage.setItem("jiuyue.auth.access_token", "test-access");
   });
 
   afterEach(() => {
     vi.unstubAllGlobals();
+    window.localStorage.clear();
   });
 
   it("renders the backend status and version when the backend answers", async () => {

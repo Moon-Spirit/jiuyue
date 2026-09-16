@@ -966,6 +966,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "jiuyue-chat"
+version = "0.1.0"
+dependencies = [
+ "jiuyue-contract",
+ "sqlx",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "ulid",
+]
+
+[[package]]
 name = "jiuyue-contract"
 version = "0.1.0"
 dependencies = [
@@ -980,6 +992,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "futures-util",
+ "jiuyue-chat",
  "jiuyue-contract",
  "serde_json",
  "thiserror",
@@ -995,6 +1008,7 @@ dependencies = [
  "dotenvy",
  "futures-util",
  "jiuyue-auth",
+ "jiuyue-chat",
  "jiuyue-contract",
  "jiuyue-realtime",
  "jiuyue-store",

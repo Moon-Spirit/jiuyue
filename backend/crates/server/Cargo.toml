@@ -22,6 +22,7 @@ path = "src/main.rs"
 axum.workspace = true
 dotenvy.workspace = true
 jiuyue-auth = { path = "../auth" }
+jiuyue-chat = { path = "../chat" }
 jiuyue-contract = { path = "../contract" }
 jiuyue-realtime = { path = "../realtime" }
 jiuyue-store = { path = "../store" }

@@ -26,6 +26,8 @@ export class FakeWebSocket {
   onerror: ((event: Event) => void) | null = null;
 
   readonly url: string;
+  /** Every frame the client sent, in order, as raw JSON text. */
+  readonly sent: string[] = [];
   readyState = 0;
 
   constructor(url: string | URL) {
@@ -33,8 +35,8 @@ export class FakeWebSocket {
     FakeWebSocket.instances.push(this);
   }
 
-  send(): void {
-    // Outgoing frames are not under test yet.
+  send(data: string): void {
+    this.sent.push(String(data));
   }
 
   close(): void {

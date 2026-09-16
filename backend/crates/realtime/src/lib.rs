@@ -1,32 +1,54 @@
 //! jiuyue realtime gateway.
 //!
-//! This crate owns the WebSocket transport only: the upgrade handshake, framing
-//! limits, per-connection sequence assignment and a bounded send queue. It knows
-//! nothing about application state or persistence, so the HTTP server can mount
-//! it as one stateless route and stay thin.
+//! This crate owns the WebSocket transport: the upgrade handshake configuration,
+//! framing limits, per-connection sequence assignment, a bounded send path, and
+//! the [`ConnectionRegistry`] that fans an event out to every live Device of a
+//! User. It is mounted by `jiuyue-server` as one route and stays free of HTTP
+//! routing.
 //!
 //! Keeping realtime out of `jiuyue-server` (rather than a `ws.rs` module inside
-//! it) matches the module split in the product spec — the realtime gateway is its
-//! own domain — and lets the transport evolve independently of HTTP routing.
+//! it) matches the module split in the product spec 鈥?the realtime gateway is its
+//! own domain 鈥?and lets the transport evolve independently of HTTP routing.
+//!
+//! # Authentication
+//!
+//! A socket is bound to a User by the caller: `jiuyue-server` authenticates the
+//! access token **before** upgrading and hands [`serve_connection`] the resolved
+//! `user_id`. There is no path that serves an unauthenticated socket.
 //!
 //! # Limits
 //!
 //! `tokio-tungstenite` defaults to 16 MiB frames and 64 MiB messages. On the
-//! 2 vCPU / 2 GB production box a handful of connections could exhaust memory,
-//! so both are pinned to deliberately small values ([`MAX_FRAME_SIZE`],
-//! [`MAX_MESSAGE_SIZE`]). The send path is a bounded `mpsc` queue, so a slow
-//! client applies backpressure instead of growing the buffer without limit.
+//! 2 vCPU / 2 GB production box a handful of connections could exhaust memory, so
+//! both are pinned to deliberately small values ([`MAX_FRAME_SIZE`],
+//! [`MAX_MESSAGE_SIZE`]). Two bounded queues guard the send path: the control
+//! queue the registry fans into, and the envelope queue the writer drains. A slow
+//! client applies backpressure rather than growing memory without limit.
+//!
+//! # Two sequences, never confused
+//!
+//! `s` on the envelope is the **connection** sequence (gap detection and replay,
+//! ADR-0003). A Message's `seq` is the **conversation** sequence, allocated by
+//! `jiuyue-chat`. This module owns the former and merely transports the latter.
 
 #![forbid(unsafe_code)]
 
+mod registry;
+
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::response::Response;
+use axum::extract::ws::{Message, WebSocket};
 use futures_util::{SinkExt, StreamExt};
-use jiuyue_contract::{ClientEnvelope, ClientEvent, Ping, ServerEnvelope, ServerEvent};
+use jiuyue_chat::ChatService;
+use jiuyue_contract::{
+    ClientEnvelope, ClientEvent, MessageAck, MessageRejected, NewMessage, Ping, ServerEnvelope,
+    ServerEvent,
+};
 use thiserror::Error;
 use tokio::sync::mpsc;
+
+pub use registry::{ConnectionId, ConnectionRegistry};
 
 /// Hard cap on a single WebSocket frame (64 KiB).
 ///
@@ -40,11 +62,17 @@ pub const MAX_FRAME_SIZE: usize = 64 * 1024;
 /// independently so fragmentation cannot bypass the frame limit.
 pub const MAX_MESSAGE_SIZE: usize = 1024 * 1024;
 
-/// Bound on the per-connection send queue, in envelopes.
+/// Bound on the per-connection outbound envelope queue, in envelopes.
 ///
-/// The queue is the backpressure point: when it is full the producer waits
-/// rather than buffering without limit.
+/// This is the writer's backpressure point: when it is full the connection waits
+/// to hand an envelope over rather than buffering without limit.
 pub const SEND_QUEUE_CAPACITY: usize = 64;
+
+/// Bound on the per-connection control queue, in events.
+///
+/// The registry fans out through this queue with `try_send` only, so its size is
+/// the per-client memory ceiling for undelivered fan-out.
+pub const CONTROL_QUEUE_CAPACITY: usize = 64;
 
 /// Interval between server-initiated heartbeats.
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
@@ -65,35 +93,60 @@ pub enum RealtimeError {
     Closed,
 }
 
-/// Axum handler for `GET /ws`.
+/// Everything a live connection needs beyond its socket.
 ///
-/// Configures the connection limits before handing the socket to
-/// [`run_connection`]. Axum performs the HTTP upgrade in a background task.
-pub async fn ws_handler(ws: WebSocketUpgrade) -> Response {
-    ws.max_frame_size(MAX_FRAME_SIZE)
-        .max_message_size(MAX_MESSAGE_SIZE)
-        .write_buffer_size(MAX_FRAME_SIZE)
-        .max_write_buffer_size(MAX_FRAME_SIZE * 2)
-        .on_upgrade(serve)
+/// One hub per process: it owns the connection registry and the chat service, so a
+/// connection can persist a Message and fan it out without reaching into either
+/// domain's internals.
+pub struct RealtimeHub {
+    registry: ConnectionRegistry,
+    chat: Arc<ChatService>,
 }
 
-/// Serve one connection, logging (not panicking) on failure.
-async fn serve(socket: WebSocket) {
-    if let Err(error) = run_connection(socket).await {
+impl RealtimeHub {
+    /// Build a hub over the chat service.
+    pub fn new(chat: Arc<ChatService>) -> Self {
+        Self {
+            registry: ConnectionRegistry::new(),
+            chat,
+        }
+    }
+
+    /// The live-connection registry, for fan-out from outside the socket path.
+    pub fn registry(&self) -> &ConnectionRegistry {
+        &self.registry
+    }
+
+    /// The chat service this hub serves.
+    pub fn chat(&self) -> &ChatService {
+        &self.chat
+    }
+}
+
+/// Serve one authenticated connection, logging (not panicking) on failure.
+///
+/// `user_id` must come from a verified access token; this function never sees the
+/// token itself.
+pub async fn serve_connection(socket: WebSocket, user_id: String, hub: Arc<RealtimeHub>) {
+    if let Err(error) = run_connection(socket, user_id, hub).await {
         tracing::debug!(%error, "realtime connection ended");
     }
 }
 
 /// Assign the connection sequence, push the opening heartbeat, then pump frames
-/// until the socket closes.
-async fn run_connection(socket: WebSocket) -> Result<(), RealtimeError> {
+/// and fanned-out events until the socket closes.
+async fn run_connection(
+    socket: WebSocket,
+    user_id: String,
+    hub: Arc<RealtimeHub>,
+) -> Result<(), RealtimeError> {
     let (mut sink, mut stream) = socket.split();
-    let (sender, mut receiver) = mpsc::channel::<ServerEnvelope>(SEND_QUEUE_CAPACITY);
+    let (envelope_tx, mut envelope_rx) = mpsc::channel::<ServerEnvelope>(SEND_QUEUE_CAPACITY);
 
     // Writer task: drains the bounded queue onto the socket and closes the sink
     // when the connection ends. Holding the sink here leaves the read side free.
     let writer = tokio::spawn(async move {
-        while let Some(envelope) = receiver.recv().await {
+        while let Some(envelope) = envelope_rx.recv().await {
             let text = match serde_json::to_string(&envelope) {
                 Ok(text) => text,
                 Err(error) => {
@@ -108,8 +161,13 @@ async fn run_connection(socket: WebSocket) -> Result<(), RealtimeError> {
         let _ = sink.close().await;
     });
 
+    // The registry holds the only control sender: fan-out reaches this connection
+    // through the same bounded queue as any other Device of this User.
+    let (control_tx, mut control_rx) = mpsc::channel::<ServerEvent>(CONTROL_QUEUE_CAPACITY);
+    let connection_id = hub.registry.register(user_id.clone(), control_tx).await;
+
     let mut sequence = 0_u64;
-    send_heartbeat(&sender, &mut sequence).await?;
+    enqueue_ping(&envelope_tx, &mut sequence).await?;
 
     let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
     // The first interval tick is immediate; the opening heartbeat already fired.
@@ -118,12 +176,34 @@ async fn run_connection(socket: WebSocket) -> Result<(), RealtimeError> {
     loop {
         tokio::select! {
             _ = heartbeat.tick() => {
-                if send_heartbeat(&sender, &mut sequence).await.is_err() {
+                if enqueue_ping(&envelope_tx, &mut sequence).await.is_err() {
                     break;
                 }
             }
+            incoming = control_rx.recv() => match incoming {
+                Some(event) => {
+                    if enqueue(&envelope_tx, &mut sequence, event).await.is_err() {
+                        break;
+                    }
+                }
+                // The registry dropped the sender: this connection is over.
+                None => break,
+            },
             frame = stream.next() => match frame {
-                Some(Ok(Message::Text(text))) => handle_client_frame(text.as_str()),
+                Some(Ok(Message::Text(text))) => {
+                    if handle_client_frame(
+                        text.as_str(),
+                        &user_id,
+                        &hub,
+                        &envelope_tx,
+                        &mut sequence,
+                    )
+                    .await
+                    .is_err()
+                    {
+                        break;
+                    }
+                }
                 Some(Ok(Message::Close(_))) | None => break,
                 Some(Ok(_)) => {}
                 Some(Err(error)) => {
@@ -134,17 +214,103 @@ async fn run_connection(socket: WebSocket) -> Result<(), RealtimeError> {
         }
     }
 
+    hub.registry.unregister(&user_id, connection_id).await;
+
     // Dropping the sender ends the writer task; awaiting it lets the close frame
     // flush before the connection is torn down.
-    drop(sender);
+    drop(envelope_tx);
     let _ = writer.await;
 
     Ok(())
 }
 
-/// Increment the per-connection sequence and enqueue a heartbeat envelope.
-async fn send_heartbeat(
-    sender: &mpsc::Sender<ServerEnvelope>,
+/// Handle one decoded client frame.
+///
+/// An unparseable frame is logged and ignored rather than dropping the connection
+/// 鈥?a client bug must not cost the user their session. A `SendMessage` is
+/// persisted inline: a connection processes its own sends in order, and the
+/// database call is bounded by the pool's acquire timeout, so one user's send
+/// cannot stall another's.
+async fn handle_client_frame(
+    text: &str,
+    user_id: &str,
+    hub: &RealtimeHub,
+    envelope_tx: &mpsc::Sender<ServerEnvelope>,
+    sequence: &mut u64,
+) -> Result<(), RealtimeError> {
+    let envelope = match serde_json::from_str::<ClientEnvelope>(text) {
+        Ok(envelope) => envelope,
+        Err(error) => {
+            tracing::debug!(%error, "ignoring an undecodable client frame");
+            return Ok(());
+        }
+    };
+
+    match envelope.event() {
+        ClientEvent::Ping(ping) => {
+            tracing::trace!(seq = ping.seq, time_ms = ping.time_ms, "client heartbeat");
+        }
+        ClientEvent::SendMessage(send) => {
+            let reply = match hub.chat.send_message(user_id, send.clone()).await {
+                Ok(sent) => {
+                    // Fan out only when this call actually wrote the Message. A
+                    // replayed Client Message ID (or the loser of a race between
+                    // two identical sends) must be a no-op on the wire: everyone
+                    // still gets exactly one NewMessage for the Message, and the
+                    // sender alone still gets its ack 鈥?which may be the only
+                    // reason it retried in the first place.
+                    if sent.created {
+                        hub.registry
+                            .deliver(
+                                &sent.participants,
+                                &ServerEvent::NewMessage(NewMessage {
+                                    message: sent.message.clone(),
+                                }),
+                            )
+                            .await;
+                    }
+
+                    ServerEvent::MessageAck(MessageAck {
+                        client_msg_id: send.client_msg_id.clone(),
+                        message: sent.message,
+                    })
+                }
+                Err(error) => {
+                    tracing::debug!(%error, "rejected a message send");
+                    ServerEvent::MessageRejected(MessageRejected {
+                        client_msg_id: send.client_msg_id.clone(),
+                        code: error.code(),
+                        message: error.message().to_owned(),
+                    })
+                }
+            };
+
+            enqueue(envelope_tx, sequence, reply).await?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Increment the per-connection sequence and enqueue an event as an envelope.
+async fn enqueue(
+    envelope_tx: &mpsc::Sender<ServerEnvelope>,
+    sequence: &mut u64,
+    event: ServerEvent,
+) -> Result<(), RealtimeError> {
+    *sequence += 1;
+
+    let envelope = ServerEnvelope::new(*sequence, now_ms()?, event);
+    envelope_tx
+        .send(envelope)
+        .await
+        .map_err(|_| RealtimeError::Closed)
+}
+
+/// Increment the per-connection sequence and enqueue a heartbeat envelope whose
+/// payload carries the same sequence the envelope does.
+async fn enqueue_ping(
+    envelope_tx: &mpsc::Sender<ServerEnvelope>,
     sequence: &mut u64,
 ) -> Result<(), RealtimeError> {
     *sequence += 1;
@@ -159,24 +325,10 @@ async fn send_heartbeat(
         }),
     );
 
-    sender
+    envelope_tx
         .send(envelope)
         .await
         .map_err(|_| RealtimeError::Closed)
-}
-
-/// Handle one decoded client frame. Client events carry no server-side effect
-/// yet, so an unknown or malformed frame is logged and ignored rather than
-/// dropping the connection.
-fn handle_client_frame(text: &str) {
-    match serde_json::from_str::<ClientEnvelope>(text) {
-        Ok(envelope) => match envelope.event() {
-            ClientEvent::Ping(ping) => {
-                tracing::trace!(seq = ping.seq, time_ms = ping.time_ms, "client heartbeat");
-            }
-        },
-        Err(error) => tracing::debug!(%error, "ignoring an undecodable client frame"),
-    }
 }
 
 /// Current wall-clock time as milliseconds since the Unix epoch.

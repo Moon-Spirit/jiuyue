@@ -147,7 +147,11 @@ pub struct FieldError {
     pub message: String,
 }
 
-/// Stable failure kinds for the auth API.
+/// Stable failure kinds for the JSON API.
+///
+/// One vocabulary shared by every module that answers with the [`ErrorBody`]
+/// envelope — identity today, chat alongside it. Codes are additive: a client
+/// branches on the ones it knows and treats the rest as a generic failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 #[ts(export)]
@@ -166,6 +170,12 @@ pub enum ErrorCode {
     Internal,
     /// The identity subsystem is not available on this instance.
     Unavailable,
+    /// The addressed Conversation does not exist, or is not visible to the caller.
+    NotFound,
+    /// No account matches the requested `@handle`.
+    UserNotFound,
+    /// The caller is authenticated but is not a Participant of the Conversation.
+    NotAParticipant,
 }
 
 /// Stable per-field validation codes.

@@ -1,0 +1,145 @@
+# Validates the deployment artifacts without a real server.
+#
+# This is the only gate these files can pass before touching a box: the CI
+# runner can run `systemd-analyze` and `caddy validate`, which the Windows dev
+# machine cannot. Everything here is container-free (ADR-0010) — Caddy and
+# PostgreSQL are installed natively from apt, no `services:` containers.
+#
+# Checks:
+#   * no CRLF anywhere under deploy/ (systemd and bash both break on CRLF)
+#   * the env template still declares every variable the binary reads
+#   * `caddy validate` the Caddyfile
+#   * `systemd-analyze verify` the unit (with its Caddy/PostgreSQL drop-ins)
+#   * `bash -n` and `shellcheck` the deploy scripts
+
+name: Deploy artifacts
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # Placeholder deployment inputs: the Caddyfile is parameterised, never hard-coded.
+  JIUYUE_DOMAIN: chat.example.com
+  JIUYUE_ACME_EMAIL: ops@example.com
+
+jobs:
+  validate:
+    name: systemd / Caddy / shell
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    services: {} # no containers, ever
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: No CRLF line endings in deploy artifacts
+        run: |
+          set -euo pipefail
+          offenders="$(grep -rlI $'\r' deploy .github/workflows || true)"
+          if [ -n "$offenders" ]; then
+            echo "::error::CRLF line endings found (systemd/bash require LF):"
+            echo "$offenders"
+            exit 1
+          fi
+          echo "LF-only: OK"
+
+      - name: Env template covers every variable in config.rs
+        run: |
+          set -euo pipefail
+          missing=0
+          for var in PORT RUST_LOG DATABASE_URL JWT_SECRET \
+                     ACCESS_TOKEN_TTL_SECS REFRESH_TOKEN_TTL_SECS; do
+            if ! grep -qE "^${var}=" deploy/env/jiuyue.env.example; then
+              echo "::error::deploy/env/jiuyue.env.example is missing ${var}"
+              missing=1
+            fi
+          done
+          [ "$missing" -eq 0 ] || exit 1
+          echo "all six variables present"
+
+      - name: Install Caddy and PostgreSQL (native apt, no containers)
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y debian-keyring debian-archive-keyring \
+            apt-transport-https curl gnupg
+          curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' \
+            | sudo gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+          curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' \
+            | sudo tee /etc/apt/sources.list.d/caddy-stable.list >/dev/null
+          sudo chmod o+r /usr/share/keyrings/caddy-stable-archive-keyring.gpg \
+                          /etc/apt/sources.list.d/caddy-stable.list
+          sudo apt-get update
+          # PostgreSQL 16 gives us the real postgresql.service and pg_isready,
+          # so the unit's ordering and ExecStartPre resolve during verification.
+          sudo apt-get install -y caddy postgresql-16 postgresql-client-16
+          caddy version
+          pg_isready --version
+
+      - name: Validate Caddyfile
+        run: caddy validate --config deploy/Caddyfile
+
+      - name: Stage a sandbox the unit's paths resolve against
+        run: |
+          set -euo pipefail
+          sudo useradd --system --no-create-home --home-dir /var/lib/jiuyue \
+            --shell /usr/sbin/nologin jiuyue || true
+          sudo install -d -m 0755 /opt/jiuyue/current/bin
+          sudo install -d -m 0750 -o jiuyue -g jiuyue /var/lib/jiuyue
+          sudo install -d -m 0750 /etc/jiuyue
+          sudo touch /etc/jiuyue/jiuyue.env
+          # The Caddy drop-in points at this file, so it must exist for verification.
+          sudo touch /etc/jiuyue/caddy.env
+          printf '#!/bin/sh\nexit 0\n' \
+            | sudo tee /opt/jiuyue/current/bin/jiuyue-server >/dev/null
+          sudo chmod 0755 /opt/jiuyue/current/bin/jiuyue-server
+
+      - name: Verify systemd unit
+        run: |
+          set -euo pipefail
+          sudo cp deploy/systemd/jiuyue.service /etc/systemd/system/jiuyue.service
+          sudo systemd-analyze verify /etc/systemd/system/jiuyue.service
+
+      - name: Verify drop-in directives
+        run: |
+          set -euo pipefail
+          # A drop-in is a unit fragment, so verify each one inside a synthetic
+          # unit instead of relying on the distro package's own unit existing.
+          check_dropin() {
+            local name="$1" dropin="$2"
+            {
+              printf '[Unit]\nDescription=drop-in check for %s\n\n' "$name"
+              cat "$dropin"
+              printf 'ExecStart=/bin/true\n'
+            } > "/tmp/${name}.service"
+            systemd-analyze verify "/tmp/${name}.service"
+          }
+          check_dropin jiuyue-pg-memory \
+            deploy/systemd/drop-ins/postgresql@16-main.service.d/10-memory.conf
+          check_dropin jiuyue-caddy-env \
+            deploy/systemd/drop-ins/caddy.service.d/10-jiuyue-env.conf
+
+      - name: Install pinned shellcheck
+        run: |
+          set -euo pipefail
+          # Pinned to the version the artifacts were verified against locally.
+          version=v0.11.0
+          curl -fsSL -o /tmp/shellcheck.tar.gz \
+            "https://github.com/koalaman/shellcheck/releases/download/${version}/shellcheck-${version}.linux.x86_64.tar.gz"
+          tar -xzf /tmp/shellcheck.tar.gz -C "$RUNNER_TEMP"
+          "$RUNNER_TEMP/shellcheck-${version}/shellcheck" --version
+
+      - name: Lint deploy scripts
+        run: |
+          set -euo pipefail
+          bash -n deploy/deploy.sh deploy/provision.sh
+          "$RUNNER_TEMP/shellcheck-v0.11.0/shellcheck" \
+            --severity=warning deploy/deploy.sh deploy/provision.sh
+          echo "shell syntax and lint: OK"

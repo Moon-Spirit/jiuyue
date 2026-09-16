@@ -15,7 +15,10 @@ use serde::Serialize;
 
 use crate::state::AppState;
 
+pub mod api;
 pub mod auth;
+pub mod chat;
+pub mod realtime;
 
 /// Payload returned by `GET /health`.
 ///
@@ -35,13 +38,16 @@ pub struct Health {
 pub fn app(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
-        // Realtime lives in its own crate; the server only wires the route. The
-        // upgrade handler is stateless, so it takes no state out of this crate.
-        .route("/ws", get(jiuyue_realtime::ws_handler))
+        // Realtime lives in its own crate; the server owns the one thing the
+        // transport must not: authenticating the socket before it is upgraded.
+        .route("/ws", get(realtime::upgrade))
         // Identity is its own module; the server only mounts its routes. The
         // handlers answer `503` when no database is configured, rather than the
         // routes disappearing, so a misconfigured instance is diagnosable.
         .merge(auth::router())
+        // Chat is its own module and its own crate: Conversation lifecycle and
+        // history over REST, Message delivery over the socket above.
+        .merge(chat::router())
         .layer(middleware::from_fn(log_request))
         .with_state(state)
 }

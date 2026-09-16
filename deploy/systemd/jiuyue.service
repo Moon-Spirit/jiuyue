@@ -1,0 +1,94 @@
+# jiuyue backend — native systemd unit. No containers anywhere (ADR-0010).
+#
+# Installed to /etc/systemd/system/jiuyue.service by deploy/provision.sh.
+# The binary is pulled from a release artifact built in CI (the 2 GB box never
+# compiles Rust). Secrets live in the EnvironmentFile, never inline here.
+#
+# This unit is validated on every push by .github/workflows/deploy-validate.yml
+# (`systemd-analyze verify`).
+
+[Unit]
+Description=jiuyue backend (Rust/Axum: REST + WebSocket)
+Documentation=https://github.com/Moon-Spirit/jiuyue/blob/main/docs/deploy.md
+
+# Ordering only: "postgresql.service started" is not "accepting connections",
+# so the real readiness gate is the ExecStartPre below. `postgresql@16-main`
+# is the Debian/Ubuntu per-cluster unit; `postgresql.service` is the meta unit.
+Wants=network-online.target postgresql.service
+After=network-online.target postgresql.service postgresql@16-main.service
+
+[Service]
+Type=simple
+User=jiuyue
+Group=jiuyue
+WorkingDirectory=/var/lib/jiuyue
+
+# Every runtime secret and tunable comes from this file (0640 root:jiuyue).
+# If it is missing the service refuses to start — a loud failure, not a silent
+# default. Never put secrets in this unit file. The file wins over any stray
+# `.env` in WorkingDirectory (dotenvy never overwrites real environment vars).
+EnvironmentFile=/etc/jiuyue/jiuyue.env
+
+# Reached through the release symlink, so a deploy swaps the symlink atomically
+# and restarts — no path edits and no in-place overwrite of a running binary.
+ExecStart=/opt/jiuyue/current/bin/jiuyue-server
+
+# Do not start until PostgreSQL answers on loopback. Bounded by TimeoutStartSec;
+# if the DB is not up in time the start fails and Restart=always retries.
+ExecStartPre=/bin/sh -c 'until pg_isready -h 127.0.0.1 -p 5432 -q; do sleep 1; done'
+
+# The server drains on SIGINT (tokio ctrl_c), not SIGTERM. KillSignal makes
+# `systemctl stop` reach the graceful path. Drop this once the binary also
+# handles SIGTERM. TimeoutStopSec is the backstop before SIGKILL.
+KillSignal=SIGINT
+TimeoutStartSec=60
+TimeoutStopSec=30
+
+Restart=always
+RestartSec=2
+
+# --- resource limits: protect the 2 GB box --------------------------------
+# MemoryMax is a blast-radius cap, not a steady-state target: base RSS is
+# ~20-80 MB (docs/research/2026-09-16-vps-2gb-ops-research.md), and the cap
+# stops allocator growth under load from starving PostgreSQL. See docs/deploy.md
+# for the full budget arithmetic.
+MemoryAccounting=yes
+MemoryHigh=256M
+MemoryMax=320M
+# WebSocket servers hold many descriptors; NOFILE is the first wall, not RAM.
+LimitNOFILE=65536
+
+# --- hardening ------------------------------------------------------------
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+# Only the data dir is writable; ProtectSystem=strict makes the rest of the
+# filesystem read-only. Uploads / local storage live here (ADR-0006, ADR-0009).
+ReadWritePaths=/var/lib/jiuyue
+# Optional, stricter: uncomment once verified against the running binary. A
+# syscall filter is the hardening step most likely to need tuning and cannot be
+# validated without the real process.
+#SystemCallFilter=@system-service
+#SystemCallErrorNumber=EPERM
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=jiuyue
+
+[Install]
+WantedBy=multi-user.target
