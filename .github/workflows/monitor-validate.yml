@@ -130,9 +130,13 @@ jobs:
           sudo -u postgres tee -a "$pgdata/postgresql.conf" \
             < deploy/postgresql/jiuyue-logging.conf >/dev/null
           fail=0
+          # `postgres -C` prints a duration GUC in its base unit, so a config
+          # written as `500ms` is reported as `500`. Compare against the
+          # normalised form; the config file keeps the explicit unit because
+          # that is what a human reading it needs.
           for kv in "logging_collector=off" "log_destination=stderr" \
                     "log_statement=none" "log_min_error_statement=error" \
-                    "log_min_duration_statement=500ms"; do
+                    "log_min_duration_statement=500"; do
             name="${kv%%=*}"
             want="${kv#*=}"
             got="$(sudo -u postgres /usr/lib/postgresql/16/bin/postgres -D "$pgdata" -C "$name")"
