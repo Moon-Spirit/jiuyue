@@ -25,6 +25,19 @@ export class ApiError extends Error {
     this.status = status;
     this.body = body;
   }
+
+  /**
+   * Whole seconds the backend asked the caller to wait, when it asked for one.
+   *
+   * Throttling and lockouts carry this so the UI can render a real countdown
+   * instead of parsing a human message; every other failure answers `null`. The
+   * value is read defensively because a response from an older backend, or one
+   * behind a proxy that rewrote the body, may simply lack the field.
+   */
+  get retryAfterSeconds(): number | null {
+    const value: unknown = this.body?.error.retry_after_seconds;
+    return typeof value === "number" ? value : null;
+  }
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

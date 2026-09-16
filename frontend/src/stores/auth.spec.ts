@@ -43,8 +43,11 @@ function errorPayload(
   code: string,
   message: string,
   fields: readonly { field: string; code: string; message: string }[] = [],
+  retryAfterSeconds: number | null = null,
 ): unknown {
-  return { error: { code, message, fields } };
+  return {
+    error: { code, message, fields, retry_after_seconds: retryAfterSeconds },
+  };
 }
 
 type Responder = () => Response;
@@ -151,6 +154,60 @@ describe("useAuthStore", () => {
     expect(store.errorCode).toBe("VALIDATION_FAILED");
     expect(store.fieldErrors["email"]).toBe("邮箱格式不正确");
     expect(store.isAuthenticated).toBe(false);
+  });
+
+  it("surfaces the throttle code and the retry hint from a 429", async () => {
+    stubFetch({
+      "/api/auth/login": [
+        () =>
+          jsonResponse(
+            errorPayload(
+              "TOO_MANY_ATTEMPTS",
+              "登录尝试过于频繁，请稍后再试",
+              [],
+              42,
+            ),
+            429,
+          ),
+      ],
+    });
+
+    const store = useAuthStore();
+    const ok = await store.login({
+      email: "alice@example.com",
+      password: "secret123",
+    });
+
+    expect(ok).toBe(false);
+    expect(store.errorCode).toBe("TOO_MANY_ATTEMPTS");
+    expect(store.retryAfterSeconds).toBe(42);
+    expect(store.isAuthenticated).toBe(false);
+  });
+
+  it("surfaces a lockout distinctly and drops the hint on the next attempt", async () => {
+    stubFetch({
+      "/api/auth/login": [
+        () =>
+          jsonResponse(
+            errorPayload("LOCKED_OUT", "登录失败次数过多，请稍后再试", [], 900),
+            423,
+          ),
+        () =>
+          jsonResponse(
+            errorPayload("INVALID_CREDENTIALS", "邮箱或密码不正确"),
+            401,
+          ),
+      ],
+    });
+
+    const store = useAuthStore();
+    await store.login({ email: "alice@example.com", password: "secret123" });
+    expect(store.errorCode).toBe("LOCKED_OUT");
+    expect(store.retryAfterSeconds).toBe(900);
+
+    await store.login({ email: "alice@example.com", password: "secret123" });
+    expect(store.errorCode).toBe("INVALID_CREDENTIALS");
+    expect(store.retryAfterSeconds).toBeNull();
   });
 
   it("distinguishes a duplicate email from a generic failure", async () => {

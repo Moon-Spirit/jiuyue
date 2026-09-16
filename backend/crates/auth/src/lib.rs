@@ -17,10 +17,11 @@
 //!
 //! # What this crate does not do
 //!
-//! Email verification, login rate limiting and refresh-token rotation are
-//! separate tickets. Nothing here delivers mail, throttles attempts, or rotates
-//! refresh tokens; the schema and [`AuthService`] are shaped so those can be
-//! added without replacing this module.
+//! Email verification and refresh-token rotation are separate tickets. Nothing
+//! here delivers mail or rotates refresh tokens; the schema and [`AuthService`]
+//! are shaped so those can be added without replacing this module. Login rate
+//! limiting *is* here — see [`limiter`] — because a login endpoint without it is
+//! an unlimited password oracle.
 //!
 //! # Cost control on a 2 vCPU / 2 GB box
 //!
@@ -31,6 +32,7 @@
 #![forbid(unsafe_code)]
 
 mod error;
+pub mod limiter;
 mod password;
 mod repository;
 mod service;
@@ -38,6 +40,10 @@ mod token;
 pub mod validation;
 
 pub use error::AuthError;
+pub use limiter::{
+    InProcessLoginAttemptStore, LoginAttempt, LoginAttemptPolicy, LoginAttemptPolicyBuilder,
+    LoginAttemptStore, MAX_LOCKOUT_SECS,
+};
 pub use password::PasswordHasher;
-pub use service::{AuthConfig, AuthService, AuthenticatedSession, SessionContext};
+pub use service::{AuthConfig, AuthService, AuthenticatedSession, SessionContext, UNKNOWN_SOURCE};
 pub use token::AccessClaims;

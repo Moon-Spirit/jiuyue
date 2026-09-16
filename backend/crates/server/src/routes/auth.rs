@@ -129,14 +129,18 @@ async fn whoami(
 /// Collect the device metadata a login records (the device ticket renders it).
 ///
 /// The client address comes from `X-Forwarded-For` because the app sits behind
-/// Caddy; there is no direct peer address to trust.
+/// Caddy; there is no direct peer address to trust. It is the **last** entry that
+/// is believed, not the first: Caddy *appends* the address it observed to any
+/// value the client sent, so earlier entries are attacker-controlled. Reading the
+/// first one would let anyone rotate the key login limiting counts under — and
+/// the limiter is only as good as its key.
 fn session_context(headers: &HeaderMap) -> SessionContext {
     SessionContext {
         device_label: None,
         user_agent: header_value(headers, "user-agent"),
         ip_address: header_value(headers, "x-forwarded-for").and_then(|forwarded| {
             forwarded
-                .split(',')
+                .rsplit(',')
                 .next()
                 .map(str::trim)
                 .filter(|value| !value.is_empty())

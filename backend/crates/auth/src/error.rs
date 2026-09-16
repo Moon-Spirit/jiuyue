@@ -29,6 +29,22 @@ pub enum AuthError {
     #[error("invalid email or password")]
     InvalidCredentials,
 
+    /// Too many failed attempts from this source recently; the caller must wait.
+    /// The wait travels as data ([`jiuyue_contract::ErrorDetail::retry_after_seconds`])
+    /// rather than as prose the client would have to parse.
+    #[error("too many login attempts, retry in {retry_after_seconds}s")]
+    TooManyAttempts {
+        /// Length of the imposed backoff, in whole seconds.
+        retry_after_seconds: u64,
+    },
+
+    /// Repeated throttling from this source escalated to a lockout.
+    #[error("login source locked out, retry in {retry_after_seconds}s")]
+    LockedOut {
+        /// Length of the imposed penalty, in whole seconds.
+        retry_after_seconds: u64,
+    },
+
     /// The access token is missing, malformed, expired, or its session was
     /// revoked or is past its own expiry.
     #[error("missing, expired or revoked credentials")]

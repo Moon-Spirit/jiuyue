@@ -6,10 +6,11 @@
 //!
 //! One test binary split into modules: `support` holds the harness, `flow` the
 //! end-to-end journeys, `validation` the rejection shapes, `tokens` the access
-//! token failures. Each test creates its own schema, so the suite runs in
-//! parallel and repeatedly without cleanup.
+//! token failures, `limiting` the login rate limiter. Each test creates its own
+//! schema, so the suite runs in parallel and repeatedly without cleanup.
 
 mod flow;
+mod limiting;
 mod support;
 mod tokens;
 mod validation;

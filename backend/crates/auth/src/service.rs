@@ -11,6 +11,7 @@
 //! [`SessionRepository`], so adding listing and rotation means adding methods,
 //! not rewriting this module.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use jiuyue_contract::{AuthSession, LoginRequest, RegisterRequest, TokenPair, UserProfile};
@@ -18,6 +19,9 @@ use sqlx::PgPool;
 use sqlx::types::time::OffsetDateTime;
 
 use crate::error::AuthError;
+use crate::limiter::{
+    InProcessLoginAttemptStore, LoginAttempt, LoginAttemptPolicy, LoginAttemptStore,
+};
 use crate::password::PasswordHasher;
 use crate::repository::{NewAccount, NewSession, SessionRepository, UserRow};
 use crate::token::{IssuedAccess, TokenIssuer};
@@ -63,6 +67,25 @@ pub struct SessionContext {
     pub ip_address: Option<String>,
 }
 
+impl SessionContext {
+    /// The key login attempts are counted under.
+    ///
+    /// This is the *source*, never the account: keying on the email would make a
+    /// throttled response differ for a registered and an unregistered address,
+    /// which is exactly the enumeration oracle the limiter exists to avoid. An
+    /// unknown source collapses to one shared bucket, which is the honest
+    /// fallback — better than an unbounded key or no limiting at all.
+    pub fn source(&self) -> &str {
+        self.ip_address
+            .as_deref()
+            .filter(|address| !address.is_empty())
+            .unwrap_or(UNKNOWN_SOURCE)
+    }
+}
+
+/// Key used when the client address could not be determined.
+pub const UNKNOWN_SOURCE: &str = "unknown";
+
 /// A resolved access token: who the caller is and which session proved it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthenticatedSession {
@@ -79,6 +102,9 @@ pub struct AuthService {
     repository: SessionRepository,
     hasher: PasswordHasher,
     tokens: TokenIssuer,
+    /// The login limiter. Held behind the trait so a multi-node deployment swaps
+    /// in a shared store without touching this file (see [`crate::limiter`]).
+    login_attempts: Arc<dyn LoginAttemptStore>,
     /// A real hash of a throwaway password, used to make "no such account" cost
     /// the same as "wrong password" (see [`AuthService::absorb_timing`]).
     dummy_hash: String,
@@ -89,7 +115,30 @@ impl AuthService {
     ///
     /// Hashing one throwaway password here is a deliberate one-off startup cost:
     /// it produces the timing-equaliser hash without a hardcoded constant.
+    ///
+    /// Login is limited by the process-local [`InProcessLoginAttemptStore`] with
+    /// the default policy; use [`AuthService::with_login_store`] to supply a
+    /// different one.
     pub async fn new(pool: PgPool, config: AuthConfig) -> Result<Self, AuthError> {
+        Self::with_login_store(
+            pool,
+            config,
+            Arc::new(InProcessLoginAttemptStore::new(
+                LoginAttemptPolicy::default(),
+            )),
+        )
+        .await
+    }
+
+    /// Build the service with a chosen login-attempt store.
+    ///
+    /// This is the seam the Redis-backed store will be injected through, and the
+    /// one tests use to run with tiny windows instead of production thresholds.
+    pub async fn with_login_store(
+        pool: PgPool,
+        config: AuthConfig,
+        login_attempts: Arc<dyn LoginAttemptStore>,
+    ) -> Result<Self, AuthError> {
         let hasher = PasswordHasher::new();
         let tokens = TokenIssuer::new(
             &config.jwt_secret,
@@ -102,6 +151,7 @@ impl AuthService {
             repository: SessionRepository::new(pool),
             hasher,
             tokens,
+            login_attempts,
             dummy_hash,
         })
     }
@@ -154,11 +204,19 @@ impl AuthService {
     }
 
     /// Verify credentials and open a new session (a new Device).
+    ///
+    /// The limiter is consulted *before* anything else — before validation and,
+    /// above all, before any credential work — so a throttled source costs the
+    /// server almost nothing and cannot be used to tell a registered address from
+    /// an unregistered one.
     pub async fn login(
         &self,
         request: LoginRequest,
         context: SessionContext,
     ) -> Result<AuthSession, AuthError> {
+        let source = context.source();
+        self.refuse_while_limited(source).await?;
+
         let problems = validation::validate_login(&request);
         if !problems.is_empty() {
             return Err(AuthError::Validation(problems));
@@ -169,13 +227,13 @@ impl AuthService {
 
         let Some(user) = user else {
             self.absorb_timing(&request.password).await?;
-            return Err(AuthError::InvalidCredentials);
+            return Err(self.reject(source).await);
         };
 
         // OAuth-only accounts have no password, so there is nothing to verify.
         let Some(password_hash) = user.password_hash.clone() else {
             self.absorb_timing(&request.password).await?;
-            return Err(AuthError::InvalidCredentials);
+            return Err(self.reject(source).await);
         };
 
         if !self
@@ -184,8 +242,12 @@ impl AuthService {
             .await?
         {
             tracing::debug!(user_id = %user.id, "login rejected: password mismatch");
-            return Err(AuthError::InvalidCredentials);
+            return Err(self.reject(source).await);
         }
+
+        // A successful sign-in forgives the source. A user who mistyped twice and
+        // then remembered their password must not carry those failures forward.
+        self.login_attempts.record_success(source).await;
 
         let session_id = new_id();
         let refresh_token = self.tokens.issue_refresh_token()?;
@@ -205,6 +267,45 @@ impl AuthService {
         tracing::info!(user_id = %user.id, session_id = %session_id, "session opened");
 
         self.finish_sign_in(user, &session_id, refresh_token)
+    }
+
+    /// Refuse an attempt the limiter is already throttling or locking out.
+    async fn refuse_while_limited(&self, source: &str) -> Result<(), AuthError> {
+        match self.login_attempts.verdict(source).await {
+            LoginAttempt::Allowed => Ok(()),
+            LoginAttempt::Throttled {
+                retry_after_seconds,
+            } => {
+                tracing::warn!(source = %source, "login throttled");
+                Err(AuthError::TooManyAttempts {
+                    retry_after_seconds,
+                })
+            }
+            LoginAttempt::LockedOut {
+                retry_after_seconds,
+            } => {
+                tracing::warn!(source = %source, "login locked out");
+                Err(AuthError::LockedOut {
+                    retry_after_seconds,
+                })
+            }
+        }
+    }
+
+    /// Record a failed credential check and return the error to report.
+    ///
+    /// The state change is deliberately *not* reflected in this response: the
+    /// contract is "N failures, then the *next* attempt is throttled", so the
+    /// failure that trips the limiter still answers "wrong password".
+    async fn reject(&self, source: &str) -> AuthError {
+        match self.login_attempts.record_failure(source).await {
+            LoginAttempt::Throttled { .. } | LoginAttempt::LockedOut { .. } => {
+                tracing::info!(source = %source, "login limiter tripped");
+            }
+            LoginAttempt::Allowed => {}
+        }
+
+        AuthError::InvalidCredentials
     }
 
     /// Trade a refresh token for a fresh access token.

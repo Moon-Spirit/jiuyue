@@ -5,7 +5,8 @@ import { RouterLink, useRoute, useRouter } from "vue-router";
 import { useAuthStore } from "../stores/auth";
 
 const auth = useAuthStore();
-const { loading, errorMessage, fieldErrors } = storeToRefs(auth);
+const { loading, errorMessage, fieldErrors, retryAfterSeconds } =
+  storeToRefs(auth);
 const router = useRouter();
 const route = useRoute();
 
@@ -71,6 +72,14 @@ async function submit(): Promise<void> {
           data-test="form-error"
         >
           {{ errorMessage }}
+        </p>
+
+        <p
+          v-if="retryAfterSeconds !== null"
+          class="rounded-lg bg-amber-50 p-3 text-xs leading-relaxed text-amber-800 dark:bg-amber-950/50 dark:text-amber-200"
+          data-test="retry-hint"
+        >
+          请等待 {{ retryAfterSeconds }} 秒后重试
         </p>
 
         <button

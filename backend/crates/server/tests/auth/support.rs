@@ -7,13 +7,17 @@
 //! which is worse than no test at all.
 
 use std::env;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::Router;
 use axum::body::{Body, to_bytes};
-use axum::http::{Method, Request, StatusCode};
-use jiuyue_auth::{AuthConfig, AuthService};
+use axum::http::{HeaderMap, Method, Request, StatusCode};
+use jiuyue_auth::{
+    AuthConfig, AuthService, InProcessLoginAttemptStore, LoginAttemptPolicy,
+    LoginAttemptPolicyBuilder,
+};
 use jiuyue_contract::AuthSession;
 use jiuyue_server::{AppState, Config, app};
 use jiuyue_store::Store;
@@ -36,6 +40,20 @@ pub struct TestApp {
 impl TestApp {
     /// Create a uniquely named schema, migrate it, and build the real router.
     pub async fn start() -> Self {
+        Self::start_with_login_policy(LoginAttemptPolicy::default())
+            .await
+            .0
+    }
+
+    /// Build the real router with a chosen login-limiting policy, and hand back
+    /// the store the limiter actually uses.
+    ///
+    /// Tests override thresholds through [`login_policy`] instead of weakening
+    /// [`LoginAttemptPolicy::default`], and they get the store so the memory
+    /// ceiling can be asserted rather than assumed.
+    pub async fn start_with_login_policy(
+        policy: LoginAttemptPolicy,
+    ) -> (Self, Arc<InProcessLoginAttemptStore>) {
         let admin_url = database_url();
         let schema = unique_schema_name();
 
@@ -51,18 +69,26 @@ impl TestApp {
             .await
             .expect("migrations must apply to an empty schema");
 
-        let auth = AuthService::new(store.pool().clone(), AuthConfig::new(TEST_SECRET))
-            .await
-            .expect("the identity service must build with a valid secret");
+        let login_store = Arc::new(InProcessLoginAttemptStore::new(policy));
+        let auth = AuthService::with_login_store(
+            store.pool().clone(),
+            AuthConfig::new(TEST_SECRET),
+            Arc::clone(&login_store) as Arc<dyn jiuyue_auth::LoginAttemptStore>,
+        )
+        .await
+        .expect("the identity service must build with a valid secret");
 
         let router = app(AppState::with_auth(Config::default(), auth));
 
-        Self {
-            router,
-            store,
-            admin_url,
-            schema,
-        }
+        (
+            Self {
+                router,
+                store,
+                admin_url,
+                schema,
+            },
+            login_store,
+        )
     }
 
     /// A clone of the router, ready for one request.
@@ -88,6 +114,19 @@ pub fn register_body(username: &str, email: &str, password: &str) -> Value {
     json!({ "username": username, "email": email, "password": password })
 }
 
+/// A login body for the common fields.
+pub fn login_body(email: &str, password: &str) -> Value {
+    json!({ "email": email, "password": password })
+}
+
+/// A builder for test-sized login thresholds.
+///
+/// Production numbers stay in [`LoginAttemptPolicy::default`]; a test composes
+/// only the knobs it needs to let a window elapse inside the test's lifetime.
+pub fn login_policy() -> LoginAttemptPolicyBuilder {
+    LoginAttemptPolicy::builder()
+}
+
 /// Register successfully and return the parsed session.
 ///
 /// Panics on a non-201, because every caller depends on the account existing.
@@ -110,16 +149,52 @@ pub async fn register(app: &TestApp, username: &str, email: &str, password: &str
 
 /// `POST` a JSON body and return the status and parsed body.
 pub async fn post_json(app: &TestApp, path: &str, body: &Value) -> (StatusCode, Value) {
-    let request = Request::builder()
+    post_json_from(app, path, body, None).await
+}
+
+/// `POST` a JSON body from a named source.
+///
+/// The limiter counts attempts per source, and outside a test the source is the
+/// client address the proxy appended to `X-Forwarded-For`. Naming it per request
+/// is how one test acts as several clients through a single router.
+pub async fn post_json_from(
+    app: &TestApp,
+    path: &str,
+    body: &Value,
+    source: Option<&str>,
+) -> (StatusCode, Value) {
+    let mut builder = Request::builder()
         .method(Method::POST)
         .uri(path)
-        .header("content-type", "application/json")
+        .header("content-type", "application/json");
+
+    if let Some(source) = source {
+        builder = builder.header("x-forwarded-for", source);
+    }
+
+    let request = builder
         .body(Body::from(
             serde_json::to_vec(body).expect("a JSON value must serialise"),
         ))
         .expect("the request must build");
 
     send(app, request).await
+}
+
+/// Log in from a named source.
+pub async fn login_from(
+    app: &TestApp,
+    email: &str,
+    password: &str,
+    source: &str,
+) -> (StatusCode, Value) {
+    post_json_from(
+        app,
+        "/auth/login",
+        &login_body(email, password),
+        Some(source),
+    )
+    .await
 }
 
 /// `GET` with a bearer token.
@@ -159,6 +234,16 @@ pub async fn get_without_token(app: &TestApp, path: &str) -> (StatusCode, Value)
 
 /// Drive one request through the real router and parse the JSON response.
 async fn send(app: &TestApp, request: Request<Body>) -> (StatusCode, Value) {
+    let (status, _, body) = send_full(app, request).await;
+
+    (status, body)
+}
+
+/// Drive one request through the real router, keeping the response headers.
+///
+/// `Retry-After` is part of the throttling contract, so a test has to be able to
+/// see it — the body alone would leave half the response unchecked.
+pub async fn send_full(app: &TestApp, request: Request<Body>) -> (StatusCode, HeaderMap, Value) {
     let response = app
         .router()
         .oneshot(request)
@@ -166,6 +251,7 @@ async fn send(app: &TestApp, request: Request<Body>) -> (StatusCode, Value) {
         .expect("the router must answer");
 
     let status = response.status();
+    let headers = response.headers().clone();
     let bytes = to_bytes(response.into_body(), usize::MAX)
         .await
         .expect("the response body must be readable");
@@ -176,7 +262,32 @@ async fn send(app: &TestApp, request: Request<Body>) -> (StatusCode, Value) {
         serde_json::from_slice(&bytes).expect("every response body must be JSON")
     };
 
-    (status, body)
+    (status, headers, body)
+}
+
+/// `POST` a JSON body from a source, keeping the response headers.
+pub async fn post_json_from_full(
+    app: &TestApp,
+    path: &str,
+    body: &Value,
+    source: Option<&str>,
+) -> (StatusCode, HeaderMap, Value) {
+    let mut builder = Request::builder()
+        .method(Method::POST)
+        .uri(path)
+        .header("content-type", "application/json");
+
+    if let Some(source) = source {
+        builder = builder.header("x-forwarded-for", source);
+    }
+
+    let request = builder
+        .body(Body::from(
+            serde_json::to_vec(body).expect("a JSON value must serialise"),
+        ))
+        .expect("the request must build");
+
+    send_full(app, request).await
 }
 
 /// The `error.code` string from an [`jiuyue_contract::ErrorBody`]-shaped response.
@@ -184,6 +295,11 @@ pub fn error_code(body: &Value) -> &str {
     body["error"]["code"]
         .as_str()
         .unwrap_or_else(|| panic!("response is not an ErrorBody: {body}"))
+}
+
+/// The `error.retry_after_seconds` hint, when the response carried one.
+pub fn error_retry_after(body: &Value) -> Option<u64> {
+    body["error"]["retry_after_seconds"].as_u64()
 }
 
 /// Panics with an actionable message when no database is configured.

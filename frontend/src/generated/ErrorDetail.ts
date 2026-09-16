@@ -17,4 +17,15 @@ message: string,
 /**
  * Field-level problems; empty when the failure is not attributable to a field.
  */
-fields: Array<FieldError>, };
+fields: Array<FieldError>, 
+/**
+ * Whole seconds the caller must wait before retrying, when the failure is a
+ * throttle or a lockout. `null` for every other failure.
+ *
+ * This travels as data rather than as prose so the client can render a real
+ * countdown instead of parsing a human message. It is the *length of the
+ * imposed backoff*, not a live countdown: it is identical for every source
+ * under the same policy at the same moment, which is what keeps the
+ * throttled response from becoming an account-enumeration oracle.
+ */
+retry_after_seconds: number | null, };

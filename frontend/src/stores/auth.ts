@@ -89,6 +89,11 @@ export const useAuthStore = defineStore("auth", () => {
   const errorCode = ref<ErrorCode | null>(null);
   const errorMessage = ref<string | null>(null);
   const fieldErrors = ref<Record<string, string>>({});
+  /**
+   * Seconds the backend asked us to wait, when the failure was a throttle or a
+   * lockout. Surfaced so a view can show a real retry hint rather than prose.
+   */
+  const retryAfterSeconds = ref<number | null>(null);
 
   /** A session is present only when both a profile and a token are held. */
   const isAuthenticated = computed(
@@ -99,6 +104,7 @@ export const useAuthStore = defineStore("auth", () => {
     errorCode.value = null;
     errorMessage.value = null;
     fieldErrors.value = {};
+    retryAfterSeconds.value = null;
   }
 
   function applySession(session: AuthSession): void {
@@ -136,6 +142,7 @@ export const useAuthStore = defineStore("auth", () => {
       errorCode.value = detail.code;
       errorMessage.value = detail.message;
       fieldErrors.value = fieldMessages(detail.fields);
+      retryAfterSeconds.value = cause.retryAfterSeconds;
       return;
     }
 
@@ -317,6 +324,7 @@ export const useAuthStore = defineStore("auth", () => {
     errorCode,
     errorMessage,
     fieldErrors,
+    retryAfterSeconds,
     isAuthenticated,
     register,
     login,

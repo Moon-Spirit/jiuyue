@@ -1,17 +1,18 @@
 //! The one HTTP failure shape every JSON endpoint answers with.
 //!
 //! A handler returns [`ApiError`] and the client receives the contract's
-//! [`ErrorBody`] — `{"error": {"code", "message", "fields"}}` — plus a status
-//! code. The code is the machine-readable part; the message is a display
-//! fallback. Nothing here leaks an internal cause: the cause is logged, the
-//! client gets a stable code.
+//! [`ErrorBody`] — `{"error": {"code", "message", "fields", "retry_after_seconds"}}`
+//! — plus a status code. The code is the machine-readable part; the message is a
+//! display fallback, and `retry_after_seconds` carries the wait for a throttle or
+//! a lockout as a number instead of prose. Nothing here leaks an internal cause:
+//! the cause is logged, the client gets a stable code.
 //!
 //! This module also owns bearer-token extraction, because "what does a missing or
 //! malformed `Authorization` header mean" must have exactly one answer across
 //! every protected endpoint.
 
 use axum::Json;
-use axum::http::{HeaderMap, StatusCode, header::AUTHORIZATION};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header::AUTHORIZATION, header::RETRY_AFTER};
 use axum::response::{IntoResponse, Response};
 use jiuyue_auth::AuthError;
 use jiuyue_chat::ChatError;
@@ -23,6 +24,8 @@ use crate::state::ServiceUnavailable;
 pub struct ApiError {
     status: StatusCode,
     body: ErrorBody,
+    /// Mirrored into the `Retry-After` header for a throttle or lockout.
+    retry_after_seconds: Option<u64>,
 }
 
 impl ApiError {
@@ -35,11 +38,39 @@ impl ApiError {
     ) -> Self {
         Self {
             status,
+            retry_after_seconds: None,
             body: ErrorBody {
                 error: ErrorDetail {
                     code,
                     message: message.to_owned(),
                     fields,
+                    retry_after_seconds: None,
+                },
+            },
+        }
+    }
+
+    /// A failure that carries a wait: throttling (`429`) or a lockout (`423`).
+    ///
+    /// The wait travels twice on purpose — in the body as
+    /// [`jiuyue_contract::ErrorDetail::retry_after_seconds`], which the client
+    /// contract already describes, and in the standard `Retry-After` header, so
+    /// an intermediary that understands HTTP but not this API can still back off.
+    fn with_retry_after(
+        status: StatusCode,
+        code: ErrorCode,
+        message: &str,
+        retry_after_seconds: u64,
+    ) -> Self {
+        Self {
+            status,
+            retry_after_seconds: Some(retry_after_seconds),
+            body: ErrorBody {
+                error: ErrorDetail {
+                    code,
+                    message: message.to_owned(),
+                    fields: Vec::new(),
+                    retry_after_seconds: Some(retry_after_seconds),
                 },
             },
         }
@@ -116,6 +147,26 @@ impl From<AuthError> for ApiError {
                 ErrorCode::InvalidCredentials,
                 "邮箱或密码不正确",
                 Vec::new(),
+            ),
+            // Throttled and locked out are distinct on purpose: a client shows a
+            // different message and a different countdown for each. `423 Locked`
+            // is the WebDAV code for "the source is locked"; `429` is the
+            // standard "slow down".
+            AuthError::TooManyAttempts {
+                retry_after_seconds,
+            } => Self::with_retry_after(
+                StatusCode::TOO_MANY_REQUESTS,
+                ErrorCode::TooManyAttempts,
+                "登录尝试过于频繁，请稍后再试",
+                retry_after_seconds,
+            ),
+            AuthError::LockedOut {
+                retry_after_seconds,
+            } => Self::with_retry_after(
+                StatusCode::LOCKED,
+                ErrorCode::LockedOut,
+                "登录失败次数过多，请稍后再试",
+                retry_after_seconds,
             ),
             AuthError::Unauthenticated => Self::unauthenticated(),
             // A token that does not verify is a credential problem, not a server
@@ -194,7 +245,16 @@ impl From<ChatError> for ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (self.status, Json(self.body)).into_response()
+        let retry_after = self.retry_after_seconds;
+        let mut response = (self.status, Json(self.body)).into_response();
+
+        if let Some(seconds) = retry_after {
+            if let Ok(value) = HeaderValue::from_str(&seconds.to_string()) {
+                response.headers_mut().insert(RETRY_AFTER, value);
+            }
+        }
+
+        response
     }
 }
 

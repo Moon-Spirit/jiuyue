@@ -133,6 +133,17 @@ pub struct ErrorDetail {
     /// Field-level problems; empty when the failure is not attributable to a field.
     #[serde(default)]
     pub fields: Vec<FieldError>,
+    /// Whole seconds the caller must wait before retrying, when the failure is a
+    /// throttle or a lockout. `null` for every other failure.
+    ///
+    /// This travels as data rather than as prose so the client can render a real
+    /// countdown instead of parsing a human message. It is the *length of the
+    /// imposed backoff*, not a live countdown: it is identical for every source
+    /// under the same policy at the same moment, which is what keeps the
+    /// throttled response from becoming an account-enumeration oracle.
+    #[serde(default)]
+    #[ts(type = "number | null")]
+    pub retry_after_seconds: Option<u64>,
 }
 
 /// One field-level validation problem.
@@ -164,6 +175,13 @@ pub enum ErrorCode {
     UsernameTaken,
     /// Email/password pair did not match. Deliberately does not say which was wrong.
     InvalidCredentials,
+    /// Too many failed attempts from this source in the recent window; the caller
+    /// must back off. [`ErrorDetail::retry_after_seconds`] carries the wait.
+    TooManyAttempts,
+    /// Repeated throttling from this source escalated to a lockout. Distinct from
+    /// [`Self::TooManyAttempts`] so a client can say so plainly; the wait is in
+    /// [`ErrorDetail::retry_after_seconds`].
+    LockedOut,
     /// The access token is missing, malformed, expired, or its session was revoked.
     Unauthenticated,
     /// The server failed for an internal reason; the cause is only in the logs.
@@ -229,6 +247,7 @@ mod tests {
                     code: FieldErrorCode::InvalidFormat,
                     message: "邮箱格式不正确".to_owned(),
                 }],
+                retry_after_seconds: None,
             },
         };
 
@@ -246,11 +265,46 @@ mod tests {
                 code: ErrorCode::InvalidCredentials,
                 message: "邮箱或密码不正确".to_owned(),
                 fields: Vec::new(),
+                retry_after_seconds: None,
             },
         };
 
         let wire = serde_json::to_value(&body).expect("the error body must serialise");
 
         assert_eq!(wire["error"]["fields"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn a_retry_hint_travels_as_a_number_and_is_absent_by_default() {
+        let throttled = ErrorBody {
+            error: super::ErrorDetail {
+                code: ErrorCode::TooManyAttempts,
+                message: "登录尝试过于频繁，请稍后再试".to_owned(),
+                fields: Vec::new(),
+                retry_after_seconds: Some(60),
+            },
+        };
+        let wire = serde_json::to_value(&throttled).expect("the error body must serialise");
+        assert_eq!(wire["error"]["code"], "TOO_MANY_ATTEMPTS");
+        assert_eq!(wire["error"]["retry_after_seconds"], serde_json::json!(60));
+
+        let locked = ErrorBody {
+            error: super::ErrorDetail {
+                code: ErrorCode::LockedOut,
+                message: "登录失败次数过多，请稍后再试".to_owned(),
+                fields: Vec::new(),
+                retry_after_seconds: Some(900),
+            },
+        };
+        let wire = serde_json::to_value(&locked).expect("the error body must serialise");
+        assert_eq!(wire["error"]["code"], "LOCKED_OUT");
+
+        // A code the client does not know must still decode, and a payload that
+        // predates the field must decode with no hint rather than fail.
+        let legacy: ErrorBody = serde_json::from_str(
+            r#"{"error":{"code":"INVALID_CREDENTIALS","message":"邮箱或密码不正确","fields":[]}}"#,
+        )
+        .expect("a body without the retry hint must decode");
+        assert_eq!(legacy.error.retry_after_seconds, None);
     }
 }
