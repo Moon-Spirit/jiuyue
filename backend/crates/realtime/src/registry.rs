@@ -36,6 +36,23 @@ impl ConnectionId {
     }
 }
 
+/// What a registration or removal did to a User's **reachability**.
+///
+/// Presence is per User (CONTEXT.md) and a User is online when *any* Device is
+/// connected, so only the first and last connection of an account change anything.
+/// The registry is the only place that knows which one this was, and deciding it
+/// under the same lock that mutates the map is what makes the answer exact rather
+/// than a race between two Devices connecting at once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PresenceChange {
+    /// This was the User's first live Device: they became reachable.
+    BecameOnline,
+    /// This was the User's last live Device: they stopped being reachable.
+    BecameOffline,
+    /// Other Devices of the same User are still connected: nothing changed.
+    Unchanged,
+}
+
 /// Every live connection, keyed by the authenticated User.
 #[derive(Debug, Default)]
 pub struct ConnectionRegistry {
@@ -49,30 +66,70 @@ impl ConnectionRegistry {
         Self::default()
     }
 
-    /// Record a live connection and return its id.
+    /// Record a live connection and report what it did to the User's presence.
+    ///
+    /// The count and the insertion happen under one lock, so two Devices of one
+    /// account connecting at the same instant cannot both be told they were "the
+    /// first" — exactly one of them is, and the other is [`PresenceChange::Unchanged`].
     pub async fn register(
         &self,
         user_id: String,
         sender: mpsc::Sender<ServerEvent>,
-    ) -> ConnectionId {
+    ) -> (ConnectionId, PresenceChange) {
         let id = ConnectionId(self.next_id.fetch_add(1, Ordering::Relaxed));
 
         let mut connections = self.connections.write().await;
-        connections.entry(user_id).or_default().insert(id, sender);
+        let sessions = connections.entry(user_id).or_default();
+        sessions.insert(id, sender);
 
-        id
+        let change = if sessions.len() == 1 {
+            PresenceChange::BecameOnline
+        } else {
+            PresenceChange::Unchanged
+        };
+
+        (id, change)
     }
 
-    /// Forget a connection. Idempotent, so a failed disconnect cannot corrupt the map.
-    pub async fn unregister(&self, user_id: &str, id: ConnectionId) {
+    /// Forget a connection and report what it did to the User's presence.
+    ///
+    /// Idempotent, so a failed disconnect cannot corrupt the map: removing a
+    /// connection that is not there changes nothing and reports
+    /// [`PresenceChange::Unchanged`] rather than claiming the User went offline.
+    pub async fn unregister(&self, user_id: &str, id: ConnectionId) -> PresenceChange {
         let mut connections = self.connections.write().await;
 
-        if let Some(sessions) = connections.get_mut(user_id) {
-            sessions.remove(&id);
-            if sessions.is_empty() {
-                connections.remove(user_id);
+        let (removed, became_empty) = match connections.get_mut(user_id) {
+            Some(sessions) => {
+                let removed = sessions.remove(&id).is_some();
+                (removed, sessions.is_empty())
             }
+            None => (false, false),
+        };
+
+        if became_empty {
+            connections.remove(user_id);
         }
+
+        if removed && became_empty {
+            PresenceChange::BecameOffline
+        } else {
+            PresenceChange::Unchanged
+        }
+    }
+
+    /// Whether any Device of a User is connected right now.
+    pub async fn is_online(&self, user_id: &str) -> bool {
+        self.connections.read().await.contains_key(user_id)
+    }
+
+    /// Every User with at least one live connection.
+    ///
+    /// The heartbeat checkpoint stamps exactly this set, which is what makes a
+    /// long-lived online User's last-seen instant stay fresh without a write per
+    /// connection.
+    pub async fn online_user_ids(&self) -> Vec<String> {
+        self.connections.read().await.keys().cloned().collect()
     }
 
     /// Deliver an event to every live connection of every listed User.

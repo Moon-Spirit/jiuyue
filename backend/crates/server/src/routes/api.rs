@@ -17,6 +17,7 @@ use axum::response::{IntoResponse, Response};
 use jiuyue_auth::AuthError;
 use jiuyue_chat::ChatError;
 use jiuyue_contract::{ErrorBody, ErrorCode, ErrorDetail, FieldError, FieldErrorCode};
+use jiuyue_realtime::RealtimeError;
 
 use crate::state::ServiceUnavailable;
 
@@ -168,6 +169,38 @@ impl From<AuthError> for ApiError {
                 "登录失败次数过多，请稍后再试",
                 retry_after_seconds,
             ),
+            // The account is fine and the token is good — the action is simply
+            // gated on a verified address. `403` says "authenticated, not allowed";
+            // the code lets the client prompt to open the inbox instead of showing
+            // a generic denial.
+            AuthError::EmailNotVerified => Self::new(
+                StatusCode::FORBIDDEN,
+                ErrorCode::EmailNotVerified,
+                "请先验证邮箱，再开始新的会话",
+                Vec::new(),
+            ),
+            // `410 Gone` is the honest code for a one-shot link: the resource
+            // existed and is no longer usable. Expired and invalid are separate
+            // codes because "ask for a new link" reads differently from "this link
+            // is not valid".
+            AuthError::TokenExpired => Self::new(
+                StatusCode::GONE,
+                ErrorCode::TokenExpired,
+                "链接已过期，请重新获取一封邮件",
+                Vec::new(),
+            ),
+            AuthError::TokenInvalid => Self::new(
+                StatusCode::BAD_REQUEST,
+                ErrorCode::TokenInvalid,
+                "链接无效或已被使用，请重新获取一封邮件",
+                Vec::new(),
+            ),
+            AuthError::AccountMissing => Self::new(
+                StatusCode::NOT_FOUND,
+                ErrorCode::UserNotFound,
+                "找不到该账号",
+                Vec::new(),
+            ),
             AuthError::Unauthenticated => Self::unauthenticated(),
             // A token that does not verify is a credential problem, not a server
             // fault: malformed, expired, tampered with, or foreign-signed. Log
@@ -240,6 +273,20 @@ impl From<ChatError> for ApiError {
                 Self::internal()
             }
         }
+    }
+}
+
+impl From<RealtimeError> for ApiError {
+    /// A realtime failure on a REST request is a server fault, never a client one.
+    ///
+    /// The only realtime errors that can reach a handler are "the presence store
+    /// failed" and "the presence audience could not be resolved" — the client's
+    /// input has already been parsed and validated by then. So the cause is logged
+    /// and the client gets the stable internal-error code, like every other
+    /// unexpected failure.
+    fn from(error: RealtimeError) -> Self {
+        tracing::error!(%error, "realtime request failed");
+        Self::internal()
     }
 }
 

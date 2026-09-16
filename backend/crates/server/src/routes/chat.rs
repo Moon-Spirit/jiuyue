@@ -82,7 +82,10 @@ async fn create_direct(
     headers: axum::http::HeaderMap,
     Json(body): Json<CreateDirectConversationRequest>,
 ) -> Result<(StatusCode, Json<ConversationSummary>), ApiError> {
-    let session = authenticate(&state, &headers).await?;
+    // Opening a Conversation is the moment an account reaches out to other people,
+    // so it is gated on a verified email. Reading and replying in Conversations
+    // that already exist stay available to an unverified account.
+    let session = authenticate_verified(&state, &headers).await?;
     let opened = state
         .chat()?
         .open_direct(&session.user_id, &body.peer_username)
@@ -119,7 +122,9 @@ async fn create_group(
     headers: axum::http::HeaderMap,
     Json(body): Json<CreateGroupConversationRequest>,
 ) -> Result<(StatusCode, Json<ConversationSummary>), ApiError> {
-    let session = authenticate(&state, &headers).await?;
+    // Same gate as opening a Direct Conversation: creating a group is outbound
+    // reach to other people, so it needs a verified address.
+    let session = authenticate_verified(&state, &headers).await?;
     let opened = state
         .chat()?
         .create_group(&session.user_id, body)
@@ -419,6 +424,23 @@ async fn authenticate(
     state
         .auth()?
         .authenticate(&token)
+        .await
+        .map_err(ApiError::from)
+}
+
+/// Resolve an authorization header to a caller whose email is verified.
+///
+/// Used by the endpoints that reach out to other people; an unverified account is
+/// refused with `403 EMAIL_NOT_VERIFIED`, which the client turns into a prompt to
+/// open the inbox (and offer a re-send) rather than a generic denial.
+async fn authenticate_verified(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+) -> Result<jiuyue_auth::AuthenticatedSession, ApiError> {
+    let token = bearer_token(headers)?;
+    state
+        .auth()?
+        .authenticate_verified(&token)
         .await
         .map_err(ApiError::from)
 }

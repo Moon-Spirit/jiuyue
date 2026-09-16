@@ -124,6 +124,25 @@ export async function apiGetAuthed<T>(path: string, token: string): Promise<T> {
   return payload as T;
 }
 
+/** `POST /api<path>` with a JSON body, expecting no content back. */
+export async function apiPostNoContent(
+  path: string,
+  body: unknown,
+): Promise<void> {
+  const response = await fetch(`/api${path}`, {
+    method: "POST",
+    headers: {
+      Accept: "application/json",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(body),
+  });
+
+  if (!response.ok) {
+    throw new ApiError(response.status, await readErrorBody(response));
+  }
+}
+
 /** `POST /api<path>` with a bearer token and no body (expects no content back). */
 export async function apiPostAuthedNoContent(
   path: string,

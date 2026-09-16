@@ -8,12 +8,16 @@ import CreateGroupForm from "../components/chat/CreateGroupForm.vue";
 import GroupInfoPanel from "../components/chat/GroupInfoPanel.vue";
 import MessageComposer from "../components/chat/MessageComposer.vue";
 import MessageList from "../components/chat/MessageList.vue";
+import PresenceBadge from "../components/chat/PresenceBadge.vue";
+import type { PresenceStatus } from "../generated/PresenceStatus";
 import { useAuthStore } from "../stores/auth";
 import { useChatStore } from "../stores/chat";
+import { usePresenceStore } from "../stores/presence";
 import { useRealtimeStore } from "../stores/realtime";
 
 const auth = useAuthStore();
 const chat = useChatStore();
+const presence = usePresenceStore();
 const realtime = useRealtimeStore();
 const router = useRouter();
 
@@ -88,6 +92,62 @@ const activePeerReceiptSeq = computed(() => {
   return peerReceipts.value[id] ?? 0;
 });
 
+/** The focused Conversation's peer id, or `null` for a Group (which has none). */
+const activePeerId = computed(() => activeConversation.value?.peer?.id ?? null);
+
+/** The focused peer's reachability, or `null` while nothing is known yet. */
+const activePeerStatus = computed<PresenceStatus | null>(() => {
+  const id = activePeerId.value;
+  return id === null ? null : presence.statusFor(id);
+});
+
+/** When the focused peer was last reachable; `null` while online or unknown. */
+const activePeerLastSeen = computed<number | null>(() => {
+  const id = activePeerId.value;
+  return id === null ? null : presence.lastSeenFor(id);
+});
+
+/**
+ * Every Direct peer's known presence, for the Conversation list's dots.
+ *
+ * Derived from the Conversation list rather than tracked per row, so a peer's
+ * status change re-renders the list from one authoritative map.
+ */
+const peerStatuses = computed<Record<string, PresenceStatus>>(() => {
+  const statuses: Record<string, PresenceStatus> = {};
+  for (const conversation of conversations.value) {
+    const peer = conversation.peer;
+    if (peer === null) continue;
+    const status = presence.statusFor(peer.id);
+    if (status !== null) statuses[peer.id] = status;
+  }
+  return statuses;
+});
+
+/**
+ * The Direct peers currently on screen, as a stable string key.
+ *
+ * Watching a joined key rather than the array means an in-place `unshift` of a new
+ * Conversation still triggers a presence read, which a shallow watch on the array
+ * reference would miss.
+ */
+const peerIdKey = computed(() =>
+  conversations.value
+    .filter((conversation) => conversation.peer !== null)
+    .map((conversation) => conversation.peer?.id ?? "")
+    .sort()
+    .join(","),
+);
+
+/** Ask the server for the current presence of every Direct peer. */
+function loadPresence(): void {
+  void presence.load(peerIdKey.value === "" ? [] : peerIdKey.value.split(","));
+}
+
+// The Conversation list is the seed: once the peers are known, ask for their
+// presence once, and let the socket keep it current from then on.
+watch(peerIdKey, loadPresence, { immediate: true });
+
 const SOCKET_LABELS: Record<SocketStatus, string> = {
   idle: "未连接",
   connecting: "连接中…",
@@ -105,7 +165,13 @@ onMounted(async () => {
 // report the read: its socket was not there to carry the `MarkRead` at entry
 // time. Idempotent, because the store only reports a position once.
 watch(connected, (isConnected) => {
-  if (isConnected) chat.markActiveRead();
+  if (isConnected) {
+    chat.markActiveRead();
+    // Presence events only arrive while the socket is up, so a reconnect is the
+    // moment to re-read the current state rather than trust a map that went stale
+    // while the user was disconnected.
+    loadPresence();
+  }
 });
 
 onUnmounted(() => {
@@ -183,6 +249,9 @@ async function dissolveGroup(): Promise<void> {
 
 async function signOut(): Promise<void> {
   realtime.disconnect();
+  // Presence belongs to the signed-in User: leaving it behind would show the next
+  // account the previous one's peers as online.
+  presence.clear();
   await auth.logout();
   await router.replace({ name: "login" });
 }
@@ -242,6 +311,7 @@ async function signOut(): Promise<void> {
         :active-id="activeConversationId"
         :loading="loadingConversations"
         :unread-counts="unreadCounts"
+        :presence="peerStatuses"
         @select="chat.openConversation($event)"
       />
 
@@ -271,6 +341,20 @@ async function signOut(): Promise<void> {
     </aside>
 
     <section class="flex min-w-0 flex-1 flex-col">
+      <p
+        v-if="user !== null && !user.email_verified"
+        class="flex items-center justify-between gap-3 border-b border-amber-200 bg-amber-50 px-4 py-2 text-xs text-amber-800 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-300"
+        data-test="verify-banner"
+      >
+        <span>邮箱尚未验证：验证后才能开始新的会话。</span>
+        <RouterLink
+          class="shrink-0 font-medium underline underline-offset-4"
+          :to="{ name: 'verify-email' }"
+        >
+          去验证
+        </RouterLink>
+      </p>
+
       <template v-if="activeConversation !== null">
         <header
           class="flex items-center justify-between gap-3 border-b border-zinc-200 bg-white px-4 py-3 dark:border-zinc-800 dark:bg-zinc-900"
@@ -282,9 +366,16 @@ async function signOut(): Promise<void> {
             >
               {{ conversationTitle }}
             </h2>
-            <p class="truncate text-xs text-zinc-500">
-              {{ conversationSubtitle }}
-            </p>
+            <div class="flex items-center gap-2">
+              <p class="truncate text-xs text-zinc-500">
+                {{ conversationSubtitle }}
+              </p>
+              <PresenceBadge
+                v-if="!isGroup"
+                :status="activePeerStatus"
+                :last-seen-ms="activePeerLastSeen"
+              />
+            </div>
           </div>
           <button
             v-if="isGroup"

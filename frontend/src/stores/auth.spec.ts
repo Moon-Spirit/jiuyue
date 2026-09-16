@@ -391,6 +391,142 @@ describe("useAuthStore", () => {
     expect(window.localStorage.getItem(REFRESH_KEY)).toBeNull();
   });
 
+  it("sends a reset request and treats every well-formed address the same", async () => {
+    const fetchMock = stubFetch({
+      "/api/auth/forgot-password": [
+        () => jsonResponse({ accepted: true }, 202),
+        () => jsonResponse({ accepted: true }, 202),
+      ],
+    });
+
+    const store = useAuthStore();
+    const known = await store.forgotPassword({ email: "  Alice@Example.COM " });
+    const unknown = await store.forgotPassword({ email: "nobody@example.com" });
+
+    expect(known).toBe(true);
+    expect(unknown).toBe(true);
+    expect(store.errorCode).toBeNull();
+
+    const { url, init } = callAt(fetchMock, 0);
+    expect(url).toBe("/api/auth/forgot-password");
+    expect(JSON.parse(String(init?.body))).toEqual({
+      email: "alice@example.com",
+    });
+  });
+
+  it("rejects a malformed recovery address before any request", async () => {
+    const fetchMock = stubFetch({});
+
+    const store = useAuthStore();
+    const ok = await store.forgotPassword({ email: "nope" });
+
+    expect(ok).toBe(false);
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(store.fieldErrors["email"]).toBe("邮箱格式不正确");
+  });
+
+  it("verifies an address and adopts the returned profile", async () => {
+    const fetchMock = stubFetch({
+      "/api/auth/verify-email": [
+        () =>
+          jsonResponse({
+            id: "01JABC1234567890ABCDEFGHJ1",
+            username: "alice",
+            email: "alice@example.com",
+            display_name: "alice",
+            avatar_url: null,
+            email_verified: true,
+            created_at_ms: 1_700_000_000_000,
+          }),
+      ],
+    });
+
+    const store = useAuthStore();
+    const profile = await store.verifyEmail("tok");
+
+    expect(profile?.email_verified).toBe(true);
+    expect(store.user?.email_verified).toBe(true);
+    expect(store.emailVerified).toBe(true);
+
+    const { url, init } = callAt(fetchMock, 0);
+    expect(url).toBe("/api/auth/verify-email");
+    expect(JSON.parse(String(init?.body))).toEqual({ token: "tok" });
+  });
+
+  it("surfaces an expired verification link distinctly", async () => {
+    stubFetch({
+      "/api/auth/verify-email": [
+        () =>
+          jsonResponse(
+            errorPayload("TOKEN_EXPIRED", "链接已过期，请重新获取一封邮件"),
+            410,
+          ),
+      ],
+    });
+
+    const store = useAuthStore();
+    const profile = await store.verifyEmail("stale");
+
+    expect(profile).toBeNull();
+    expect(store.errorCode).toBe("TOKEN_EXPIRED");
+  });
+
+  it("resets the password, drops the dead session and never sends the confirmation", async () => {
+    const fetchMock = stubFetch({
+      "/api/auth/login": [() => jsonResponse(sessionPayload())],
+      "/api/auth/reset-password": [() => new Response(null, { status: 204 })],
+    });
+
+    const store = useAuthStore();
+    await store.login({ email: "alice@example.com", password: "secret123" });
+
+    const ok = await store.resetPassword({
+      token: "tok",
+      password: "brand-new-1",
+      confirm: "brand-new-1",
+    });
+
+    expect(ok).toBe(true);
+    expect(store.isAuthenticated).toBe(false);
+    expect(window.localStorage.getItem(ACCESS_KEY)).toBeNull();
+
+    const { url, init } = callAt(fetchMock, 1);
+    expect(url).toBe("/api/auth/reset-password");
+    expect(JSON.parse(String(init?.body))).toEqual({
+      token: "tok",
+      password: "brand-new-1",
+    });
+  });
+
+  it("rejects a mismatched confirmation without a request", async () => {
+    const fetchMock = stubFetch({});
+
+    const store = useAuthStore();
+    const ok = await store.resetPassword({
+      token: "tok",
+      password: "secret123",
+      confirm: "secret124",
+    });
+
+    expect(ok).toBe(false);
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(store.fieldErrors["confirm"]).toBe("两次输入的密码不一致");
+  });
+
+  it("re-sends a verification link", async () => {
+    const fetchMock = stubFetch({
+      "/api/auth/resend-verification": [
+        () => jsonResponse({ accepted: true }, 202),
+      ],
+    });
+
+    const store = useAuthStore();
+    const ok = await store.resendVerification({ email: "alice@example.com" });
+
+    expect(ok).toBe(true);
+    expect(callAt(fetchMock, 0).url).toBe("/api/auth/resend-verification");
+  });
+
   it("records the whoami response from the protected endpoint", async () => {
     stubFetch({
       "/api/auth/login": [() => jsonResponse(sessionPayload())],

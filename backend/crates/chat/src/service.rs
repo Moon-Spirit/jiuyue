@@ -1129,6 +1129,26 @@ impl ChatService {
             .await
     }
 
+    /// The Users who share a Conversation with `user_id` — the audience for that
+    /// User's presence.
+    ///
+    /// Presence is not chat state, so this returns a **relationship**, not a
+    /// presence: it answers "who has a reason to care" and leaves the decision of
+    /// what to send, and the sending, to `jiuyue-realtime`. That split is the same
+    /// one [`SentMessage::participants`] draws for Message fan-out, and it is the
+    /// seam issue #27 narrows when "who can see my presence" becomes a setting.
+    ///
+    /// `candidates` narrows the answer to a caller-supplied set; `None` returns the
+    /// whole audience. A User with no Conversations has an empty audience, which is
+    /// a normal answer, not a failure.
+    pub async fn presence_audience(
+        &self,
+        user_id: &str,
+        candidates: Option<&[String]>,
+    ) -> Result<Vec<String>, ChatError> {
+        self.repository.presence_audience(user_id, candidates).await
+    }
+
     /// The Device's stored Sync Cursors, most recently advanced first.
     ///
     /// `device_id` is a `sessions` row id — the Device identity CONTEXT.md draws —

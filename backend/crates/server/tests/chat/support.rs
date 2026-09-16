@@ -21,13 +21,13 @@ use axum::Router;
 use axum::body::{Body, to_bytes};
 use axum::http::{Method, Request, StatusCode};
 use futures_util::{SinkExt, StreamExt};
-use jiuyue_auth::{AuthConfig, AuthService};
+use jiuyue_auth::{AuthConfig, AuthService, InMemoryMailer, Mailer};
 use jiuyue_chat::ChatService;
 use jiuyue_contract::{
     AuthSession, ClientEnvelope, ClientEvent, ConversationList, ConversationSummary, GroupInfo,
     MarkRead, MembershipChanged, MessageAck, MessageList, MessageRejected, MessageView, NewMessage,
-    ReadMarker, ReadReceipt, Resume, Resync, Role, SendMessage, ServerEnvelope, ServerEvent,
-    SyncCursor, SyncState,
+    Ping, Presence, PresenceList, ReadMarker, ReadReceipt, Resume, Resync, Role, SendMessage,
+    ServerEnvelope, ServerEvent, SyncCursor, SyncState,
 };
 use jiuyue_realtime::{HEARTBEAT_INTERVAL, RealtimeHub};
 use jiuyue_server::{AppState, Config, Services, app};
@@ -56,7 +56,11 @@ pub struct TestApp {
     store: Store,
     admin_url: String,
     schema: String,
+    mailer: Arc<InMemoryMailer>,
 }
+
+/// How long a test waits for a queued email to be captured.
+pub const MAIL_TIMEOUT: Duration = Duration::from_secs(5);
 
 impl TestApp {
     /// Create a uniquely named schema, migrate it, and build the real router.
@@ -95,12 +99,18 @@ impl TestApp {
             .expect("migrations must apply to an empty schema");
 
         let pool = store.pool().clone();
-        let auth = AuthService::new(pool.clone(), AuthConfig::new(TEST_SECRET))
+        // A capturing transport, so `register` below can follow the verification
+        // link the server queued (the chat actions under test are gated on it).
+        let mailer = Arc::new(InMemoryMailer::new());
+        let auth = AuthService::builder(pool.clone(), AuthConfig::new(TEST_SECRET))
+            .mailer(Arc::clone(&mailer) as Arc<dyn Mailer>)
+            .build()
             .await
             .expect("the identity service must build with a valid secret");
-        let chat = Arc::new(ChatService::new(pool));
+        let chat = Arc::new(ChatService::new(pool.clone()));
         let realtime = Arc::new(RealtimeHub::with_settings(
             Arc::clone(&chat),
+            pool,
             heartbeat,
             jiuyue_realtime::DEFAULT_REPLAY_CAPACITY,
         ));
@@ -119,6 +129,7 @@ impl TestApp {
             store,
             admin_url,
             schema,
+            mailer,
         }
     }
 
@@ -127,9 +138,25 @@ impl TestApp {
         app(self.state.clone())
     }
 
+    /// The captured-mail transport, for following a verification link.
+    pub fn mailer(&self) -> &InMemoryMailer {
+        &self.mailer
+    }
+
     /// The pool writing into this test's schema, for direct assertions.
     pub fn pool(&self) -> &PgPool {
         self.store.pool()
+    }
+
+    /// The realtime hub this instance serves with.
+    ///
+    /// Exposed so a test can ask the process-level question directly — "does this
+    /// node believe the User is online" — which is what proves a restart starts
+    /// from an empty registry rather than from whatever the last one knew.
+    pub fn realtime(&self) -> Arc<RealtimeHub> {
+        self.state
+            .realtime()
+            .expect("the harness always configures the realtime subsystem")
     }
 
     /// Bind the real router to an ephemeral port and return the WebSocket URL.
@@ -159,8 +186,17 @@ impl TestApp {
     }
 }
 
-/// Register successfully and return the parsed session.
-pub async fn register(app: &TestApp, username: &str, email: &str, password: &str) -> AuthSession {
+/// Register successfully and return the parsed session, without verifying it.
+///
+/// Use this only for tests about the unverified state itself; most callers want
+/// [`register`], which verifies the address because the chat actions under test
+/// are gated on it.
+pub async fn register_unverified(
+    app: &TestApp,
+    username: &str,
+    email: &str,
+    password: &str,
+) -> AuthSession {
     let (status, body) = post_json(
         app,
         "/auth/register",
@@ -175,6 +211,62 @@ pub async fn register(app: &TestApp, username: &str, email: &str, password: &str
     );
 
     serde_json::from_value(body).expect("the registration response must match AuthSession")
+}
+
+/// Register an account and follow the verification link it was emailed.
+///
+/// Opening a Conversation is gated on a verified address, so the shared chat
+/// fixture does what a real user does before their first chat. The returned
+/// session was captured before verification, so its `user.email_verified` is
+/// still `false`; the account in the database is verified.
+pub async fn register(app: &TestApp, username: &str, email: &str, password: &str) -> AuthSession {
+    let session = register_unverified(app, username, email, password).await;
+
+    let token = wait_for_verification_token(app, email).await;
+    let (status, body) = post_json(app, "/auth/verify-email", &json!({ "token": token })).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the fixture must verify {email}: {body}"
+    );
+
+    session
+}
+
+/// Wait until a verification email has been captured for `email`, then return its
+/// token.
+///
+/// Identified by the link's path, not by arrival order: registration's own
+/// verification mail is queued on a spawned task, so a test polls (bounded by
+/// [`MAIL_TIMEOUT`]) instead of sleeping a guessed interval.
+pub async fn wait_for_verification_token(app: &TestApp, email: &str) -> String {
+    const VERIFY_LINK: &str = "/verify-email?token=";
+    let deadline = tokio::time::Instant::now() + MAIL_TIMEOUT;
+
+    loop {
+        if let Some(message) = app
+            .mailer()
+            .messages_to(email)
+            .into_iter()
+            .rev()
+            .find(|message| message.text.contains(VERIFY_LINK))
+        {
+            let link = InMemoryMailer::first_link(&message)
+                .unwrap_or_else(|| panic!("the message carried no link: {message:?}"));
+
+            return link
+                .split("token=")
+                .nth(1)
+                .unwrap_or_else(|| panic!("the link carried no token: {link}"))
+                .to_owned();
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            panic!("no verification email reached the mailbox for {email} within {MAIL_TIMEOUT:?}");
+        }
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 /// Log in an existing account, opening a second Device for it.
@@ -406,6 +498,20 @@ pub fn mark_read(conversation_id: &str, last_seq: i64) -> ClientEvent {
     })
 }
 
+/// A client heartbeat.
+///
+/// This is the liveness evidence the server's dead-connection sweep works from:
+/// a connection the server has never heard a heartbeat from is never swept, so
+/// only a client that sends one can be declared dead. The payload is not used —
+/// the arrival of the frame is the whole signal.
+pub fn heartbeat() -> ClientEvent {
+    ClientEvent::Ping(Ping {
+        seq: 0,
+        time_ms: 0,
+        connection_id: None,
+    })
+}
+
 /// Read the REST repair loop: every Message strictly after `cursor`, oldest first.
 ///
 /// This is what the client does after a reconnect: pull forward pages until the
@@ -585,6 +691,19 @@ pub async fn expect_membership_changed(socket: &mut TestSocket) -> MembershipCha
     }
 }
 
+/// Read until the next presence change arrives, ignoring everything else.
+///
+/// The server sends one only when a User's reachability actually changes, so
+/// getting here at all is a proof that the transition was observed — there is no
+/// periodic presence traffic to mistake for it.
+pub async fn expect_presence(socket: &mut TestSocket) -> Presence {
+    loop {
+        if let ServerEvent::Presence(presence) = next_event(socket).await {
+            return presence;
+        }
+    }
+}
+
 /// Every non-heartbeat event a socket receives within `timeout`.
 ///
 /// Used to assert an **absence**: the privacy test drains a peer's socket for a
@@ -691,6 +810,18 @@ pub async fn get_without_token(app: &TestApp, path: &str) -> (StatusCode, Value)
         .expect("the request must build");
 
     send(app, request).await
+}
+
+/// `GET /presence?user_ids=…` — the caller's visibility-filtered presence view.
+///
+/// The ids travel as a comma-separated list, exactly as the frontend sends them;
+/// a requested User the caller shares no Conversation with is simply absent.
+pub async fn list_presence(app: &TestApp, token: &str, user_ids: &[&str]) -> PresenceList {
+    let path = format!("/presence?user_ids={}", user_ids.join(","));
+    let (status, body) = get_with_token(app, &path, token).await;
+    assert_eq!(status, StatusCode::OK, "presence must load: {body}");
+
+    serde_json::from_value(body).expect("the response must match PresenceList")
 }
 
 /// Drive one request through the real router and parse the JSON response.
@@ -876,6 +1007,48 @@ pub async fn wait_for_device_cursor(
                  stored cursors: {:?}",
                 device_cursors_for_user(pool, user_id, conversation_id).await
             );
+        }
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// One User's stored last-seen instant, in milliseconds since the Unix epoch.
+///
+/// Read straight from `user_presence`, so it proves the instant lives in
+/// PostgreSQL rather than in a hub's memory. `None` means no row: a User who has
+/// not been seen since the table existed.
+///
+/// `floor` rather than a bare cast: PostgreSQL *rounds* on a numeric-to-integer
+/// cast, while the service floors (`unix_timestamp() * 1000 + millisecond()`), and
+/// a helper that disagreed with the service by one millisecond half the time would
+/// be a flake, not an assertion.
+pub async fn stored_last_seen(pool: &PgPool, user_id: &str) -> Option<i64> {
+    sqlx::query_scalar(
+        "SELECT floor(extract(epoch FROM last_seen_at) * 1000)::bigint \
+         FROM user_presence WHERE user_id = $1",
+    )
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await
+    .unwrap_or_else(|error| panic!("reading user_presence must succeed: {error}"))
+}
+
+/// Wait until a User has a stored last-seen instant, and return it.
+///
+/// The offline checkpoint is written from the connection's teardown path, which is
+/// asynchronous with respect to the client dropping its socket; polling is how a
+/// test waits for that without racing a fixed sleep.
+pub async fn wait_for_last_seen(pool: &PgPool, user_id: &str) -> i64 {
+    let deadline = tokio::time::Instant::now() + EVENT_TIMEOUT;
+
+    loop {
+        if let Some(instant) = stored_last_seen(pool, user_id).await {
+            return instant;
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            panic!("no last-seen instant for {user_id} within {EVENT_TIMEOUT:?}");
         }
 
         tokio::time::sleep(Duration::from_millis(20)).await;

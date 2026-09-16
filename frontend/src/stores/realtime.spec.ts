@@ -69,6 +69,21 @@ function sentFrames(socket: FakeWebSocket): Record<string, unknown>[] {
   return socket.sent.map((text) => JSON.parse(text) as Record<string, unknown>);
 }
 
+/** The client frames of one event type, in order, ignoring every other frame. */
+function framesOfType(
+  socket: FakeWebSocket,
+  type: string,
+): Record<string, unknown>[] {
+  return sentFrames(socket).filter((frame) => {
+    const event = frame["e"];
+    return (
+      typeof event === "object" &&
+      event !== null &&
+      (event as Record<string, unknown>)["t"] === type
+    );
+  });
+}
+
 const ACCESS_KEY = "jiuyue.auth.access_token";
 
 describe("useRealtimeStore", () => {
@@ -265,9 +280,70 @@ describe("useRealtimeStore", () => {
     socket.emitMessage(connectionPing(1, 1_000, 7));
 
     expect(store.connectionId).toBe(7);
-    expect(sentFrames(socket)).toEqual([
+    expect(framesOfType(socket, "Resume")).toEqual([
       { v: 1, e: { t: "Resume", d: { last_seq: 0, connection_id: null } } },
     ]);
+  });
+
+  it("answers every server heartbeat with a client one", () => {
+    const store = useRealtimeStore();
+    store.connect();
+    const socket = FakeWebSocket.latest();
+    socket.emitOpen();
+
+    socket.emitMessage(connectionPing(1, 1_000, 7));
+    socket.emitMessage(connectionPing(2, 2_000, 7));
+
+    // The server can only tell a half-open socket from a live one if the client
+    // keeps talking; without this reply it would never be able to sweep a dead
+    // peer. The echo carries the server's own sequence and names no connection.
+    const beats = framesOfType(socket, "Ping");
+    expect(beats).toHaveLength(2);
+    expect(beats[0]).toEqual({
+      v: 1,
+      e: {
+        t: "Ping",
+        d: { seq: 1, time_ms: expect.any(Number), connection_id: null },
+      },
+    });
+    expect(beats[1]).toEqual({
+      v: 1,
+      e: {
+        t: "Ping",
+        d: { seq: 2, time_ms: expect.any(Number), connection_id: null },
+      },
+    });
+  });
+
+  it("routes presence to its own subscribers, not to the chat store", () => {
+    const store = useRealtimeStore();
+    const chat: string[] = [];
+    const seen: string[] = [];
+    store.onChatEvent((event) => chat.push(event.t));
+    store.onPresenceEvent((presence) => seen.push(presence.status));
+
+    store.connect();
+    const socket = FakeWebSocket.latest();
+    socket.emitOpen();
+
+    socket.emitMessage(
+      JSON.stringify({
+        v: 1,
+        s: 1,
+        ts: 2_000,
+        e: {
+          t: "Presence",
+          d: {
+            user_id: "01JABC1234567890ABCDEFGHJ3",
+            status: "offline",
+            last_seen_ms: 1_750_000_000_000,
+          },
+        },
+      }),
+    );
+
+    expect(seen).toEqual(["offline"]);
+    expect(chat).toEqual([]);
   });
 
   it("detects a hole in the connection sequence and asks to resume", () => {
@@ -285,7 +361,7 @@ describe("useRealtimeStore", () => {
 
     expect(store.sequence).toBe(3);
     expect(resyncs).toEqual(["unavailable"]);
-    expect(sentFrames(socket)[1]).toEqual({
+    expect(framesOfType(socket, "Resume")[1]).toEqual({
       v: 1,
       e: { t: "Resume", d: { last_seq: 1, connection_id: 7 } },
     });
@@ -314,7 +390,7 @@ describe("useRealtimeStore", () => {
     expect(resyncs).toEqual([]);
     // The handshake names the position consumed on the dead connection so the
     // server can answer `unavailable` (it does) rather than assume continuity.
-    expect(sentFrames(second)).toEqual([
+    expect(framesOfType(second, "Resume")).toEqual([
       { v: 1, e: { t: "Resume", d: { last_seq: 1, connection_id: null } } },
     ]);
   });

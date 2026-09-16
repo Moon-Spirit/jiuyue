@@ -28,6 +28,23 @@ const router = createRouter({
       component: () => import("../views/RegisterView.vue"),
     },
     {
+      // The three email journeys. All are reachable without a session: a link
+      // from a mail client is followed in whatever browser opened it.
+      path: "/verify-email",
+      name: "verify-email",
+      component: () => import("../views/VerifyEmailView.vue"),
+    },
+    {
+      path: "/forgot-password",
+      name: "forgot-password",
+      component: () => import("../views/ForgotPasswordView.vue"),
+    },
+    {
+      path: "/reset-password",
+      name: "reset-password",
+      component: () => import("../views/ResetPasswordView.vue"),
+    },
+    {
       path: "/health",
       name: "health",
       component: () => import("../views/HealthView.vue"),

@@ -16,6 +16,18 @@ futures-util = { version = "0.3", features = ["sink"] }
 jiuyue-chat = { path = "../chat" }
 jiuyue-contract = { path = "../contract" }
 serde_json.workspace = true
+
+# `user_presence` is this crate's own table (ADR-0011: one table, one owning
+# crate). Reachability is process state, but the last-seen instant is the durable
+# half of presence, and this crate — not the transport layer of `jiuyue-server` —
+# is where the presence domain lives. Queries are runtime-checked, like every
+# other crate in this workspace, so building never needs a database.
+sqlx = { version = "0.8", default-features = false, features = [
+    "postgres",
+    "runtime-tokio",
+    "tls-rustls",
+    "time",
+] }
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true

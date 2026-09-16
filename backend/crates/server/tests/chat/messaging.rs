@@ -6,7 +6,7 @@
 //! is unique and gapless even when two connections send at once.
 
 use axum::http::StatusCode;
-use jiuyue_contract::{ErrorCode, MessageList};
+use jiuyue_contract::{ErrorCode, MessageList, ServerEvent};
 use std::time::Duration;
 
 use crate::support::{
@@ -220,9 +220,13 @@ async fn a_concurrent_duplicate_send_fans_out_exactly_once() {
     let pushed = expect_new_message(&mut bob_socket).await;
     assert_eq!(pushed.message.id, one.message.id);
 
+    // Both of Alice's sockets are dropped when the spawned tasks end, so her
+    // presence legitimately goes offline in this window; that is a different
+    // feature. What this asserts is the thing under test: the racing duplicate
+    // must not fan out a *second* NewMessage.
     let unexpected = next_event_within(&mut bob_socket, Duration::from_millis(750)).await;
     assert!(
-        unexpected.is_none(),
+        !matches!(unexpected, Some(ServerEvent::NewMessage(_))),
         "a racing duplicate must not fan out a second NewMessage, got {unexpected:?}"
     );
 

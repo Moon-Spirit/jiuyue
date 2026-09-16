@@ -1126,6 +1126,12 @@ export const useChatStore = defineStore("chat", () => {
       case "ReadReceipt":
         applyReadReceipt(event.d);
         break;
+      case "Presence":
+        // Presence is not chat state: the realtime store routes it to the presence
+        // store's own subscription, so it never reaches this reducer. The case
+        // exists because the tagged union is exhaustive — the compiler refuses to
+        // let a new event type go unconsidered.
+        break;
       default:
         assertExhaustive(event);
     }

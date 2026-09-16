@@ -77,23 +77,46 @@
 //!   crosses [`CURSOR_CHECKPOINT_BATCH`] — never one write per Message. A crash
 //!   between checkpoints loses at most one heartbeat interval, which the Device
 //!   re-fetches harmlessly.
+//!
+//! # Presence and last-seen
+//!
+//! A **User** is online while any of their Devices is connected, and offline only
+//! when the last one goes — Presence is per User, where a Sync Cursor is per
+//! Device (CONTEXT.md). The [`ConnectionRegistry`] counts the Devices, so
+//! [`ConnectionRegistry::register`] and [`ConnectionRegistry::unregister`] report
+//! the first and the last connection as a [`PresenceChange`]; the hub turns that
+//! into a `ServerEvent::Presence` for the Participants of a shared Conversation
+//! and nothing else. Reachability itself lives in this process's memory, so a
+//! restart empties it and no User can be left stuck online; the last-seen instant
+//! is the durable half, checkpointed into `user_presence` by
+//! [`LastSeenStore`] under the same batched discipline as the cursors above.
+//!
+//! A connection that goes silent without closing — a severed network, a killed
+//! client with no FIN — is swept once its client heartbeat is overdue: see
+//! `ConnectionLiveness` and [`RealtimeHub::dead_connection_timeout`]. A client
+//! that never sends a heartbeat is never swept, which is what keeps the sweep
+//! additive for a client written against the older contract.
 
 #![forbid(unsafe_code)]
 
 mod connection;
 mod cursor;
+mod liveness;
+mod presence;
 mod registry;
 mod replay;
 mod session;
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use jiuyue_chat::ChatService;
+use sqlx::PgPool;
 use thiserror::Error;
 
 pub use connection::serve_connection;
-pub use registry::{ConnectionId, ConnectionRegistry};
+pub use presence::LastSeenStore;
+pub use registry::{ConnectionId, ConnectionRegistry, PresenceChange};
 pub use replay::{DEFAULT_REPLAY_CAPACITY, ReplayBuffer};
 
 /// Hard cap on a single WebSocket frame (64 KiB).
@@ -141,6 +164,28 @@ pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 /// between two heartbeats.
 pub const CURSOR_CHECKPOINT_BATCH: usize = 64;
 
+/// How many Users one presence checkpoint coalesces before it writes without
+/// waiting for the next heartbeat.
+///
+/// The same write-amplification guard as [`CURSOR_CHECKPOINT_BATCH`], on a set
+/// that is process-wide rather than per connection: presence changes are one per
+/// User transition, so this bounds the pending set on a busy node while a normal
+/// heartbeat flush (one statement for every online User) stays the common path.
+pub const PRESENCE_CHECKPOINT_BATCH: usize = 512;
+
+/// How many consecutive client heartbeats a silent connection may miss before the
+/// server closes it.
+///
+/// The heartbeat is every [`HEARTBEAT_INTERVAL`], so **a dead connection can hold
+/// a User online for at most three beats — 90 s at the production 30 s period**,
+/// and in practice at most four (the sweep runs on the heartbeat tick, so the
+/// detection lands between the third and fourth). Three rather than one because a
+/// single lost beat must not flap a live client (a GC pause, a burst, a brief
+/// network hiccup), and it is deliberately close to the client's own 75 s
+/// (`2.5 × 30 s`) staleness deadline in ADR-0013 — the two ends of the same link
+/// should give up at roughly the same moment.
+pub const DEAD_CONNECTION_BEATS: u32 = 3;
+
 /// The authenticated Device a connection belongs to (CONTEXT.md: Device).
 ///
 /// A Device is a `sessions` row — a logged-in client instance — and it is the
@@ -171,47 +216,64 @@ pub enum RealtimeError {
     /// The peer closed the connection while a send was pending.
     #[error("the realtime connection was closed")]
     Closed,
+
+    /// The audience for a User's presence could not be resolved.
+    ///
+    /// Presence fan-out asks the chat domain who shares a Conversation with the
+    /// User; a failure there degrades the *hint* — the connection itself is
+    /// unaffected — but the reason must not be swallowed.
+    #[error("could not resolve a presence audience")]
+    Chat(#[from] jiuyue_chat::ChatError),
+
+    /// The presence store could not be read or written.
+    #[error("the presence store failed")]
+    Presence(#[from] sqlx::Error),
 }
 
 /// Everything a live connection needs beyond its socket.
 ///
-/// One hub per process: it owns the connection registry and the chat service, so a
-/// connection can persist a Message and fan it out without reaching into either
-/// domain's internals. It also carries the two tunables the socket loop reads —
-/// the heartbeat period and the replay-buffer capacity — so tests can pin them
+/// One hub per process: it owns the connection registry, the chat service and the
+/// presence store, so a connection can persist a Message, fan it out and record a
+/// User's reachability without reaching into either domain's internals. It also
+/// carries the three tunables the socket loop reads — the heartbeat period, the
+/// replay-buffer capacity and the dead-connection deadline — so tests can pin them
 /// without touching global state.
 pub struct RealtimeHub {
     registry: ConnectionRegistry,
     chat: Arc<ChatService>,
+    presence: presence::PresenceState,
     heartbeat_interval: Duration,
     replay_capacity: usize,
+    dead_connection_timeout: Duration,
 }
 
 impl RealtimeHub {
-    /// Build a hub over the chat service, with the production defaults.
-    pub fn new(chat: Arc<ChatService>) -> Self {
-        Self {
-            registry: ConnectionRegistry::new(),
-            chat,
-            heartbeat_interval: HEARTBEAT_INTERVAL,
-            replay_capacity: DEFAULT_REPLAY_CAPACITY,
-        }
+    /// Build a hub over the chat service and the presence store, with the
+    /// production defaults.
+    pub fn new(chat: Arc<ChatService>, pool: PgPool) -> Self {
+        Self::with_settings(chat, pool, HEARTBEAT_INTERVAL, DEFAULT_REPLAY_CAPACITY)
     }
 
     /// Build a hub with an explicit heartbeat period and replay capacity.
     ///
-    /// Exists so tests can exercise the heartbeat and buffer eviction with
-    /// milliseconds instead of seconds, without weakening the production values.
+    /// Exists so tests can exercise the heartbeat, the buffer eviction and the
+    /// presence sweep with milliseconds instead of seconds, without weakening the
+    /// production values. The dead-connection deadline is derived from the
+    /// heartbeat ([`DEAD_CONNECTION_BEATS`]), so shortening one shortens the other
+    /// and a test never has to wait 90 s to watch a sweep.
     pub fn with_settings(
         chat: Arc<ChatService>,
+        pool: PgPool,
         heartbeat_interval: Duration,
         replay_capacity: usize,
     ) -> Self {
         Self {
             registry: ConnectionRegistry::new(),
             chat,
+            presence: presence::PresenceState::new(pool),
             heartbeat_interval,
             replay_capacity,
+            dead_connection_timeout: heartbeat_interval * DEAD_CONNECTION_BEATS,
         }
     }
 
@@ -234,4 +296,10 @@ impl RealtimeHub {
     pub fn replay_capacity(&self) -> usize {
         self.replay_capacity
     }
+}
+
+/// Current wall-clock time as milliseconds since the Unix epoch.
+pub(crate) fn now_ms() -> Result<i64, RealtimeError> {
+    let elapsed = SystemTime::now().duration_since(UNIX_EPOCH)?;
+    i64::try_from(elapsed.as_millis()).map_err(|_| RealtimeError::ClockRange)
 }

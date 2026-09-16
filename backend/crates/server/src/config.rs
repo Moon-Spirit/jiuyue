@@ -57,6 +57,15 @@ pub enum ConfigError {
         /// The rejected raw value.
         value: String,
     },
+
+    /// A URL variable was set but is not an absolute `http(s)` URL.
+    #[error("environment variable `{name}` must be an absolute http(s) URL, got `{value}`")]
+    InvalidUrl {
+        /// Name of the offending variable.
+        name: &'static str,
+        /// The rejected raw value.
+        value: String,
+    },
 }
 
 /// Runtime configuration for the server.
@@ -76,6 +85,18 @@ pub struct Config {
     pub access_token_ttl: Duration,
     /// Refresh-token lifetime, in seconds, from `REFRESH_TOKEN_TTL_SECS`.
     pub refresh_token_ttl: Duration,
+    /// Public origin the frontend is served from, from `APP_BASE_URL`. Used to
+    /// build the links inside verification and reset emails.
+    pub public_base_url: String,
+    /// Verification-link lifetime, in seconds, from `EMAIL_VERIFICATION_TTL_SECS`.
+    pub verification_token_ttl: Duration,
+    /// Reset-link lifetime, in seconds, from `PASSWORD_RESET_TTL_SECS`.
+    pub reset_token_ttl: Duration,
+    /// Transactional-mail transport, from `SMTP_URL`. `None` means "no provider
+    /// configured", which selects the development transport. The shipped build
+    /// carries no provider implementation, so setting this makes startup fail
+    /// rather than let the process pretend to deliver password-reset mail.
+    pub smtp_url: Option<String>,
 }
 
 impl Default for Config {
@@ -87,6 +108,10 @@ impl Default for Config {
             jwt_secret: None,
             access_token_ttl: DEFAULT_ACCESS_TOKEN_TTL,
             refresh_token_ttl: DEFAULT_REFRESH_TOKEN_TTL,
+            public_base_url: DEFAULT_PUBLIC_BASE_URL.to_owned(),
+            verification_token_ttl: DEFAULT_VERIFICATION_TOKEN_TTL,
+            reset_token_ttl: DEFAULT_RESET_TOKEN_TTL,
+            smtp_url: None,
         }
     }
 }
@@ -97,6 +122,17 @@ pub const DEFAULT_ACCESS_TOKEN_TTL: Duration = Duration::from_secs(15 * 60);
 /// Default refresh-token lifetime (30 days).
 pub const DEFAULT_REFRESH_TOKEN_TTL: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
+/// Default public origin for email links, taken from the identity module so the
+/// two can never disagree (the Vite dev server's origin).
+pub const DEFAULT_PUBLIC_BASE_URL: &str = jiuyue_auth::AuthConfig::DEFAULT_PUBLIC_BASE_URL;
+
+/// Default verification-link lifetime, taken from the identity module (24 hours).
+pub const DEFAULT_VERIFICATION_TOKEN_TTL: Duration =
+    jiuyue_auth::AuthConfig::DEFAULT_VERIFICATION_TOKEN_TTL;
+
+/// Default reset-link lifetime, taken from the identity module (1 hour).
+pub const DEFAULT_RESET_TOKEN_TTL: Duration = jiuyue_auth::AuthConfig::DEFAULT_RESET_TOKEN_TTL;
+
 /// Values read from the environment, before defaults and parsing.
 #[derive(Debug, Default, Clone)]
 struct RawConfig {
@@ -106,6 +142,10 @@ struct RawConfig {
     jwt_secret: Option<String>,
     access_token_ttl_secs: Option<String>,
     refresh_token_ttl_secs: Option<String>,
+    app_base_url: Option<String>,
+    verification_token_ttl_secs: Option<String>,
+    password_reset_ttl_secs: Option<String>,
+    smtp_url: Option<String>,
 }
 
 impl Config {
@@ -125,6 +165,10 @@ impl Config {
             jwt_secret: read_var("JWT_SECRET")?,
             access_token_ttl_secs: read_var("ACCESS_TOKEN_TTL_SECS")?,
             refresh_token_ttl_secs: read_var("REFRESH_TOKEN_TTL_SECS")?,
+            app_base_url: read_var("APP_BASE_URL")?,
+            verification_token_ttl_secs: read_var("EMAIL_VERIFICATION_TTL_SECS")?,
+            password_reset_ttl_secs: read_var("PASSWORD_RESET_TTL_SECS")?,
+            smtp_url: read_var("SMTP_URL")?,
         })
     }
 
@@ -171,7 +215,42 @@ impl Config {
                 defaults.refresh_token_ttl,
                 "REFRESH_TOKEN_TTL_SECS",
             )?,
+            public_base_url: base_url(raw.app_base_url, defaults.public_base_url)?,
+            verification_token_ttl: ttl(
+                raw.verification_token_ttl_secs,
+                defaults.verification_token_ttl,
+                "EMAIL_VERIFICATION_TTL_SECS",
+            )?,
+            reset_token_ttl: ttl(
+                raw.password_reset_ttl_secs,
+                defaults.reset_token_ttl,
+                "PASSWORD_RESET_TTL_SECS",
+            )?,
+            smtp_url: non_empty(raw.smtp_url).map(|value| value.trim().to_owned()),
         })
+    }
+}
+
+/// Parse the public base URL, defaulting when blank and rejecting a value that
+/// could never be a link origin.
+///
+/// A trailing slash is trimmed so `https://a.example/` and `https://a.example`
+/// both build the same link prefix.
+fn base_url(value: Option<String>, default: String) -> Result<String, ConfigError> {
+    match non_empty(value) {
+        Some(raw) => {
+            let trimmed = raw.trim().trim_end_matches('/').to_owned();
+
+            if !(trimmed.starts_with("http://") || trimmed.starts_with("https://")) {
+                return Err(ConfigError::InvalidUrl {
+                    name: "APP_BASE_URL",
+                    value: raw,
+                });
+            }
+
+            Ok(trimmed)
+        }
+        None => Ok(default),
     }
 }
 
@@ -215,8 +294,9 @@ fn ttl(
 #[cfg(test)]
 mod tests {
     use super::{
-        Config, ConfigError, DEFAULT_ACCESS_TOKEN_TTL, DEFAULT_PORT, DEFAULT_REFRESH_TOKEN_TTL,
-        DEFAULT_RUST_LOG, RawConfig,
+        Config, ConfigError, DEFAULT_ACCESS_TOKEN_TTL, DEFAULT_PORT, DEFAULT_PUBLIC_BASE_URL,
+        DEFAULT_REFRESH_TOKEN_TTL, DEFAULT_RESET_TOKEN_TTL, DEFAULT_RUST_LOG,
+        DEFAULT_VERIFICATION_TOKEN_TTL, RawConfig,
     };
 
     fn raw() -> RawConfig {
@@ -338,5 +418,69 @@ mod tests {
         assert_eq!(config.jwt_secret, None);
         assert!(config.require_database_url().is_err());
         assert!(config.require_jwt_secret().is_err());
+    }
+
+    #[test]
+    fn email_settings_default_when_absent() {
+        let config = Config::from_raw(raw()).expect("the required values are present");
+
+        assert_eq!(config.public_base_url, DEFAULT_PUBLIC_BASE_URL);
+        assert_eq!(
+            config.verification_token_ttl,
+            DEFAULT_VERIFICATION_TOKEN_TTL
+        );
+        assert_eq!(config.reset_token_ttl, DEFAULT_RESET_TOKEN_TTL);
+        assert_eq!(
+            config.smtp_url, None,
+            "no provider configured means the development transport"
+        );
+    }
+
+    #[test]
+    fn explicit_email_settings_override_defaults_and_trim_the_origin() {
+        let config = Config::from_raw(RawConfig {
+            app_base_url: Some("  https://jiuyue.example/  ".to_owned()),
+            verification_token_ttl_secs: Some("60".to_owned()),
+            password_reset_ttl_secs: Some("120".to_owned()),
+            smtp_url: Some("smtp://mail.example".to_owned()),
+            ..raw()
+        })
+        .expect("explicit email settings must load");
+
+        assert_eq!(
+            config.public_base_url, "https://jiuyue.example",
+            "a trailing slash must not survive into the link prefix"
+        );
+        assert_eq!(config.verification_token_ttl.as_secs(), 60);
+        assert_eq!(config.reset_token_ttl.as_secs(), 120);
+        assert_eq!(config.smtp_url.as_deref(), Some("smtp://mail.example"));
+    }
+
+    #[test]
+    fn a_non_http_base_url_is_rejected() {
+        let error = Config::from_raw(RawConfig {
+            app_base_url: Some("jiuyue.example".to_owned()),
+            ..raw()
+        })
+        .expect_err("a base URL without a scheme must be rejected");
+
+        assert!(matches!(
+            error,
+            ConfigError::InvalidUrl {
+                name: "APP_BASE_URL",
+                ref value,
+            } if value == "jiuyue.example"
+        ));
+    }
+
+    #[test]
+    fn a_blank_smtp_url_means_no_provider() {
+        let config = Config::from_raw(RawConfig {
+            smtp_url: Some("   ".to_owned()),
+            ..raw()
+        })
+        .expect("a blank optional value must fall back to the default");
+
+        assert_eq!(config.smtp_url, None);
     }
 }

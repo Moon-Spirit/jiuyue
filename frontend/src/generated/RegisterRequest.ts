@@ -3,8 +3,10 @@
 /**
  * `POST /auth/register` body.
  *
- * Registration does not require email verification yet; the account is usable
- * immediately with `email_verified` false until a later ticket changes that.
+ * Registration succeeds and signs the new Device in immediately; the account
+ * starts with `email_verified` false and a verification link is emailed. Some
+ * actions (opening a Conversation) are gated on verification — see
+ * `docs/adr/0015-email-verification-and-the-mailer-seam.md`.
  */
 export type RegisterRequest = { 
 /**

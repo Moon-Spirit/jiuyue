@@ -38,6 +38,12 @@ function testRouter(): Router {
         name: "register",
         component: { template: "<div />" },
       },
+      {
+        // The view links here; the route must resolve for the mount to work.
+        path: "/forgot-password",
+        name: "forgot-password",
+        component: { template: "<div />" },
+      },
     ],
   });
 }

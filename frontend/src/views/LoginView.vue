@@ -74,6 +74,15 @@ async function submit(): Promise<void> {
           {{ errorMessage }}
         </p>
 
+        <p class="text-right">
+          <RouterLink
+            class="text-xs font-medium text-zinc-500 underline-offset-4 hover:underline dark:text-zinc-400"
+            :to="{ name: 'forgot-password' }"
+          >
+            忘记密码？
+          </RouterLink>
+        </p>
+
         <p
           v-if="retryAfterSeconds !== null"
           class="rounded-lg bg-amber-50 p-3 text-xs leading-relaxed text-amber-800 dark:bg-amber-950/50 dark:text-amber-200"

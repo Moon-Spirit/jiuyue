@@ -21,6 +21,16 @@ pub enum Error {
     #[error(transparent)]
     Store(#[from] jiuyue_store::StoreError),
 
+    /// `SMTP_URL` was set, but this build ships no transactional-mail provider to
+    /// deliver through it. Refusing to start is deliberate: the alternative is a
+    /// process that accepts registrations and password resets while every link it
+    /// "sends" lands in a log file.
+    #[error(
+        "SMTP_URL is set but this build has no transactional-mail provider; \
+         unset it to use the development transport, or ship an SMTP-backed `Mailer`"
+    )]
+    MailTransportUnsupported,
+
     /// Identity could not be initialised (for example a rejected signing secret).
     #[error(transparent)]
     Auth(#[from] jiuyue_auth::AuthError),

@@ -12,7 +12,7 @@
 //! an envelope the replay buffer never saw — which would make a later replay punch
 //! a hole in the client's gap arithmetic.
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 
 use jiuyue_contract::{
     ClientEnvelope, ClientEvent, MarkRead, MessageAck, MessageRejected, NewMessage, Ping,
@@ -22,8 +22,9 @@ use jiuyue_contract::{
 use tokio::sync::mpsc;
 
 use crate::cursor::CursorCheckpoint;
+use crate::liveness::ConnectionLiveness;
 use crate::replay::ReplayBuffer;
-use crate::{Device, RealtimeError, RealtimeHub};
+use crate::{Device, RealtimeError, RealtimeHub, now_ms};
 
 /// One connection: the authenticated Device, the hub it belongs to, and the writer.
 ///
@@ -41,6 +42,9 @@ pub(crate) struct Session<'a> {
     hub: &'a RealtimeHub,
     writer: ConnectionWriter,
     cursors: CursorCheckpoint,
+    /// The peer's heartbeat evidence, which the transport loop's sweep consults.
+    /// Owned here because a heartbeat arrives on the client-frame path.
+    liveness: ConnectionLiveness,
 }
 
 impl<'a> Session<'a> {
@@ -61,7 +65,13 @@ impl<'a> Session<'a> {
             hub,
             writer: ConnectionWriter::new(tx, replay_capacity, connection_id),
             cursors: CursorCheckpoint::default(),
+            liveness: ConnectionLiveness::default(),
         }
+    }
+
+    /// The peer's heartbeat evidence as of the last client frame.
+    pub(crate) fn liveness(&self) -> &ConnectionLiveness {
+        &self.liveness
     }
 
     /// Enqueue a heartbeat.
@@ -162,6 +172,11 @@ impl<'a> Session<'a> {
 
         match envelope.event() {
             ClientEvent::Ping(ping) => {
+                // The one client frame that is purely about liveness. Recording it
+                // is what lets the transport loop tell a live peer from a half-open
+                // socket that will never send anything again (ADR-0013's server
+                // half); a client that never sends one is never swept.
+                self.liveness.record_beat(Instant::now());
                 tracing::trace!(seq = ping.seq, time_ms = ping.time_ms, "client heartbeat");
             }
             ClientEvent::SendMessage(send) => {
@@ -425,10 +440,4 @@ enum ResumePlan {
 /// Build the [`Resync`] event for an outcome.
 fn resync(reason: ResyncReason, replayed: u64) -> ServerEvent {
     ServerEvent::Resync(Resync { reason, replayed })
-}
-
-/// Current wall-clock time as milliseconds since the Unix epoch.
-fn now_ms() -> Result<i64, RealtimeError> {
-    let elapsed = SystemTime::now().duration_since(UNIX_EPOCH)?;
-    i64::try_from(elapsed.as_millis()).map_err(|_| RealtimeError::ClockRange)
 }

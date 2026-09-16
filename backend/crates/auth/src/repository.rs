@@ -246,6 +246,70 @@ impl SessionRepository {
         .map_err(AuthError::Database)
     }
 
+    /// Mark an account's email verified and return the updated row.
+    ///
+    /// `COALESCE` keeps the *first* verification time: redeeming a second link (or
+    /// re-verifying an already-verified account) must not move the timestamp that
+    /// records when the address was proven.
+    pub async fn mark_email_verified(&self, user_id: &str) -> Result<UserRow, AuthError> {
+        sqlx::query(
+            "UPDATE users \
+             SET email_verified_at = COALESCE(email_verified_at, now()), updated_at = now() \
+             WHERE id = $1 \
+             RETURNING id::text AS id, username, email, display_name, avatar_url, \
+                       password_hash, email_verified_at, created_at",
+        )
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(AuthError::Database)?
+        .map(|row| user_from_row(&row))
+        .ok_or(AuthError::AccountMissing)
+    }
+
+    /// Replace an account's password hash.
+    ///
+    /// Callers revoke the account's sessions after this — a password change must
+    /// end every session opened with the old one.
+    pub async fn update_password(
+        &self,
+        user_id: &str,
+        password_hash: &str,
+    ) -> Result<(), AuthError> {
+        let updated =
+            sqlx::query("UPDATE users SET password_hash = $2, updated_at = now() WHERE id = $1")
+                .bind(user_id)
+                .bind(password_hash)
+                .execute(&self.pool)
+                .await
+                .map_err(AuthError::Database)?
+                .rows_affected();
+
+        if updated == 0 {
+            return Err(AuthError::AccountMissing);
+        }
+
+        Ok(())
+    }
+
+    /// Revoke every active session for one account.
+    ///
+    /// This is what makes "reset the password" also mean "sign out everywhere":
+    /// each revoked row makes the access token that names it fail on the very next
+    /// request, because `authenticate` re-reads the row rather than trusting the
+    /// signed token.
+    pub async fn revoke_all_sessions(&self, user_id: &str) -> Result<(), AuthError> {
+        sqlx::query(
+            "UPDATE sessions SET revoked_at = now() \
+             WHERE user_id = $1 AND revoked_at IS NULL",
+        )
+        .bind(user_id)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(AuthError::Database)
+    }
+
     /// Shared body for the two account lookups.
     async fn find_user_by(&self, column: &str, value: &str) -> Result<Option<UserRow>, AuthError> {
         // `column` is a hard-coded literal from the two callers above, never input.

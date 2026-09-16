@@ -53,6 +53,11 @@
 //!   `ConnectionRegistry::deliver` takes a list of User ids and fans out to their
 //!   Devices. Changing small-group write-fanout into large-group read-fanout is a
 //!   change to what that call is handed, not to the rules that produced the list.
+//! - **The recipient set is also a relationship query.** `presence_audience`
+//!   answers "who shares a Conversation with this User" for presence fan-out;
+//!   unlike `SentMessage` it carries no payload at all, so the transport decides
+//!   what (if anything) to say and issue #27 can narrow who is allowed to hear it
+//!   without touching this crate's rules.
 //!
 //! The recipient sets are also where membership rules become observable: a
 //! Participant who left or was removed is absent from the Group's

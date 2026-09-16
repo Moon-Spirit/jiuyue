@@ -45,6 +45,28 @@ pub enum AuthError {
         retry_after_seconds: u64,
     },
 
+    /// The account exists but its email has not been verified, and the action is
+    /// gated on verification. Distinct so the HTTP layer can answer with a code
+    /// the client turns into "open your inbox / resend the link".
+    #[error("email is not verified")]
+    EmailNotVerified,
+
+    /// A one-shot link is well-formed but past its lifetime. Kept separate from
+    /// [`Self::TokenInvalid`] because "request a new one" is actionable advice.
+    #[error("the link has expired")]
+    TokenExpired,
+
+    /// A one-shot link is unknown, malformed, or already spent. "Used" and "never
+    /// existed" are deliberately the same answer: both mean start over.
+    #[error("the link is invalid or already used")]
+    TokenInvalid,
+
+    /// A token was redeemed successfully but the account it named is gone. Only
+    /// reachable through a race with account deletion; reported honestly rather
+    /// than as a bad credential.
+    #[error("the account no longer exists")]
+    AccountMissing,
+
     /// The access token is missing, malformed, expired, or its session was
     /// revoked or is past its own expiry.
     #[error("missing, expired or revoked credentials")]

@@ -18,6 +18,7 @@ use crate::state::AppState;
 pub mod api;
 pub mod auth;
 pub mod chat;
+pub mod presence;
 pub mod realtime;
 
 /// Version string compiled into the binary.
@@ -59,6 +60,9 @@ pub fn app(state: AppState) -> Router {
         // Chat is its own module and its own crate: Conversation lifecycle and
         // history over REST, Message delivery over the socket above.
         .merge(chat::router())
+        // Presence is its own module over its own crate: the socket pushes a
+        // change when it happens, this reads the current state on demand.
+        .merge(presence::router())
         .layer(middleware::from_fn(log_request))
         .with_state(state)
 }

@@ -10,6 +10,7 @@ use ts_rs::TS;
 
 use crate::chat::{ConversationCreated, MessageAck, MessageRejected, NewMessage, SendMessage};
 use crate::group::MembershipChanged;
+use crate::presence::Presence;
 use crate::read::{MarkRead, ReadMarker, ReadReceipt};
 use crate::sync::{Resume, Resync, SyncCursor, SyncState};
 
@@ -72,6 +73,14 @@ pub enum ServerEvent {
     /// [`ReadReceipt`] position — the reader's private Read Marker has no path to
     /// this event.
     ReadReceipt(ReadReceipt),
+    /// A User's reachability changed (CONTEXT.md: Presence).
+    ///
+    /// Sent **only** to Participants of a Conversation shared with that User — the
+    /// people with a reason to care — never to every connected client. The
+    /// transition is per **User**, not per Device: a second Device connecting while
+    /// the first is already live produces no event at all, and [`Presence::status`]
+    /// only turns `offline` when the User's *last* Device goes.
+    Presence(Presence),
 }
 
 /// Events a client sends to the server.

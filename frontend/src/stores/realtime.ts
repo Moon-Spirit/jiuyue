@@ -2,6 +2,7 @@ import { defineStore } from "pinia";
 import { ref } from "vue";
 import { RealtimeSocket, type SocketStatus } from "../api/ws";
 import type { ClientEvent } from "../generated/ClientEvent";
+import type { Presence } from "../generated/Presence";
 import type { ResyncReason } from "../generated/ResyncReason";
 import type { ServerEnvelope } from "../generated/ServerEnvelope";
 import type { ServerEvent } from "../generated/ServerEvent";
@@ -42,6 +43,14 @@ function assertExhaustive(_variant: never): void {}
  * ever consumed. On a reconnect that position belongs to a dead connection, so
  * the server answers `unavailable` — the explicit signal that drives the repair.
  * A first connection sends `0` and is answered `fresh`.
+ *
+ * # Heartbeat, both ways
+ *
+ * The server's heartbeat is what lets the client notice a half-open socket
+ * (ADR-0013). The server's own half of that problem needs evidence flowing the
+ * other way, so every server heartbeat is answered with a client one: the server
+ * holds a connection to a heartbeat deadline only once the peer has shown it will
+ * beat, which keeps the reply additive for older clients.
  */
 export const useRealtimeStore = defineStore("realtime", () => {
   const status = ref<SocketStatus>("idle");
@@ -54,6 +63,7 @@ export const useRealtimeStore = defineStore("realtime", () => {
   let socket: RealtimeSocket | null = null;
   const listeners = new Set<(event: ServerEvent) => void>();
   const resyncListeners = new Set<(reason: ResyncReason) => void>();
+  const presenceListeners = new Set<(presence: Presence) => void>();
 
   /** Highest `s` applied on the current connection; reset when a new one opens. */
   let lastSequence: number | null = null;
@@ -111,6 +121,16 @@ export const useRealtimeStore = defineStore("realtime", () => {
           }
           hasOpenedBefore = true;
         }
+
+        // Answer the heartbeat. The client half of ADR-0013's liveness: without
+        // it the server cannot tell a live peer from a half-open socket that will
+        // never speak again, so it can only ever assume the connection is fine.
+        // The reply is optional on the wire — a client that omits it is never
+        // swept — which is what keeps this additive.
+        socket?.send({
+          t: "Ping",
+          d: { seq: event.d.seq, time_ms: Date.now(), connection_id: null },
+        });
         break;
       case "Resync":
         // The server's explicit answer to our handshake. `unavailable` means it
@@ -133,6 +153,11 @@ export const useRealtimeStore = defineStore("realtime", () => {
         // not connection state — this store only forwards them, and the chat
         // store decides what to do with them.
         for (const listener of listeners) listener(event);
+        break;
+      case "Presence":
+        // Presence is not chat state, so it goes to its own subscribers rather
+        // than to the chat store, which stays about Conversations and Messages.
+        for (const listener of presenceListeners) listener(event.d);
         break;
       default:
         assertExhaustive(event);
@@ -168,6 +193,18 @@ export const useRealtimeStore = defineStore("realtime", () => {
   function onResync(listener: (reason: ResyncReason) => void): () => void {
     resyncListeners.add(listener);
     return () => resyncListeners.delete(listener);
+  }
+
+  /**
+   * Subscribe to presence changes. Returns an unsubscribe.
+   *
+   * Presence is a User's reachability, and the server delivers it only to the
+   * Participants of a Conversation shared with that User. The socket is the pipe;
+   * the presence store owns what the map means and how it is rendered.
+   */
+  function onPresenceEvent(listener: (presence: Presence) => void): () => void {
+    presenceListeners.add(listener);
+    return () => presenceListeners.delete(listener);
   }
 
   /** Open the realtime channel, reusing the socket if it already exists. */
@@ -224,5 +261,6 @@ export const useRealtimeStore = defineStore("realtime", () => {
     send,
     onChatEvent,
     onResync,
+    onPresenceEvent,
   };
 });

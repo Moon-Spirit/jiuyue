@@ -25,7 +25,8 @@ display_name: string,
  */
 avatar_url: string | null, 
 /**
- * Whether the email has been verified (always false until the email ticket).
+ * Whether the email has been verified by following the emailed link.
+ * `false` restricts the account from opening Conversations.
  */
 email_verified: boolean, 
 /**

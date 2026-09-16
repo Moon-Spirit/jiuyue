@@ -4,8 +4,10 @@ import {
   isValidEmail,
   isValidUsername,
   validateEmail,
+  validateForgotPassword,
   validateLogin,
   validatePassword,
+  validatePasswordReset,
   validateRegistration,
   validateUsername,
 } from "./validation";
@@ -111,6 +113,64 @@ describe("form validation", () => {
     const problems = validateLogin({ email: "nope", password: "secret123" });
 
     expect(problems.map((entry) => entry.code)).toEqual(["INVALID_FORMAT"]);
+  });
+});
+
+describe("password recovery validation", () => {
+  it("accepts a well-formed forgot-password address", () => {
+    expect(validateForgotPassword({ email: "alice@example.com" })).toEqual([]);
+    // The value is normalised before it is checked.
+    expect(validateForgotPassword({ email: "  Alice@Example.COM " })).toEqual(
+      [],
+    );
+  });
+
+  it("reports a missing or malformed address", () => {
+    expect(validateForgotPassword({ email: "" })[0]?.code).toBe("REQUIRED");
+    expect(validateForgotPassword({ email: "nope" })[0]?.code).toBe(
+      "INVALID_FORMAT",
+    );
+  });
+
+  it("accepts a matching, strong reset form", () => {
+    expect(
+      validatePasswordReset({
+        token: "opaque-token",
+        password: "secret123",
+        confirm: "secret123",
+      }),
+    ).toEqual([]);
+  });
+
+  it("rejects a mismatched confirmation with the mismatch code", () => {
+    const problems = validatePasswordReset({
+      token: "opaque-token",
+      password: "secret123",
+      confirm: "secret124",
+    });
+
+    expect(problems).toHaveLength(1);
+    expect(problems[0]?.field).toBe("confirm");
+    expect(problems[0]?.code).toBe("MISMATCH");
+    expect(problems[0]?.message).toBe("两次输入的密码不一致");
+  });
+
+  it("applies the registration password policy and requires a token", () => {
+    const weak = validatePasswordReset({
+      token: "opaque-token",
+      password: "allletters",
+      confirm: "allletters",
+    });
+    expect(weak[0]?.field).toBe("password");
+    expect(weak[0]?.code).toBe("WEAK");
+
+    const noToken = validatePasswordReset({
+      token: "   ",
+      password: "secret123",
+      confirm: "secret123",
+    });
+    expect(noToken[0]?.field).toBe("token");
+    expect(noToken[0]?.code).toBe("REQUIRED");
   });
 });
 

@@ -14,6 +14,10 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use jiuyue_auth::SessionContext;
+use jiuyue_contract::auth::{
+    ForgotPasswordRequest, RequestAccepted, ResendVerificationRequest, ResetPasswordRequest,
+    VerifyEmailRequest,
+};
 use jiuyue_contract::{
     AuthSession, LoginRequest, RefreshRequest, RegisterRequest, TokenPair, UserProfile, WhoAmI,
 };
@@ -34,6 +38,13 @@ pub fn router() -> Router<AppState> {
         .route("/auth/logout", post(logout))
         .route("/auth/me", get(current_user))
         .route("/auth/whoami", get(whoami))
+        // The two email journeys. Verify and reset redeem a one-shot link; the
+        // other two ask for a link to be sent (again) and deliberately answer the
+        // same way whether or not the address has an account.
+        .route("/auth/verify-email", post(verify_email))
+        .route("/auth/resend-verification", post(resend_verification))
+        .route("/auth/forgot-password", post(forgot_password))
+        .route("/auth/reset-password", post(reset_password))
 }
 
 /// `POST /auth/register` — create an account and sign it in immediately.
@@ -124,6 +135,88 @@ async fn whoami(
         session_id: session.session_id,
         username: session.username,
     }))
+}
+
+/// `POST /auth/verify-email` — redeem a verification link and return the profile.
+///
+/// The updated [`UserProfile`] comes back so the client can flip its own
+/// `email_verified` without a second round trip. No bearer token is required: the
+/// link itself is the proof, and the user may well be following it in a different
+/// browser from the one they registered with.
+async fn verify_email(
+    State(state): State<AppState>,
+    Json(body): Json<VerifyEmailRequest>,
+) -> Result<Json<UserProfile>, ApiError> {
+    let auth = state.auth()?;
+
+    let profile = auth
+        .verify_email(&body.token)
+        .await
+        .map_err(ApiError::from)?;
+
+    Ok(Json(profile))
+}
+
+/// `POST /auth/resend-verification` — send a fresh verification link.
+///
+/// Answers `202` with a fixed body, whether or not the address belongs to an
+/// unverified account: the endpoint must not be usable to probe which addresses
+/// are registered.
+async fn resend_verification(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<ResendVerificationRequest>,
+) -> Result<(StatusCode, Json<RequestAccepted>), ApiError> {
+    let auth = state.auth()?;
+
+    auth.resend_verification(body, session_context(&headers))
+        .await
+        .map_err(ApiError::from)?;
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(RequestAccepted { accepted: true }),
+    ))
+}
+
+/// `POST /auth/forgot-password` — send a password-reset link.
+///
+/// The response is identical for an address with an account and one without, and
+/// the work done is the same too (see `AuthService::forgot_password`), so this
+/// cannot become an account-existence oracle.
+async fn forgot_password(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<ForgotPasswordRequest>,
+) -> Result<(StatusCode, Json<RequestAccepted>), ApiError> {
+    let auth = state.auth()?;
+
+    auth.forgot_password(body, session_context(&headers))
+        .await
+        .map_err(ApiError::from)?;
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(RequestAccepted { accepted: true }),
+    ))
+}
+
+/// `POST /auth/reset-password` — redeem a reset link and set a new password.
+///
+/// Answers `204`: there is nothing to return, and the session the caller may have
+/// held is intentionally revoked by the reset.
+async fn reset_password(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<ResetPasswordRequest>,
+) -> Result<StatusCode, ApiError> {
+    let auth = state.auth()?;
+
+    auth.reset_password(body, session_context(&headers))
+        .await
+        .map_err(ApiError::from)?;
+
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// Collect the device metadata a login records (the device ticket renders it).

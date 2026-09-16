@@ -22,7 +22,10 @@ async function submit(): Promise<void> {
     password: form.password,
     displayName: form.displayName,
   });
-  if (ok) await router.replace("/");
+  // Registration signs the account in but leaves it unverified, and opening a
+  // Conversation is gated on verification — so the next screen is the one that
+  // explains the link we just emailed.
+  if (ok) await router.replace({ name: "verify-email" });
 }
 </script>
 

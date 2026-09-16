@@ -2,7 +2,8 @@
 //!
 //! This crate owns everything about *who a request is*: password hashing
 //! (Argon2id), access-token issuance and verification (HS256 JWT), refresh-token
-//! storage, and the `sessions` table that makes logout immediate.
+//! storage, the `sessions` table that makes logout immediate, and the one-shot
+//! email links that verify an address or reset a forgotten password.
 //!
 //! # Why a session row, when the token is already signed
 //!
@@ -15,35 +16,48 @@
 //! fails. There is deliberately no lookup cache — on one node a primary-key
 //! probe is cheap, and a cache would reintroduce revocation lag.
 //!
-//! # What this crate does not do
+//! # Email links
 //!
-//! Email verification and refresh-token rotation are separate tickets. Nothing
-//! here delivers mail or rotates refresh tokens; the schema and [`AuthService`]
-//! are shaped so those can be added without replacing this module. Login rate
-//! limiting *is* here — see [`limiter`] — because a login endpoint without it is
-//! an unlimited password oracle.
+//! Verification and password-reset links are opaque random tokens; only their
+//! SHA-256 digests are stored (`account_tokens`, see [`AccountTokenRepository`]).
+//! They expire, and redemption is a single atomic UPDATE that spends the token
+//! before the caller does anything else. Delivery goes through the [`Mailer`]
+//! seam: [`InMemoryMailer`] for development and tests, a provider-backed
+//! implementation for production. See [`mailer`] for what a deployment must
+//! supply, and `docs/adr/0015-email-verification-and-the-mailer-seam.md` for the
+//! full decision.
 //!
 //! # Cost control on a 2 vCPU / 2 GB box
 //!
 //! Argon2id at OWASP parameters allocates ~19 MiB per in-flight hash, so an
 //! unbounded burst of logins could exhaust memory. [`PasswordHasher`] bounds
-//! concurrent hashes with a semaphore and runs them on the blocking pool.
+//! concurrent hashes with a semaphore and runs them on the blocking pool. The
+//! endpoints that trigger email share the same rate limiter as login, keyed on
+//! the caller's source, so neither can be turned into a spam cannon.
 
 #![forbid(unsafe_code)]
 
+mod account_tokens;
 mod error;
 pub mod limiter;
+mod links;
+pub mod mailer;
 mod password;
 mod repository;
 mod service;
 mod token;
 pub mod validation;
 
+pub use account_tokens::{AccountTokenRepository, NewToken, StoredToken, TokenPurpose};
 pub use error::AuthError;
 pub use limiter::{
     InProcessLoginAttemptStore, LoginAttempt, LoginAttemptPolicy, LoginAttemptPolicyBuilder,
     LoginAttemptStore, MAX_LOCKOUT_SECS,
 };
+pub use mailer::{InMemoryMailer, MailError, Mailer, OutgoingMessage};
 pub use password::PasswordHasher;
-pub use service::{AuthConfig, AuthService, AuthenticatedSession, SessionContext, UNKNOWN_SOURCE};
-pub use token::AccessClaims;
+pub use service::{
+    AuthConfig, AuthService, AuthServiceBuilder, AuthenticatedSession, SessionContext,
+    UNKNOWN_SOURCE,
+};
+pub use token::{AccessClaims, TokenIssuer};

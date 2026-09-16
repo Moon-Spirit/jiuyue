@@ -19,8 +19,10 @@ use ts_rs::TS;
 
 /// `POST /auth/register` body.
 ///
-/// Registration does not require email verification yet; the account is usable
-/// immediately with `email_verified` false until a later ticket changes that.
+/// Registration succeeds and signs the new Device in immediately; the account
+/// starts with `email_verified` false and a verification link is emailed. Some
+/// actions (opening a Conversation) are gated on verification — see
+/// `docs/adr/0015-email-verification-and-the-mailer-seam.md`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct RegisterRequest {
@@ -53,6 +55,61 @@ pub struct RefreshRequest {
     pub refresh_token: String,
 }
 
+/// `POST /auth/verify-email` body.
+///
+/// The token is the opaque value from the verification link. It is single-use and
+/// time-limited, and the server stores only its digest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct VerifyEmailRequest {
+    /// The token carried by the verification link (`?token=…`).
+    pub token: String,
+}
+
+/// `POST /auth/forgot-password` body.
+///
+/// The response never says whether the address exists — see
+/// [`crate::auth::RequestAccepted`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct ForgotPasswordRequest {
+    /// Address to send a reset link to, if an account uses it.
+    pub email: String,
+}
+
+/// `POST /auth/reset-password` body.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct ResetPasswordRequest {
+    /// The token carried by the reset link (`?token=…`); single-use and expiring.
+    pub token: String,
+    /// The new cleartext password; hashed with Argon2id on arrival, never stored.
+    pub password: String,
+}
+
+/// `POST /auth/resend-verification` body.
+///
+/// Like forgot-password, the answer does not reveal whether the address exists.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct ResendVerificationRequest {
+    /// Address to re-send the verification link to, if an unverified account uses it.
+    pub email: String,
+}
+
+/// Generic "we accepted your request" body.
+///
+/// Used only by the two endpoints that must answer identically whether or not an
+/// account exists (`forgot-password`, `resend-verification`). Returning one fixed
+/// shape — rather than `{"sent": true}` for a hit and something else for a miss —
+/// is what keeps the response from becoming an account-existence oracle.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct RequestAccepted {
+    /// Always `true`: the request was accepted, independent of any account lookup.
+    pub accepted: bool,
+}
+
 /// A freshly minted pair of credentials.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[ts(export)]
@@ -82,7 +139,8 @@ pub struct UserProfile {
     pub display_name: String,
     /// Avatar URL, when one has been set.
     pub avatar_url: Option<String>,
-    /// Whether the email has been verified (always false until the email ticket).
+    /// Whether the email has been verified by following the emailed link.
+    /// `false` restricts the account from opening Conversations.
     pub email_verified: bool,
     /// Account creation time, milliseconds since the Unix epoch.
     #[ts(type = "number")]
@@ -182,6 +240,18 @@ pub enum ErrorCode {
     /// [`Self::TooManyAttempts`] so a client can say so plainly; the wait is in
     /// [`ErrorDetail::retry_after_seconds`].
     LockedOut,
+    /// The account exists but its email has not been verified, and the action is
+    /// gated on verification. Distinct so the client can prompt the user to open
+    /// their inbox (and offer a re-send) instead of showing a generic denial.
+    EmailNotVerified,
+    /// The one-shot link is well-formed but past its lifetime. Separate from
+    /// [`Self::TokenInvalid`] because "expired, ask for a new one" is actionable
+    /// advice to a real user.
+    TokenExpired,
+    /// The one-shot link is unknown, malformed, or already spent. Deliberately
+    /// does not separate "has been used" from "never existed": both mean "start
+    /// over and request a fresh link".
+    TokenInvalid,
     /// The access token is missing, malformed, expired, or its session was revoked.
     Unauthenticated,
     /// The server failed for an internal reason; the cause is only in the logs.
@@ -220,11 +290,54 @@ pub enum FieldErrorCode {
     Weak,
     /// The field's value is already in use by another account.
     Taken,
+    /// The field does not match a sibling field it must repeat. Emitted by the
+    /// client for a password-confirmation box; the server never needs to send it,
+    /// because it never receives a confirmation field.
+    Mismatch,
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ErrorBody, ErrorCode, FieldError, FieldErrorCode, RegisterRequest};
+    use super::{
+        ErrorBody, ErrorCode, FieldError, FieldErrorCode, ForgotPasswordRequest, RegisterRequest,
+        RequestAccepted, ResendVerificationRequest, ResetPasswordRequest, VerifyEmailRequest,
+    };
+
+    #[test]
+    fn the_one_shot_link_requests_round_trip() {
+        let verify: VerifyEmailRequest =
+            serde_json::from_str(r#"{"token":"abc"}"#).expect("a verify body must decode");
+        assert_eq!(verify.token, "abc");
+
+        let reset: ResetPasswordRequest =
+            serde_json::from_str(r#"{"token":"abc","password":"secret123"}"#)
+                .expect("a reset body must decode");
+        assert_eq!(reset.password, "secret123");
+
+        let forgot: ForgotPasswordRequest = serde_json::from_str(r#"{"email":"a@b.com"}"#)
+            .expect("a forgot-password body must decode");
+        assert_eq!(forgot.email, "a@b.com");
+
+        let resend: ResendVerificationRequest =
+            serde_json::from_str(r#"{"email":"a@b.com"}"#).expect("a resend body must decode");
+        assert_eq!(resend.email, "a@b.com");
+
+        let accepted = serde_json::to_value(RequestAccepted { accepted: true })
+            .expect("the accepted body must serialise");
+        assert_eq!(accepted, serde_json::json!({ "accepted": true }));
+    }
+
+    #[test]
+    fn the_verification_failure_codes_are_stable_on_the_wire() {
+        for (code, expected) in [
+            (ErrorCode::EmailNotVerified, "EMAIL_NOT_VERIFIED"),
+            (ErrorCode::TokenExpired, "TOKEN_EXPIRED"),
+            (ErrorCode::TokenInvalid, "TOKEN_INVALID"),
+        ] {
+            let wire = serde_json::to_value(code).expect("a code must serialise");
+            assert_eq!(wire, serde_json::json!(expected));
+        }
+    }
 
     #[test]
     fn optional_display_name_may_be_omitted() {

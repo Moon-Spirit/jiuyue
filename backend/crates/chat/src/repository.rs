@@ -177,6 +177,32 @@ const SELECT_PARTICIPANTS: &str = "\
     SELECT user_id::text AS user_id \
     FROM conversation_members WHERE conversation_id = $1 ORDER BY joined_at";
 
+/// Every User who shares a Conversation with the given User, excluding them.
+///
+/// This is the audience for a User's presence: the Participants of their shared
+/// Conversations, and nobody else. It is deliberately a *relationship* query and
+/// knows nothing about presence — the realtime gateway decides what to send, this
+/// decides who is allowed to hear it. Keeping the two apart is what lets issue #27
+/// narrow visibility by changing one caller rather than every fan-out.
+///
+/// The self-join is on `conversation_id` with `other.user_id <> mine.user_id`, so a
+/// Direct Conversation yields the one peer and a Group yields the rest of its
+/// members; `DISTINCT` collapses a peer reachable through several Conversations.
+///
+/// `candidates` narrows the answer to a caller-supplied set — the realtime path
+/// passes `None` (the whole audience) and the presence REST read passes the ids it
+/// was asked about, so a request for two peers does not materialise a User's entire
+/// social graph. A `NULL` array means "no filter", which is why the parameter is
+/// tested rather than the query being duplicated.
+const SELECT_PRESENCE_AUDIENCE: &str = "\
+    SELECT DISTINCT other.user_id::text AS user_id \
+    FROM conversation_members AS mine \
+    JOIN conversation_members AS other \
+      ON other.conversation_id = mine.conversation_id AND other.user_id <> mine.user_id \
+    WHERE mine.user_id = $1 \
+      AND ($2::text[] IS NULL OR other.user_id = ANY($2::text[])) \
+    ORDER BY user_id";
+
 const ALLOCATE_SEQ: &str = "\
     UPDATE conversations SET next_seq = next_seq + 1 \
     WHERE id = $1 RETURNING next_seq";
@@ -850,6 +876,26 @@ impl ChatRepository {
     pub async fn participants(&self, conversation_id: &str) -> Result<Vec<String>, ChatError> {
         sqlx::query(SELECT_PARTICIPANTS)
             .bind(conversation_id)
+            .fetch_all(&self.pool)
+            .await
+            .map(|rows| rows.iter().map(|row| row.get("user_id")).collect())
+            .map_err(ChatError::Database)
+    }
+
+    /// Every User who shares a Conversation with `user_id`, or only those in
+    /// `candidates` when one is given.
+    ///
+    /// See [`SELECT_PRESENCE_AUDIENCE`]: this is the "who has a reason to care"
+    /// relation, not a presence read. A User with no Conversations has an empty
+    /// audience, which is the correct answer rather than an error.
+    pub async fn presence_audience(
+        &self,
+        user_id: &str,
+        candidates: Option<&[String]>,
+    ) -> Result<Vec<String>, ChatError> {
+        sqlx::query(SELECT_PRESENCE_AUDIENCE)
+            .bind(user_id)
+            .bind(candidates)
             .fetch_all(&self.pool)
             .await
             .map(|rows| rows.iter().map(|row| row.get("user_id")).collect())

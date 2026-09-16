@@ -995,6 +995,7 @@ dependencies = [
  "jiuyue-chat",
  "jiuyue-contract",
  "serde_json",
+ "sqlx",
  "thiserror",
  "tokio",
  "tracing",

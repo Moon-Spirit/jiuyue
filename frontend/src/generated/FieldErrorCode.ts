@@ -3,4 +3,4 @@
 /**
  * Stable per-field validation codes.
  */
-export type FieldErrorCode = "REQUIRED" | "INVALID_FORMAT" | "TOO_SHORT" | "TOO_LONG" | "WEAK" | "TAKEN";
+export type FieldErrorCode = "REQUIRED" | "INVALID_FORMAT" | "TOO_SHORT" | "TOO_LONG" | "WEAK" | "TAKEN" | "MISMATCH";

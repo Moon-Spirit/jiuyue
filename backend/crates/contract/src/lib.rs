@@ -26,6 +26,7 @@ pub mod chat;
 pub mod envelope;
 pub mod events;
 pub mod group;
+pub mod presence;
 pub mod read;
 pub mod sync;
 
@@ -46,5 +47,6 @@ pub use group::{
     GroupSummary, MAX_GROUP_MEMBERS, MAX_GROUP_TITLE_CHARS, MIN_GROUP_MEMBERS, MemberView,
     MembershipChange, MembershipChanged, Role, TransferOwnershipRequest,
 };
+pub use presence::{MAX_PRESENCE_QUERY, Presence, PresenceList, PresenceQuery, PresenceStatus};
 pub use read::{MarkRead, ReadMarker, ReadReceipt};
 pub use sync::{Resume, Resync, ResyncReason, SyncCursor, SyncState};

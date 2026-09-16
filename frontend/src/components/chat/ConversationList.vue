@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import type { ConversationSummary } from "../../generated/ConversationSummary";
+import type { PresenceStatus } from "../../generated/PresenceStatus";
 
 const props = defineProps<{
   conversations: readonly ConversationSummary[];
@@ -7,9 +8,23 @@ const props = defineProps<{
   loading: boolean;
   /** The User's Unread Count per Conversation id (CONTEXT.md: 未读数). */
   unreadCounts: Record<string, number>;
+  /**
+   * The known presence of each peer, by User id.
+   *
+   * Presence is per User and a Group has no single peer to show it for, so this
+   * drives a dot on Direct Conversations only. A peer with no entry — unknown, or
+   * a Group — simply has no dot.
+   */
+  presence?: Record<string, PresenceStatus>;
 }>();
 
 const emit = defineEmits<{ select: [id: string] }>();
+
+/** Whether this Conversation's peer is reachable right now. */
+function isPeerOnline(conversation: ConversationSummary): boolean {
+  const peer = conversation.peer;
+  return peer !== null && props.presence?.[peer.id] === "online";
+}
 
 /** The name shown for a Conversation: a group's title, or the peer's name. */
 function label(conversation: ConversationSummary): string {
@@ -72,8 +87,14 @@ function unreadFor(conversation: ConversationSummary): number {
             {{ initial(conversation) }}
           </span>
           <span class="min-w-0 flex-1">
-            <span class="block truncate text-sm font-medium">
-              {{ label(conversation) }}
+            <span class="flex items-center gap-1.5 text-sm font-medium">
+              <span
+                v-if="isPeerOnline(conversation)"
+                aria-hidden="true"
+                class="h-2 w-2 shrink-0 rounded-full bg-emerald-500"
+                data-test="presence-dot"
+              />
+              <span class="truncate">{{ label(conversation) }}</span>
             </span>
             <span class="block truncate text-xs text-zinc-500">
               {{ subtitle(conversation) }}

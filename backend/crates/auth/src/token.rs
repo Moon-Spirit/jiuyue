@@ -139,6 +139,27 @@ impl TokenIssuer {
         let digest = Sha256::digest(token.as_bytes());
         format!("{digest:x}")
     }
+
+    /// Mint a fresh opaque one-shot link token (256 bits, base64url without padding).
+    ///
+    /// Verification and password-reset links carry the same shape of secret as a
+    /// refresh token — pure randomness with no structure to guess — and are
+    /// minted the same way. Only the digest is ever stored, so the link in the
+    /// email is the only copy of the value.
+    pub fn issue_link_token(&self) -> Result<String, AuthError> {
+        let mut bytes = [0_u8; REFRESH_TOKEN_BYTES];
+        getrandom::fill(&mut bytes).map_err(AuthError::Random)?;
+
+        Ok(URL_SAFE_NO_PAD.encode(bytes))
+    }
+
+    /// Digest a one-shot link token for storage: lowercase hex SHA-256.
+    ///
+    /// Matches `account_tokens.token_hash`'s `^[0-9a-f]{64}$` CHECK.
+    pub fn hash_link_token(token: &str) -> String {
+        let digest = Sha256::digest(token.as_bytes());
+        format!("{digest:x}")
+    }
 }
 
 /// Current wall-clock time as whole seconds since the Unix epoch.
@@ -259,5 +280,26 @@ mod tests {
             !digest.contains(&first),
             "the digest must not embed the token"
         );
+    }
+
+    #[test]
+    fn link_tokens_are_random_and_hash_to_a_storable_digest() {
+        let issuer = issuer();
+
+        let token = issuer.issue_link_token().expect("mint");
+        let other = issuer.issue_link_token().expect("mint");
+
+        assert_ne!(token, other, "each link token must be unique");
+        assert_eq!(token.len(), 43, "32 bytes base64url without padding");
+
+        let digest = TokenIssuer::hash_link_token(&token);
+        assert_eq!(
+            digest.len(),
+            64,
+            "account_tokens stores a 64-char hex digest"
+        );
+        assert!(digest.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(digest, TokenIssuer::hash_link_token(&token));
+        assert_ne!(digest, token, "the digest must not be the token");
     }
 }

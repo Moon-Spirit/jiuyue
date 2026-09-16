@@ -42,6 +42,23 @@ export interface LoginForm {
   password: string;
 }
 
+/** The forgot-password form as the view holds it. */
+export interface ForgotPasswordForm {
+  email: string;
+}
+
+/**
+ * The reset-password form as the view holds it.
+ *
+ * `confirm` never leaves the browser: the server receives only `token` and
+ * `password`, so the repeat-check is a client convenience, not a contract field.
+ */
+export interface ResetPasswordForm {
+  token: string;
+  password: string;
+  confirm: string;
+}
+
 /** Trim and lowercase an email into its stored form. */
 export function normalizeEmail(value: string): string {
   return value.trim().toLowerCase();
@@ -178,6 +195,44 @@ export function validateLogin(form: LoginForm): FieldError[] {
   if (form.password.length === 0) {
     problems.push(problem("password", "REQUIRED", "请输入密码"));
   }
+  return problems;
+}
+
+/**
+ * Validate the forgot-password form.
+ *
+ * Only the email shape is checked here; whether the address has an account is a
+ * question the client must not be able to answer, so the view shows the same
+ * "已发送" state either way.
+ */
+export function validateForgotPassword(form: ForgotPasswordForm): FieldError[] {
+  const email = validateEmail(form.email);
+  return email === null ? [] : [email];
+}
+
+/**
+ * Validate the reset-password form.
+ *
+ * The new password must satisfy the same policy as registration, and must be
+ * repeated — a typo in a reset is unrecoverable, because the reset link is spent
+ * by the attempt.
+ */
+export function validatePasswordReset(form: ResetPasswordForm): FieldError[] {
+  const problems: FieldError[] = [];
+
+  if (form.token.trim().length === 0) {
+    problems.push(
+      problem("token", "REQUIRED", "重置链接不完整，请重新打开邮件中的链接"),
+    );
+  }
+
+  const password = validatePassword(form.password);
+  if (password !== null) problems.push(password);
+
+  if (form.confirm !== form.password) {
+    problems.push(problem("confirm", "MISMATCH", "两次输入的密码不一致"));
+  }
+
   return problems;
 }
 

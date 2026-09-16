@@ -14,6 +14,9 @@
 //! - a blank display name means "use the username", which keeps the table's
 //!   `char_length(display_name) BETWEEN 1 AND 64` check satisfied.
 
+use jiuyue_contract::auth::{
+    ForgotPasswordRequest, ResendVerificationRequest, ResetPasswordRequest,
+};
 use jiuyue_contract::{FieldError, FieldErrorCode, LoginRequest, RegisterRequest};
 
 /// Shortest accepted `@handle`, matching the `users_username_format` check.
@@ -86,6 +89,45 @@ pub fn validate_login(request: &LoginRequest) -> Vec<FieldError> {
     if request.password.is_empty() {
         errors.push(problem("password", FieldErrorCode::Required, "请输入密码"));
     }
+
+    errors
+}
+
+/// Validate a forgot-password request.
+///
+/// Only the email shape is checked. The check runs before any account lookup, so
+/// a malformed address is refused as a field problem regardless of whether an
+/// account uses it — which is the same answer a valid address gets.
+pub fn validate_forgot_password(request: &ForgotPasswordRequest) -> Vec<FieldError> {
+    let mut errors = Vec::new();
+    push(&mut errors, check_email(&normalize_email(&request.email)));
+    errors
+}
+
+/// Validate a resend-verification request. Identical rules to forgot-password.
+pub fn validate_resend_verification(request: &ResendVerificationRequest) -> Vec<FieldError> {
+    let mut errors = Vec::new();
+    push(&mut errors, check_email(&normalize_email(&request.email)));
+    errors
+}
+
+/// Validate a password-reset request.
+///
+/// The new password must satisfy the same strength policy as registration. A
+/// blank token is a field problem; a well-formed but unknown/expired/used token is
+/// reported by the service as a link problem, not a field problem.
+pub fn validate_password_reset(request: &ResetPasswordRequest) -> Vec<FieldError> {
+    let mut errors = Vec::new();
+
+    if request.token.trim().is_empty() {
+        errors.push(problem(
+            "token",
+            FieldErrorCode::Required,
+            "重置链接不完整，请重新打开邮件中的链接",
+        ));
+    }
+
+    push(&mut errors, check_password(&request.password));
 
     errors
 }
@@ -418,5 +460,67 @@ mod tests {
             validate_login(&malformed)[0].code,
             FieldErrorCode::InvalidFormat
         );
+    }
+
+    #[test]
+    fn forgot_password_requires_a_well_formed_address() {
+        use super::validate_forgot_password;
+        use jiuyue_contract::auth::ForgotPasswordRequest;
+
+        let good = ForgotPasswordRequest {
+            email: "  Alice@Example.com ".to_owned(),
+        };
+        assert!(validate_forgot_password(&good).is_empty());
+
+        let broken = ForgotPasswordRequest {
+            email: "nope".to_owned(),
+        };
+        let found = validate_forgot_password(&broken);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].field, "email");
+        assert_eq!(found[0].code, FieldErrorCode::InvalidFormat);
+    }
+
+    #[test]
+    fn a_password_reset_needs_a_token_and_a_strong_password() {
+        use super::validate_password_reset;
+        use jiuyue_contract::auth::ResetPasswordRequest;
+
+        let good = ResetPasswordRequest {
+            token: "opaque".to_owned(),
+            password: "secret123".to_owned(),
+        };
+        assert!(validate_password_reset(&good).is_empty());
+
+        let blank_token = ResetPasswordRequest {
+            token: "   ".to_owned(),
+            password: "secret123".to_owned(),
+        };
+        let found = validate_password_reset(&blank_token);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].field, "token");
+        assert_eq!(found[0].code, FieldErrorCode::Required);
+
+        let weak = ResetPasswordRequest {
+            token: "opaque".to_owned(),
+            password: "allletters".to_owned(),
+        };
+        let found = validate_password_reset(&weak);
+        assert_eq!(found[0].field, "password");
+        assert_eq!(found[0].code, FieldErrorCode::Weak);
+    }
+
+    #[test]
+    fn resend_verification_shares_the_email_rule() {
+        use super::validate_resend_verification;
+        use jiuyue_contract::auth::ResendVerificationRequest;
+
+        let request = ResendVerificationRequest {
+            email: "not-an-email".to_owned(),
+        };
+        let found = validate_resend_verification(&request);
+
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].code, FieldErrorCode::InvalidFormat);
     }
 }

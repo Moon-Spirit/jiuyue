@@ -5,6 +5,7 @@ import {
   apiGetAuthed,
   apiPost,
   apiPostAuthedNoContent,
+  apiPostNoContent,
 } from "../api/client";
 import type { AuthSession } from "../generated/AuthSession";
 import type { ErrorCode } from "../generated/ErrorCode";
@@ -16,10 +17,14 @@ import {
   fieldMessages,
   normalizeEmail,
   normalizeUsername,
+  validateForgotPassword,
   validateLogin,
+  validatePasswordReset,
   validateRegistration,
+  type ForgotPasswordForm,
   type LoginForm,
   type RegisterForm,
+  type ResetPasswordForm,
 } from "../validation";
 
 const ACCESS_TOKEN_KEY = "jiuyue.auth.access_token";
@@ -99,6 +104,14 @@ export const useAuthStore = defineStore("auth", () => {
   const isAuthenticated = computed(
     () => user.value !== null && accessToken.value !== null,
   );
+
+  /**
+   * Whether the signed-in account's email is verified.
+   *
+   * The server enforces this; the flag exists so the UI can *explain* why a
+   * restricted action is unavailable instead of letting it fail silently.
+   */
+  const emailVerified = computed(() => user.value?.email_verified ?? false);
 
   function resetMessages(): void {
     errorCode.value = null;
@@ -282,6 +295,108 @@ export const useAuthStore = defineStore("auth", () => {
     }
   }
 
+  /**
+   * Ask for a password-reset link.
+   *
+   * Returns whether the request was accepted — which is always true for a
+   * well-formed address, because the server answers identically whether or not
+   * an account exists. That is deliberate: the UI must show the same "已发送"
+   * state either way, or it becomes the account-existence oracle the backend
+   * refuses to be.
+   */
+  async function forgotPassword(form: ForgotPasswordForm): Promise<boolean> {
+    if (rejectLocally(validateForgotPassword(form))) return false;
+
+    loading.value = true;
+    resetMessages();
+    try {
+      await apiPost<unknown>("/auth/forgot-password", {
+        email: normalizeEmail(form.email),
+      });
+      return true;
+    } catch (cause) {
+      applyError(cause);
+      return false;
+    } finally {
+      loading.value = false;
+    }
+  }
+
+  /**
+   * Ask for another verification link. Same uniform answer as {@link forgotPassword}.
+   */
+  async function resendVerification(
+    form: ForgotPasswordForm,
+  ): Promise<boolean> {
+    if (rejectLocally(validateForgotPassword(form))) return false;
+
+    loading.value = true;
+    resetMessages();
+    try {
+      await apiPost<unknown>("/auth/resend-verification", {
+        email: normalizeEmail(form.email),
+      });
+      return true;
+    } catch (cause) {
+      applyError(cause);
+      return false;
+    } finally {
+      loading.value = false;
+    }
+  }
+
+  /**
+   * Redeem a verification link and return the updated profile.
+   *
+   * The link may be opened in a browser that is not signed in (mail clients open
+   * links wherever), so the profile only replaces the local user when it is the
+   * same account — a different account's verification must not hijack the tab.
+   */
+  async function verifyEmail(token: string): Promise<UserProfile | null> {
+    loading.value = true;
+    resetMessages();
+    try {
+      const profile = await apiPost<UserProfile>("/auth/verify-email", {
+        token,
+      });
+      if (user.value === null || user.value.id === profile.id) {
+        user.value = profile;
+      }
+      return profile;
+    } catch (cause) {
+      applyError(cause);
+      return null;
+    } finally {
+      loading.value = false;
+    }
+  }
+
+  /**
+   * Redeem a reset link and set a new password.
+   *
+   * On success the local session is dropped: the server revokes every session as
+   * part of the reset, so keeping the old tokens would only hold a dead session.
+   */
+  async function resetPassword(form: ResetPasswordForm): Promise<boolean> {
+    if (rejectLocally(validatePasswordReset(form))) return false;
+
+    loading.value = true;
+    resetMessages();
+    try {
+      await apiPostNoContent("/auth/reset-password", {
+        token: form.token,
+        password: form.password,
+      });
+      clear();
+      return true;
+    } catch (cause) {
+      applyError(cause);
+      return false;
+    } finally {
+      loading.value = false;
+    }
+  }
+
   /** Load the authenticated user's profile, refreshing first when needed. */
   async function fetchCurrentUser(): Promise<boolean> {
     return ensureSession();
@@ -326,8 +441,13 @@ export const useAuthStore = defineStore("auth", () => {
     fieldErrors,
     retryAfterSeconds,
     isAuthenticated,
+    emailVerified,
     register,
     login,
+    forgotPassword,
+    resendVerification,
+    verifyEmail,
+    resetPassword,
     logout,
     fetchCurrentUser,
     fetchWhoAmI,

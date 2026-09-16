@@ -7,6 +7,7 @@
 //! `session`; this module only drives it.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use axum::extract::ws::{Message, WebSocket};
 use futures_util::{SinkExt, StreamExt};
@@ -14,7 +15,9 @@ use jiuyue_contract::{ServerEnvelope, ServerEvent};
 use tokio::sync::mpsc;
 
 use crate::session::Session;
-use crate::{CONTROL_QUEUE_CAPACITY, Device, RealtimeError, RealtimeHub, SEND_QUEUE_CAPACITY};
+use crate::{
+    CONTROL_QUEUE_CAPACITY, Device, PresenceChange, RealtimeError, RealtimeHub, SEND_QUEUE_CAPACITY,
+};
 
 /// Serve one authenticated connection, logging (not panicking) on failure.
 ///
@@ -58,7 +61,7 @@ async fn run_connection(
     // The registry holds the only control sender: fan-out reaches this connection
     // through the same bounded queue as any other Device of this User.
     let (control_tx, mut control_rx) = mpsc::channel::<ServerEvent>(CONTROL_QUEUE_CAPACITY);
-    let connection_id = hub
+    let (connection_id, presence) = hub
         .registry()
         .register(device.user_id.clone(), control_tx)
         .await;
@@ -70,6 +73,21 @@ async fn run_connection(
         hub.replay_capacity(),
         connection_id.value(),
     );
+
+    // The User's **first** live Device connected, so they are reachable now. Only
+    // the first: the registry reports `Unchanged` for a second Device of an account
+    // that is already online, which is what stops a phone and a laptop reporting
+    // each other offline.
+    //
+    // Announced *before* the opening heartbeat, deliberately. The registration is
+    // already in the registry, and completing the fan-out first means a peer that
+    // has seen this connection's first frame has already been told about it — so
+    // presence can never arrive behind an event the client has already acted on.
+    // The extra database read defers the handshake by microseconds and buys
+    // ordering that no timestamp could reconstruct.
+    if presence == PresenceChange::BecameOnline {
+        hub.user_came_online(&device.user_id).await;
+    }
 
     session.send_ping().await?;
     // The Device's stored positions, when it has any, so it can repair forward
@@ -91,6 +109,24 @@ async fn run_connection(
                 // long-lived connection cannot accumulate unflushed progress for
                 // longer than one interval.
                 session.flush_cursors().await;
+                // And the presence checkpoint: whichever connection takes the flush
+                // lock stamps every reachable User in one statement, so a node with
+                // many connections still writes once per interval.
+                hub.checkpoint_presence().await;
+                // A peer that has stopped answering its heartbeat is gone even
+                // though the socket still looks open — the half-open connection
+                // ADR-0013 describes, seen from the server. Ending the loop drives
+                // the same teardown as a clean close, so presence follows one path.
+                if session
+                    .liveness()
+                    .is_expired(hub.dead_connection_timeout(), Instant::now())
+                {
+                    tracing::debug!(
+                        user_id = %device.user_id,
+                        "closing a connection that missed its heartbeat deadline"
+                    );
+                    break;
+                }
             }
             incoming = control_rx.recv() => match incoming {
                 Some(event) => {
@@ -117,9 +153,19 @@ async fn run_connection(
         }
     }
 
-    hub.registry()
+    let presence = hub
+        .registry()
         .unregister(&device.user_id, connection_id)
         .await;
+
+    // The User's **last** Device went away, so they stopped being reachable. This
+    // runs after the registry stopped counting them, so the status the audience is
+    // told is already offline; the last-seen instant is persisted here rather than
+    // left to the next heartbeat, because the User has left the online set and this
+    // is the last moment their instant can be recorded.
+    if presence == PresenceChange::BecameOffline {
+        hub.user_went_offline(&device.user_id).await;
+    }
 
     // The last checkpoint this connection is sure to make: flush the cursor
     // progress it coalesced before its state goes away. A clean teardown (a page

@@ -82,4 +82,32 @@ describe("ConversationList", () => {
     expect(wrapper.text()).toContain("九月小组");
     expect(wrapper.text()).toContain("3 位成员");
   });
+
+  it("marks a Direct Conversation whose peer is online", () => {
+    const wrapper = mount(ConversationList, {
+      props: {
+        conversations: [conversation()],
+        activeId: null,
+        loading: false,
+        unreadCounts: {},
+        presence: { "01JABC1234567890ABCDEFGHJ3": "online" },
+      },
+    });
+
+    expect(wrapper.find('[data-test="presence-dot"]').exists()).toBe(true);
+  });
+
+  it("leaves an offline peer unmarked", () => {
+    const wrapper = mount(ConversationList, {
+      props: {
+        conversations: [conversation()],
+        activeId: null,
+        loading: false,
+        unreadCounts: {},
+        presence: { "01JABC1234567890ABCDEFGHJ3": "offline" },
+      },
+    });
+
+    expect(wrapper.find('[data-test="presence-dot"]').exists()).toBe(false);
+  });
 });

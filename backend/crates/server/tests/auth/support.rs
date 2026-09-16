@@ -9,16 +9,17 @@
 use std::env;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::Router;
 use axum::body::{Body, to_bytes};
 use axum::http::{HeaderMap, Method, Request, StatusCode};
 use jiuyue_auth::{
-    AuthConfig, AuthService, InProcessLoginAttemptStore, LoginAttemptPolicy,
-    LoginAttemptPolicyBuilder,
+    AuthConfig, AuthService, InMemoryMailer, InProcessLoginAttemptStore, LoginAttemptPolicy,
+    LoginAttemptPolicyBuilder, LoginAttemptStore, Mailer, OutgoingMessage,
 };
-use jiuyue_contract::AuthSession;
+use jiuyue_contract::auth::RequestAccepted;
+use jiuyue_contract::{AuthSession, UserProfile};
 use jiuyue_server::{AppState, Config, app};
 use jiuyue_store::Store;
 use serde_json::{Value, json};
@@ -35,6 +36,7 @@ pub struct TestApp {
     store: Store,
     admin_url: String,
     schema: String,
+    mailer: Arc<InMemoryMailer>,
 }
 
 impl TestApp {
@@ -54,6 +56,25 @@ impl TestApp {
     pub async fn start_with_login_policy(
         policy: LoginAttemptPolicy,
     ) -> (Self, Arc<InProcessLoginAttemptStore>) {
+        let (app, login, _email) =
+            Self::start_with_policies(policy, LoginAttemptPolicy::default()).await;
+
+        (app, login)
+    }
+
+    /// Build the real router with chosen login- and email-limiting policies.
+    ///
+    /// The email limiter guards the endpoints that trigger mail
+    /// (`forgot-password`, `resend-verification`); it is a separate bucket from
+    /// login, so tests configure it independently.
+    pub async fn start_with_policies(
+        login_policy: LoginAttemptPolicy,
+        email_policy: LoginAttemptPolicy,
+    ) -> (
+        Self,
+        Arc<InProcessLoginAttemptStore>,
+        Arc<InProcessLoginAttemptStore>,
+    ) {
         let admin_url = database_url();
         let schema = unique_schema_name();
 
@@ -69,14 +90,17 @@ impl TestApp {
             .await
             .expect("migrations must apply to an empty schema");
 
-        let login_store = Arc::new(InProcessLoginAttemptStore::new(policy));
-        let auth = AuthService::with_login_store(
-            store.pool().clone(),
-            AuthConfig::new(TEST_SECRET),
-            Arc::clone(&login_store) as Arc<dyn jiuyue_auth::LoginAttemptStore>,
-        )
-        .await
-        .expect("the identity service must build with a valid secret");
+        let login_store = Arc::new(InProcessLoginAttemptStore::new(login_policy));
+        let email_store = Arc::new(InProcessLoginAttemptStore::new(email_policy));
+        let mailer = Arc::new(InMemoryMailer::new());
+
+        let auth = AuthService::builder(store.pool().clone(), AuthConfig::new(TEST_SECRET))
+            .login_store(Arc::clone(&login_store) as Arc<dyn LoginAttemptStore>)
+            .email_store(Arc::clone(&email_store) as Arc<dyn LoginAttemptStore>)
+            .mailer(Arc::clone(&mailer) as Arc<dyn Mailer>)
+            .build()
+            .await
+            .expect("the identity service must build with a valid secret");
 
         let router = app(AppState::with_auth(Config::default(), auth));
 
@@ -86,14 +110,21 @@ impl TestApp {
                 store,
                 admin_url,
                 schema,
+                mailer,
             },
             login_store,
+            email_store,
         )
     }
 
     /// A clone of the router, ready for one request.
     pub fn router(&self) -> Router {
         self.router.clone()
+    }
+
+    /// The captured-mail transport, for asserting on what was "sent".
+    pub fn mailer(&self) -> &InMemoryMailer {
+        &self.mailer
     }
 
     /// The pool writing into this test's schema, for direct assertions.
@@ -300,6 +331,121 @@ pub fn error_code(body: &Value) -> &str {
 /// The `error.retry_after_seconds` hint, when the response carried one.
 pub fn error_retry_after(body: &Value) -> Option<u64> {
     body["error"]["retry_after_seconds"].as_u64()
+}
+
+/// How long a test waits for a queued email to be captured.
+pub const MAIL_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Which of the two emails a test is waiting for.
+///
+/// The two are told apart by the path on their link, not by arrival order: a
+/// registration and a reset can both be in flight for the same address, so "the
+/// next message" is not a reliable answer and a link is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MailKind {
+    /// The address-verification link (`/verify-email?token=…`).
+    Verification,
+    /// The password-reset link (`/reset-password?token=…`).
+    Reset,
+}
+
+impl MailKind {
+    /// The route fragment that identifies this kind of link.
+    fn link_path(self) -> &'static str {
+        match self {
+            Self::Verification => "/verify-email?token=",
+            Self::Reset => "/reset-password?token=",
+        }
+    }
+}
+
+/// The token carried by the first link in a captured message.
+pub fn token_from_message(message: &OutgoingMessage) -> String {
+    let link = InMemoryMailer::first_link(message)
+        .unwrap_or_else(|| panic!("the message carried no link: {message:?}"));
+
+    link.split("token=")
+        .nth(1)
+        .unwrap_or_else(|| panic!("the link carried no token: {link}"))
+        .to_owned()
+}
+
+/// Wait until `email` has received `count` messages of `kind`, then return the
+/// token from the newest one.
+///
+/// Delivery happens on a spawned task, so this polls (bounded by [`MAIL_TIMEOUT`])
+/// rather than sleeping a guessed interval. Counting per address and per kind is
+/// what keeps it correct when several messages are in flight at once.
+pub async fn wait_for_token(app: &TestApp, email: &str, kind: MailKind, count: usize) -> String {
+    let deadline = tokio::time::Instant::now() + MAIL_TIMEOUT;
+
+    loop {
+        let matching: Vec<OutgoingMessage> = app
+            .mailer()
+            .messages_to(email)
+            .into_iter()
+            .filter(|message| message.text.contains(kind.link_path()))
+            .collect();
+
+        if matching.len() >= count {
+            return token_from_message(matching.last().expect("the list is non-empty"));
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            panic!(
+                "{email} never received {count} {kind:?} email(s) within {MAIL_TIMEOUT:?}; \
+                 captured: {:?}",
+                app.mailer().messages_to(email)
+            );
+        }
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Follow the newest verification link sent to `email` and return the profile.
+pub async fn verify_address(app: &TestApp, email: &str) -> UserProfile {
+    let token = wait_for_token(app, email, MailKind::Verification, 1).await;
+    let (status, body) = post_json(app, "/auth/verify-email", &json!({ "token": token })).await;
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "following the verification link must succeed: {body}"
+    );
+
+    serde_json::from_value(body).expect("the verification response must match UserProfile")
+}
+
+/// Insert an already-expired one-shot token for `email` and return the raw token.
+///
+/// Backdating in SQL is the only honest way to test expiry: the redemption check
+/// is evaluated by the database's clock, so a test that shortened a TTL in the
+/// application would not exercise it.
+pub async fn insert_expired_token(app: &TestApp, email: &str, id: &str, purpose: &str) -> String {
+    let raw = format!("expired-{purpose}-{id}");
+    let hash = jiuyue_auth::TokenIssuer::hash_link_token(&raw);
+
+    sqlx::query(
+        "INSERT INTO account_tokens (id, user_id, purpose, token_hash, expires_at) \
+         SELECT $1, u.id, $2, $3, now() - interval '1 hour' \
+         FROM users AS u WHERE u.email = $4",
+    )
+    .bind(id)
+    .bind(purpose)
+    .bind(&hash)
+    .bind(email)
+    .execute(app.pool())
+    .await
+    .expect("inserting an expired token must succeed");
+
+    raw
+}
+
+/// An `ErrorBody`-shaped acceptance body, asserted against the fixed contract.
+pub fn accepted_body(body: &Value) -> RequestAccepted {
+    serde_json::from_value(body.clone())
+        .unwrap_or_else(|error| panic!("expected a RequestAccepted body, got {body}: {error}"))
 }
 
 /// Panics with an actionable message when no database is configured.
