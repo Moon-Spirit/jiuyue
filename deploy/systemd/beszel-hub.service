@@ -1,0 +1,49 @@
+# Beszel hub — the resource-usage view for the jiuyue box. No containers (ADR-0010).
+#
+# Installed to /etc/systemd/system/beszel-hub.service by deploy/monitor/install-beszel.sh.
+#
+# Beszel is the light option from docs/research/2026-09-16-vps-2gb-ops-research.md
+# §(e): hub ~30-50 MB RSS, agent ~10-30 MB, versus Netdata's 150-400 MB. It is
+# the VIEW; threshold alerting and crash-loop detection live in monitor.sh, which
+# CI can actually trigger and capture.
+#
+# The hub binds loopback only. Reach its UI through an SSH tunnel:
+#   ssh -L 8090:127.0.0.1:8090 ops@your-host   ->   http://localhost:8090
+#
+# This unit is validated on every push by .github/workflows/monitor-validate.yml
+# (`systemd-analyze verify`).
+
+[Unit]
+Description=Beszel hub (resource usage view)
+Documentation=https://github.com/Moon-Spirit/jiuyue/blob/main/docs/monitoring.md
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=beszel
+Group=beszel
+WorkingDirectory=/var/lib/beszel
+# The hub is PocketBase-based; `--dir` is where its SQLite data lives (there is
+# no BESZEL_DATA env var). `--http` keeps it on loopback only.
+ExecStart=/opt/beszel/beszel serve --http 127.0.0.1:8090 --dir /var/lib/beszel
+
+Restart=always
+RestartSec=5
+
+# Blast-radius cap (hub typical 30-50 MB). See docs/monitoring.md §3.
+MemoryAccounting=yes
+MemoryHigh=64M
+MemoryMax=96M
+
+# --- hardening --------------------------------------------------------------
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+ReadWritePaths=/var/lib/beszel
+
+[Install]
+WantedBy=multi-user.target

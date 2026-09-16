@@ -363,45 +363,61 @@ ufw enable
 
 ---
 
-## 12. 监控
+## 12. 监控与告警
 
-按 research §(e) 的轻量结论，不要上 Prometheus+Grafana：
+完整设计、告警目录、内存/日志算术与 runbook 见 [`docs/monitoring.md`](./monitoring.md)。
+按 research §(e) 的轻量结论，**不要上 Prometheus+Grafana，也不要 Netdata**（后者 150-400 MB，是 2 GB 机器的三分之一）：
 
-1. **Beszel agent**（+ hub，可在别处）——CPU/内存/磁盘/网络、阈值告警；
-2. **Uptime Kuma `-slim` + SQLite**——HTTP 关键字检查公网入口、TCP 443、SSH，以及备份任务的 push 心跳
-   （**不要**用内置 MariaDB、不要用 Chromium 浏览器监控，二者在 2 GB 机器上会 OOM）；
-3. **外部检查**——用一个不在本机上的第三方检测公网 URL，机器整体挂掉时才有信号。
+1. **`deploy/monitor/monitor.sh` + `jiuyue-monitor.timer`（每分钟）** —— 磁盘/内存阈值、关键服务停止、
+   **`Restart=always` 的崩溃循环**，全部 POST 到 `ALERT_WEBHOOK_URL`；告警去重、恢复通知、重启记录到
+   `/var/lib/jiuyue-monitor/restarts.log`。这是 CI 里可被**真实触发并捕获**的那条链路。
+2. **Beszel（hub + agent，原生二进制）** —— 资源使用视图（CPU/内存/磁盘/网络历史），
+   agent ~10-30 MB、hub ~30-50 MB；hub 只监听 `127.0.0.1:8090`，经 SSH 隧道访问。
+   安装：`sudo bash deploy/monitor/install-beszel.sh --version <pinned>`。
+3. **外部检查** —— 机器整体挂掉时，机内监控发不出任何东西，必须有一个**机器外**的第三方检查打公网 URL。
+4. **日志上限**：journald `SystemMaxUse=200M`（后端与 Caddy 都进 journald）+ PostgreSQL 文件日志由
+   `deploy/logrotate/jiuyue-postgresql` 以 `size 50M` × `rotate 5` 轮转（Debian 用 `pg_ctl -l` 重定向，
+   `logging_collector=off`，PostgreSQL 自身的 `log_rotation_*` 不生效）。到顶时 journald 从旧到新 vacuum、
+   logrotate 截断并删除最旧一份，`/` 占用长期稳定。
 
-只开两条告警起步：**磁盘 > 85%** 与**关键服务不在运行**。另外盯：`systemctl status jiuyue` 的重启、
-`journalctl` 里的 OOM、Postgres 连接占用率、持续 swap in/out、`MemAvailable` 低于 10–15%。
+告警默认从宽到严起步：磁盘 80/90%、内存可用 15/8%、服务停止（连续 2 次）、崩溃循环（10 分钟内 ≥5 次）。
+备份失败仍由 `backup.sh` 的心跳（`HEARTBEAT_URL`，可指向一个 Uptime Kuma push monitor，可在别处）通知。
 
 ---
 
 ## 13. 验证状态（诚实清单）
 
-| 检查项                                                            | 在哪里验证                                     | 状态                          |
-| ----------------------------------------------------------------- | ---------------------------------------------- | ----------------------------- |
-| Caddyfile 语法 / 结构                                             | CI `caddy validate`                            | CI 每次推送                   |
-| systemd unit 与 drop-in 语法                                      | CI `systemd-analyze verify`                    | CI 每次推送                   |
-| 部署脚本语法 / lint                                               | CI `bash -n` + `shellcheck`                    | CI 每次推送                   |
-| 无 CRLF、env 模板变量齐全                                         | CI                                             | CI 每次推送                   |
-| 证书签发/续期、HTTP→HTTPS、真实域名路由                           | 需要真实服务器与域名                           | **未验证**                    |
-| `MemoryMax`/`LimitNOFILE` 的实际生效                              | 需要真实服务器                                 | **未验证**                    |
-| `deploy.sh` 端到端（下载→校验→切换→重启→健康→回滚）               | 需要真实服务器与 systemd                       | **未验证**                    |
-| PostgreSQL 调参、swap 的实际表现                                  | 需要真实服务器负载                             | **未验证**                    |
-| Caddy 重载时的 WebSocket 保留行为                                 | 需要真实浏览器与 live 连接                     | **未验证**                    |
-| 制品打包内容（`bin/` + `dist/` + `VERSION`）                      | CI `Release` 工作流冒烟任务                    | CI 每次 push main / 标签      |
-| 制品 `.sha256` 侧车能被 `sha256sum -c` 验证                       | CI `Release` 工作流冒烟任务                    | CI 每次 push main / 标签      |
-| 制品能在 Linux 上真跑（真 PostgreSQL，`/health` = ok 且版本一致） | CI `Release` 工作流冒烟任务                    | CI 每次 push main / 标签      |
-| `deploy.sh` 端到端（假 systemd + 真二进制 + 真健康检查）          | CI `Release` 工作流冒烟任务                    | CI 每次 push main / 标签      |
-| GitHub Release 发布（`v*` 标签 → tar.gz + 侧车可下载）            | 首次打 `v*` 标签时                             | **未验证**（仓库尚无标签）    |
-| 备份/恢复脚本 lint、CRLF、systemd unit、env 模板                  | CI `Backup and restore` lint                   | CI 每次推送                   |
-| **恢复演练**：备份 → 销毁 → 从远端副本恢复 → 逐表逐字节一致       | CI `Backup and restore` `restore-drill` + 本机 | **已验证**（见 drills 记录）  |
-| 文件存储纳入备份（空文件、带空格文件名）                          | CI `restore-drill` / 本机演练                  | **已验证**                    |
-| 备份失败会发出 `status=down` 心跳                                 | CI `alerting` / 本机捕获                       | **已验证**                    |
-| 制品离开机器前确为密文（OpenPGP 包头 + 可解析）                   | CI `restore-drill` / 本机演练                  | **已验证**                    |
-| `rclone` 上传真实对象存储、远端保留对真实 bucket 生效             | 需要真实 bucket 与凭据                         | **未验证**（CI 指向本地目录） |
-| Uptime Kuma 因心跳缺席而告警（「没备份」那条路径）                | 需要真实 Kuma 实例                             | **未验证**                    |
+| 检查项                                                             | 在哪里验证                                     | 状态                          |
+| ------------------------------------------------------------------ | ---------------------------------------------- | ----------------------------- |
+| Caddyfile 语法 / 结构                                              | CI `caddy validate`                            | CI 每次推送                   |
+| systemd unit 与 drop-in 语法                                       | CI `systemd-analyze verify`                    | CI 每次推送                   |
+| 部署脚本语法 / lint                                                | CI `bash -n` + `shellcheck`                    | CI 每次推送                   |
+| 无 CRLF、env 模板变量齐全                                          | CI                                             | CI 每次推送                   |
+| 证书签发/续期、HTTP→HTTPS、真实域名路由                            | 需要真实服务器与域名                           | **未验证**                    |
+| `MemoryMax`/`LimitNOFILE` 的实际生效                               | 需要真实服务器                                 | **未验证**                    |
+| `deploy.sh` 端到端（下载→校验→切换→重启→健康→回滚）                | 需要真实服务器与 systemd                       | **未验证**                    |
+| PostgreSQL 调参、swap 的实际表现                                   | 需要真实服务器负载                             | **未验证**                    |
+| Caddy 重载时的 WebSocket 保留行为                                  | 需要真实浏览器与 live 连接                     | **未验证**                    |
+| 制品打包内容（`bin/` + `dist/` + `VERSION`）                       | CI `Release` 工作流冒烟任务                    | CI 每次 push main / 标签      |
+| 制品 `.sha256` 侧车能被 `sha256sum -c` 验证                        | CI `Release` 工作流冒烟任务                    | CI 每次 push main / 标签      |
+| 制品能在 Linux 上真跑（真 PostgreSQL，`/health` = ok 且版本一致）  | CI `Release` 工作流冒烟任务                    | CI 每次 push main / 标签      |
+| `deploy.sh` 端到端（假 systemd + 真二进制 + 真健康检查）           | CI `Release` 工作流冒烟任务                    | CI 每次 push main / 标签      |
+| GitHub Release 发布（`v*` 标签 → tar.gz + 侧车可下载）             | 首次打 `v*` 标签时                             | **未验证**（仓库尚无标签）    |
+| 备份/恢复脚本 lint、CRLF、systemd unit、env 模板                   | CI `Backup and restore` lint                   | CI 每次推送                   |
+| **恢复演练**：备份 → 销毁 → 从远端副本恢复 → 逐表逐字节一致        | CI `Backup and restore` `restore-drill` + 本机 | **已验证**（见 drills 记录）  |
+| 文件存储纳入备份（空文件、带空格文件名）                           | CI `restore-drill` / 本机演练                  | **已验证**                    |
+| 备份失败会发出 `status=down` 心跳                                  | CI `alerting` / 本机捕获                       | **已验证**                    |
+| 制品离开机器前确为密文（OpenPGP 包头 + 可解析）                    | CI `restore-drill` / 本机演练                  | **已验证**                    |
+| `rclone` 上传真实对象存储、远端保留对真实 bucket 生效              | 需要真实 bucket 与凭据                         | **未验证**（CI 指向本地目录） |
+| Uptime Kuma 因心跳缺席而告警（「没备份」那条路径）                 | 需要真实 Kuma 实例                             | **未验证**                    |
+| `monitor.sh`/`install-beszel.sh` 语法、shellcheck、CRLF、unit 语法 | CI `Monitor and logs` lint                     | CI 每次推送                   |
+| journald 上限被 systemd 识别、PG 日志参数被真实 postgres 接受      | CI `Monitor and logs` lint                     | CI 每次推送                   |
+| **四类告警真的到达 sink**（磁盘/内存/服务停止/崩溃循环）           | CI `Monitor and logs` `alerting` 捕获端点      | **已验证**                    |
+| 告警去重（cooldown）与恢复通知                                     | CI `Monitor and logs` `alerting`               | **已验证**                    |
+| `install-beszel.sh` 校验和缺失/不匹配时拒绝                        | CI `Monitor and logs` lint（假制品）           | **已验证**                    |
+| Beszel 真二进制运行、hub UI 可访问、真实内存占用                   | 需要真实服务器                                 | **未验证**（CI 用假制品）     |
+| systemd timer 每分钟触发、journald 真机满盘 vacuum                 | 需要真实服务器                                 | **未验证**                    |
+| 真实 webhook 频道（Slack/ntfy/…）收到告警                          | 需要真实 webhook                               | **未验证**                    |
 
 > 本地开发机是 Windows，无法运行 systemd 或 Caddy，所以上述"未验证"项只能靠 CI 或真实服务器确认。
 > `deploy.sh` 现在不再只靠语法检查：`Release` 工作流在 Linux runner 上用**假 systemd + 真二进制 + 真
@@ -413,23 +429,33 @@ ufw enable
 
 ## 14. 文件清单
 
-| 文件                                                                  | 作用                                                           |
-| --------------------------------------------------------------------- | -------------------------------------------------------------- |
-| `deploy/systemd/jiuyue.service`                                       | 后端 unit：非特权用户、资源上限、加固、PG 就绪门禁             |
-| `deploy/systemd/drop-ins/postgresql@16-main.service.d/10-memory.conf` | PostgreSQL 内存上限与 OOM 保护                                 |
-| `deploy/systemd/drop-ins/caddy.service.d/10-jiuyue-env.conf`          | Caddy 的环境文件与内存上限                                     |
-| `deploy/Caddyfile`                                                    | 自动 HTTPS + `/api` 反向代理 + `/ws` 调优 + 静态 SPA           |
-| `deploy/deploy.sh`                                                    | 唯一发布入口：校验制品、切换、重启、健康检查、失败回滚         |
-| `deploy/provision.sh`                                                 | 一次性幂等初始化（包/用户/目录/swap/PG/Caddy/密钥/unit）       |
-| `deploy/postgresql/jiuyue-tuning.conf`                                | PostgreSQL 16 调参 drop-in                                     |
-| `deploy/env/jiuyue.env.example`                                       | 运行时变量模板（占位符，无真实密钥）                           |
-| `deploy/backup.sh`                                                    | 每日备份：dump + 文件存储 + 加密 + 上传 + 分离保留 + 心跳      |
-| `deploy/restore.sh`                                                   | 从备份集恢复数据库与文件存储（sha256 不匹配即拒绝）            |
-| `deploy/restore-drill.sh`                                             | 恢复演练：销毁 → 从远端恢复 → 逐字节比对                       |
-| `deploy/env/backup.env.example`                                       | 备份配置模板（保留天数、远端、心跳 URL；占位符）               |
-| `deploy/systemd/jiuyue-backup.service` / `.timer`                     | 每日 18:30 UTC 执行备份（systemd timer，非 cron）              |
-| `docs/backup.md`                                                      | 备份与恢复的完整设计与诚实清单                                 |
-| `docs/drills/2026-09-17-restore-drill.md`                             | 最近一次恢复演练的日期化记录                                   |
-| `.github/workflows/deploy-validate.yml`                               | 每次推送校验上述全部制品                                       |
-| `.github/workflows/backup-restore.yml`                                | 每次推送跑真恢复演练与失败告警断言                             |
-| `.github/workflows/release.yml`                                       | 构建发布制品（tar.gz + `.sha256`）、冒烟真跑、标签时发 Release |
+| 文件                                                                  | 作用                                                                 |
+| --------------------------------------------------------------------- | -------------------------------------------------------------------- |
+| `deploy/systemd/jiuyue.service`                                       | 后端 unit：非特权用户、资源上限、加固、PG 就绪门禁                   |
+| `deploy/systemd/drop-ins/postgresql@16-main.service.d/10-memory.conf` | PostgreSQL 内存上限与 OOM 保护                                       |
+| `deploy/systemd/drop-ins/caddy.service.d/10-jiuyue-env.conf`          | Caddy 的环境文件与内存上限                                           |
+| `deploy/Caddyfile`                                                    | 自动 HTTPS + `/api` 反向代理 + `/ws` 调优 + 静态 SPA                 |
+| `deploy/deploy.sh`                                                    | 唯一发布入口：校验制品、切换、重启、健康检查、失败回滚               |
+| `deploy/provision.sh`                                                 | 一次性幂等初始化（包/用户/目录/swap/PG/Caddy/密钥/unit）             |
+| `deploy/postgresql/jiuyue-tuning.conf`                                | PostgreSQL 16 调参 drop-in                                           |
+| `deploy/env/jiuyue.env.example`                                       | 运行时变量模板（占位符，无真实密钥）                                 |
+| `deploy/backup.sh`                                                    | 每日备份：dump + 文件存储 + 加密 + 上传 + 分离保留 + 心跳            |
+| `deploy/restore.sh`                                                   | 从备份集恢复数据库与文件存储（sha256 不匹配即拒绝）                  |
+| `deploy/restore-drill.sh`                                             | 恢复演练：销毁 → 从远端恢复 → 逐字节比对                             |
+| `deploy/env/backup.env.example`                                       | 备份配置模板（保留天数、远端、心跳 URL；占位符）                     |
+| `deploy/systemd/jiuyue-backup.service` / `.timer`                     | 每日 18:30 UTC 执行备份（systemd timer，非 cron）                    |
+| `docs/backup.md`                                                      | 备份与恢复的完整设计与诚实清单                                       |
+| `docs/drills/2026-09-17-restore-drill.md`                             | 最近一次恢复演练的日期化记录                                         |
+| `.github/workflows/deploy-validate.yml`                               | 每次推送校验上述全部制品                                             |
+| `.github/workflows/backup-restore.yml`                                | 每次推送跑真恢复演练与失败告警断言                                   |
+| `.github/workflows/release.yml`                                       | 构建发布制品（tar.gz + `.sha256`）、冒烟真跑、标签时发 Release       |
+| `deploy/monitor/monitor.sh`                                           | 每分钟的磁盘/内存/服务/崩溃循环检查 + webhook 告警 + 状态记录        |
+| `deploy/systemd/jiuyue-monitor.service` / `.timer`                    | 每分钟执行 `monitor.sh all`（oneshot，绝不自旋）                     |
+| `deploy/monitor/install-beszel.sh`                                    | 原生安装 Beszel hub/agent（校验和不匹配即拒绝）                      |
+| `deploy/systemd/beszel-hub.service` / `beszel-agent.service`          | 资源使用视图（Beszel）的 systemd 单元                                |
+| `deploy/systemd/journald.conf.d/10-jiuyue-limits.conf`                | journald 显式容量/保留上限（后端 + Caddy 的日志）                    |
+| `deploy/postgresql/jiuyue-logging.conf`                               | PostgreSQL 日志量限制（`logging_collector=off`，轮转交给 logrotate） |
+| `deploy/logrotate/jiuyue-postgresql`                                  | PostgreSQL 日志 `size 50M` × `rotate 5` 轮转（接管 Debian 的配置）   |
+| `deploy/env/monitor.env.example` / `beszel.env.example`               | 监控与视图配置模板（占位符，无真实 URL/密钥）                        |
+| `docs/monitoring.md`                                                  | 监控、告警、日志轮转的完整设计与 runbook                             |
+| `.github/workflows/monitor-validate.yml`                              | 校验配置并**触发/捕获**四类告警                                      |

@@ -58,10 +58,30 @@
 //! clients must key on Message ID and apply duplicates harmlessly. That is
 //! deliberate — exactly-once is not attempted, and duplicates are the price of
 //! never losing a Message.
+//!
+//! # Per-Device sync cursors
+//!
+//! The handshake above repairs the **connection**; it does not remember what a
+//! **Device** had consumed before the process or the laptop went away. That state
+//! is a Sync Cursor (CONTEXT.md), scoped to the connection's [`Device`] and
+//! persisted by `jiuyue-chat`:
+//!
+//! - On connect, when the Device has stored cursors, the connection pushes
+//!   `ServerEvent::SyncState` right after the opening heartbeat. It carries
+//!   **positions, never Messages**, so the frame is bounded by the Device's
+//!   Conversation count; the missed Messages are pulled with the existing forward
+//!   walk, one bounded page at a time.
+//! - The client reports progress with `ClientEvent::SyncCursor`. The connection
+//!   coalesces those reports in memory (one entry per Conversation, highest wins)
+//!   and checkpoints them on the heartbeat, on teardown, and when the pending set
+//!   crosses [`CURSOR_CHECKPOINT_BATCH`] — never one write per Message. A crash
+//!   between checkpoints loses at most one heartbeat interval, which the Device
+//!   re-fetches harmlessly.
 
 #![forbid(unsafe_code)]
 
 mod connection;
+mod cursor;
 mod registry;
 mod replay;
 mod session;
@@ -106,7 +126,36 @@ pub const CONTROL_QUEUE_CAPACITY: usize = 64;
 ///
 /// The opening heartbeat fires on connect; this is the period of the ones after
 /// it. It is the wall-clock evidence a client uses to notice a half-open socket.
+/// It doubles as the Sync Cursor checkpoint interval: a connection flushes the
+/// cursors it has coalesced on every beat, so a process death loses at most one
+/// interval of progress and the Device re-fetches that tail idempotently.
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+
+/// How many distinct Conversation cursors one connection coalesces in memory
+/// before it checkpoints them without waiting for the next heartbeat.
+///
+/// The coalescing is the write-amplification guard: a client reporting after every
+/// Message still produces **one** database statement per flush, because the map is
+/// keyed by Conversation and keeps only the highest position. This bound keeps
+/// that map from growing without limit on a Device that touches many Conversations
+/// between two heartbeats.
+pub const CURSOR_CHECKPOINT_BATCH: usize = 64;
+
+/// The authenticated Device a connection belongs to (CONTEXT.md: Device).
+///
+/// A Device is a `sessions` row — a logged-in client instance — and it is the
+/// scope a **Sync Cursor** lives in (CONTEXT.md: 同步游标按 Device). The socket
+/// needs both halves: `user_id` for fan-out to every Device of the account, and
+/// `session_id` to persist and restore *this* Device's own position. Passing them
+/// as one value keeps the connection entry point at three arguments and makes
+/// "which Device is this" explicit rather than positional.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Device {
+    /// ULID of the authenticated User.
+    pub user_id: String,
+    /// ULID of the `sessions` row the access token proved.
+    pub session_id: String,
+}
 
 /// Failures raised while serving a realtime connection.
 #[derive(Debug, Error)]

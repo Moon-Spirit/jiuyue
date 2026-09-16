@@ -16,21 +16,30 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use jiuyue_contract::{
     ClientEnvelope, ClientEvent, MessageAck, MessageRejected, NewMessage, Ping, Resume, Resync,
-    ResyncReason, SendMessage, ServerEnvelope, ServerEvent,
+    ResyncReason, SendMessage, ServerEnvelope, ServerEvent, SyncCursor, SyncState,
 };
 use tokio::sync::mpsc;
 
+use crate::cursor::CursorCheckpoint;
 use crate::replay::ReplayBuffer;
-use crate::{RealtimeError, RealtimeHub};
+use crate::{Device, RealtimeError, RealtimeHub};
 
-/// One connection: the authenticated User, the hub it belongs to, and the writer.
+/// One connection: the authenticated Device, the hub it belongs to, and the writer.
 ///
 /// A struct rather than a bag of arguments keeps frame handling to one parameter
-/// and makes `user_id` / `hub` available exactly where the send path needs them.
+/// and makes the Device / hub available exactly where the send path needs them.
+///
+/// `cursors` is the Sync Cursor write-coalescing buffer (see
+/// [`CursorCheckpoint`]): one entry per Conversation, holding the highest position
+/// this connection has been told the Device consumed. The buffer is flushed on the
+/// heartbeat, on teardown, and eagerly once it holds a whole batch of distinct
+/// Conversations; on a failed write it is kept, so the next flush retries instead
+/// of losing progress.
 pub(crate) struct Session<'a> {
-    user_id: &'a str,
+    device: &'a Device,
     hub: &'a RealtimeHub,
     writer: ConnectionWriter,
+    cursors: CursorCheckpoint,
 }
 
 impl<'a> Session<'a> {
@@ -40,22 +49,93 @@ impl<'a> Session<'a> {
     /// heartbeat so a client can prove which connection a resume position belongs
     /// to.
     pub(crate) fn new(
-        user_id: &'a str,
+        device: &'a Device,
         hub: &'a RealtimeHub,
         tx: mpsc::Sender<ServerEnvelope>,
         replay_capacity: usize,
         connection_id: u64,
     ) -> Self {
         Self {
-            user_id,
+            device,
             hub,
             writer: ConnectionWriter::new(tx, replay_capacity, connection_id),
+            cursors: CursorCheckpoint::default(),
         }
     }
 
     /// Enqueue a heartbeat.
     pub(crate) async fn send_ping(&mut self) -> Result<(), RealtimeError> {
         self.writer.send_ping().await
+    }
+
+    /// Push the Device's stored Sync Cursors, when it has any.
+    ///
+    /// This is the "resume/sync response" of the delivery protocol, and it is
+    /// deliberately silent for a Device with no stored progress: there is nothing
+    /// to resume, so the client keeps its pre-cursor behaviour (load the newest
+    /// page) and no frame is spent. A read failure is logged and swallowed — a
+    /// database hiccup must degrade the *hint*, not refuse the connection, because
+    /// the Conversation stream is still reachable over REST either way.
+    pub(crate) async fn send_sync_state(&mut self) -> Result<(), RealtimeError> {
+        let cursors = match self
+            .hub
+            .chat()
+            .list_sync_cursors(&self.device.session_id)
+            .await
+        {
+            Ok(cursors) => cursors,
+            Err(error) => {
+                tracing::warn!(%error, "could not load the device sync cursors");
+                return Ok(());
+            }
+        };
+
+        if cursors.is_empty() {
+            return Ok(());
+        }
+
+        self.send_event(ServerEvent::SyncState(SyncState { cursors }))
+            .await
+    }
+
+    /// Coalesce one reported Sync Cursor, checkpointing early if the buffer fills.
+    ///
+    /// The buffer keeps the highest position per Conversation, so a report that
+    /// arrives out of order (or a replay) cannot rewind it. Reports are never
+    /// persisted one at a time: [`Self::flush_cursors`] is the only writer.
+    pub(crate) async fn record_cursor(&mut self, cursor: &SyncCursor) {
+        if self.cursors.record(cursor) {
+            self.flush_cursors().await;
+        }
+    }
+
+    /// Persist every coalesced cursor the Device has reported.
+    ///
+    /// Best effort on purpose: a failure keeps the buffer so the next flush (the
+    /// heartbeat, or teardown) retries, and the Device merely re-fetches the tail
+    /// if the process dies first. The buffer is cleared only after a successful
+    /// write, so a checkpoint is never lost silently.
+    pub(crate) async fn flush_cursors(&mut self) {
+        if self.cursors.is_empty() {
+            return;
+        }
+
+        let batch = self.cursors.batch();
+        match self
+            .hub
+            .chat()
+            .save_sync_cursors(&self.device.session_id, &batch)
+            .await
+        {
+            Ok(()) => self.cursors.clear(),
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    pending = batch.len(),
+                    "could not checkpoint device sync cursors; will retry"
+                );
+            }
+        }
     }
 
     /// Enqueue an event, allocating its connection sequence.
@@ -90,6 +170,9 @@ impl<'a> Session<'a> {
             ClientEvent::Resume(resume) => {
                 self.resume(resume).await?;
             }
+            ClientEvent::SyncCursor(cursor) => {
+                self.record_cursor(cursor).await;
+            }
         }
 
         Ok(())
@@ -100,7 +183,7 @@ impl<'a> Session<'a> {
         match self
             .hub
             .chat()
-            .send_message(self.user_id, send.clone())
+            .send_message(&self.device.user_id, send.clone())
             .await
         {
             Ok(sent) => {

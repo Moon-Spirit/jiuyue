@@ -14,7 +14,7 @@
 use axum::extract::ws::WebSocketUpgrade;
 use axum::extract::{Query, State};
 use axum::response::Response;
-use jiuyue_realtime::{MAX_FRAME_SIZE, MAX_MESSAGE_SIZE};
+use jiuyue_realtime::{Device, MAX_FRAME_SIZE, MAX_MESSAGE_SIZE};
 use serde::Deserialize;
 
 use super::api::ApiError;
@@ -45,10 +45,18 @@ pub async fn upgrade(
         .map_err(ApiError::from)?;
     let hub = state.realtime()?;
 
+    // The socket is bound to the Device the access token proved, not merely to its
+    // User: a Sync Cursor is per Device (CONTEXT.md), so the connection must know
+    // which `sessions` row it is.
+    let device = Device {
+        user_id: session.user_id,
+        session_id: session.session_id,
+    };
+
     Ok(ws
         .max_frame_size(MAX_FRAME_SIZE)
         .max_message_size(MAX_MESSAGE_SIZE)
         .write_buffer_size(MAX_FRAME_SIZE)
         .max_write_buffer_size(MAX_FRAME_SIZE * 2)
-        .on_upgrade(move |socket| jiuyue_realtime::serve_connection(socket, session.user_id, hub)))
+        .on_upgrade(move |socket| jiuyue_realtime::serve_connection(socket, device, hub)))
 }

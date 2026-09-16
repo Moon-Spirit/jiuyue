@@ -1,0 +1,50 @@
+# jiuyue monitor — one-shot host/service check. No containers anywhere (ADR-0010).
+#
+# Installed to /etc/systemd/system/jiuyue-monitor.service by deploy/provision.sh,
+# which also installs deploy/monitor/monitor.sh to /usr/local/lib/jiuyue/.
+#
+# Triggered once a minute by jiuyue-monitor.timer. It reads journald and
+# `systemctl` state and POSTs any threshold breach to ALERT_WEBHOOK_URL.
+# Deliberately NOT `Restart=always`: a monitor that loops silently is worse than
+# no monitor. A failed run shows in `systemctl --failed` and journald.
+#
+# Runs as root because it reads the system journal and `systemctl` state; it
+# writes only under /var/lib/jiuyue-monitor. Webhook URL and thresholds come from
+# /etc/jiuyue/monitor.env.
+#
+# This unit is validated on every push by .github/workflows/monitor-validate.yml
+# (`systemd-analyze verify`).
+
+[Unit]
+Description=jiuyue monitor (disk/memory/service/restart checks -> webhook)
+Documentation=https://github.com/Moon-Spirit/jiuyue/blob/main/docs/monitoring.md
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/jiuyue/monitor.env
+ExecStart=/usr/local/lib/jiuyue/monitor.sh all
+
+# Never overlap with itself; a slow run must not stack. The timer also skips a
+# tick if the previous run is still alive.
+ConditionPathExists=/etc/jiuyue/monitor.env
+
+# --- hardening --------------------------------------------------------------
+NoNewPrivileges=yes
+# `full` keeps /usr, /boot and /etc read-only but leaves /run writable, which
+# systemctl needs to reach the bus. /var/lib/jiuyue-monitor stays writable.
+ProtectSystem=full
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=jiuyue-monitor

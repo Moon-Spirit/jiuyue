@@ -14,6 +14,7 @@
 //!   send turns out to be a replay. That is what keeps `seq` gapless *and* keeps a
 //!   retry from writing twice.
 
+use jiuyue_contract::SyncCursor;
 use sqlx::postgres::PgRow;
 use sqlx::types::time::OffsetDateTime;
 use sqlx::{Executor, PgPool, Postgres, Row};
@@ -124,6 +125,36 @@ const SELECT_MESSAGE_BY_CLIENT_ID: &str = "\
     SELECT id::text AS id, conversation_id::text AS conversation_id, seq, \
            sender_id::text AS sender_id, client_msg_id, body, created_at \
     FROM messages WHERE sender_id = $1 AND client_msg_id = $2";
+
+/// Checkpoint a Device's consumed positions in one statement.
+///
+/// The two parallel arrays are fed through `unnest`, exactly as [`INSERT_MEMBERS`]
+/// feeds the member list: one round trip regardless of how many Conversations the
+/// batch covers, which is the point of coalescing before writing.
+///
+/// `JOIN conversations` is what makes an unknown Conversation a silent no-op
+/// instead of a foreign-key failure that would sink the whole batch — the cursor
+/// is advisory state for this Device, so a stale report is dropped, not fatal.
+/// `GREATEST` keeps the cursor monotonic: several connections of one Device may
+/// report out of order, and a cursor must never rewind.
+const UPSERT_SYNC_CURSORS: &str = "\
+    INSERT INTO sync_cursors (session_id, conversation_id, last_seq) \
+    SELECT $1, candidate.conversation_id, candidate.last_seq \
+    FROM unnest($2::text[], $3::bigint[]) AS candidate (conversation_id, last_seq) \
+    JOIN conversations AS c ON c.id = candidate.conversation_id \
+    ON CONFLICT (session_id, conversation_id) \
+    DO UPDATE SET last_seq = GREATEST(sync_cursors.last_seq, EXCLUDED.last_seq), \
+                  updated_at = now()";
+
+/// The Device's stored cursors, most recently advanced first.
+///
+/// Ordered and bounded so one connect can never hand a client an unbounded frame:
+/// the caller passes `MAX_SYNC_CURSORS`, and the order is deterministic (a tie on
+/// `updated_at` falls back to the Conversation id) so two reads agree.
+const SELECT_SYNC_CURSORS: &str = "\
+    SELECT conversation_id::text AS conversation_id, last_seq \
+    FROM sync_cursors WHERE session_id = $1 \
+    ORDER BY updated_at DESC, conversation_id DESC LIMIT $2";
 
 /// A row of `conversations`, as this module needs it.
 #[derive(Debug, Clone)]
@@ -463,6 +494,56 @@ impl ChatRepository {
         }
 
         Ok((messages, has_more))
+    }
+
+    /// Checkpoint a batch of a Device's consumed positions.
+    ///
+    /// `cursors` must already be de-duplicated by the caller: PostgreSQL refuses an
+    /// `ON CONFLICT DO UPDATE` that would touch the same row twice, so a batch with
+    /// two entries for one Conversation is a statement error, not a last-writer-win.
+    /// Unknown Conversations are skipped by the `JOIN`; the rest are advanced
+    /// monotonically (`GREATEST`), so a replayed or out-of-order report is harmless.
+    pub async fn upsert_sync_cursors(
+        &self,
+        session_id: &str,
+        cursors: &[SyncCursor],
+    ) -> Result<(), ChatError> {
+        let conversation_ids: Vec<String> = cursors
+            .iter()
+            .map(|cursor| cursor.conversation_id.clone())
+            .collect();
+        let last_seqs: Vec<i64> = cursors.iter().map(|cursor| cursor.last_seq).collect();
+
+        sqlx::query(UPSERT_SYNC_CURSORS)
+            .bind(session_id)
+            .bind(&conversation_ids)
+            .bind(&last_seqs)
+            .execute(&self.pool)
+            .await
+            .map(|_| ())
+            .map_err(ChatError::Database)
+    }
+
+    /// A Device's stored cursors, most recently advanced first, at most `limit`.
+    pub async fn list_sync_cursors(
+        &self,
+        session_id: &str,
+        limit: i64,
+    ) -> Result<Vec<SyncCursor>, ChatError> {
+        sqlx::query(SELECT_SYNC_CURSORS)
+            .bind(session_id)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await
+            .map(|rows| {
+                rows.iter()
+                    .map(|row| SyncCursor {
+                        conversation_id: row.get("conversation_id"),
+                        last_seq: row.get("last_seq"),
+                    })
+                    .collect()
+            })
+            .map_err(ChatError::Database)
     }
 }
 

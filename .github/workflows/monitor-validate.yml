@@ -1,0 +1,382 @@
+# Monitor and logs —— CI 证明告警真的会到达，日志配置真的被接受
+#
+# 接管 issue #43（监控告警与日志轮转）的验收标准。这个工作流存在的理由只有两个：
+#   1. 让 "日志不会撑爆磁盘" 有证据：journald 的 drop-in 被 systemd 识别、PostgreSQL
+#      的参数被真实 postgres 接受且确实有界；
+#   2. 让 "告警可用" 有证据：**故意制造**磁盘/内存/服务停止/崩溃循环四类条件，
+#      断言它们真的 POST 到了本地捕获端点——不是"配置文件看起来对"。
+#
+# 不用任何容器（ADR-0010）：PostgreSQL、python3、systemd 都直接装在 runner 上，
+# `services: {}` 明确拒绝 service container。真实的 webhook 频道与真实的 Beszel
+# 二进制无法在这里验证，见 docs/monitoring.md §9 未验证清单。
+
+name: Monitor and logs
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  ALERT_PORT: "8097"
+
+jobs:
+  lint:
+    name: lint / CRLF / systemd / journald / PostgreSQL 配置
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    services: {} # 不使用 service container（ADR-0010）
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: No CRLF line endings in monitor/log artifacts
+        run: |
+          set -euo pipefail
+          offenders="$(grep -rlI $'\r' deploy docs .github/workflows || true)"
+          if [ -n "$offenders" ]; then
+            echo "::error::CRLF line endings found (bash/systemd require LF):"
+            echo "$offenders"
+            exit 1
+          fi
+          echo "LF-only: OK"
+
+      - name: Install pinned shellcheck
+        run: |
+          set -euo pipefail
+          version=v0.11.0
+          curl -fsSL -o /tmp/shellcheck.tar.gz \
+            "https://github.com/koalaman/shellcheck/releases/download/${version}/shellcheck-${version}.linux.x86_64.tar.gz"
+          tar -xzf /tmp/shellcheck.tar.gz -C "$RUNNER_TEMP"
+          "$RUNNER_TEMP/shellcheck-${version}/shellcheck" --version
+
+      - name: Shell syntax and lint
+        run: |
+          set -euo pipefail
+          bash -n deploy/monitor/monitor.sh deploy/monitor/install-beszel.sh deploy/provision.sh
+          "$RUNNER_TEMP/shellcheck-v0.11.0/shellcheck" --severity=warning \
+            deploy/monitor/monitor.sh deploy/monitor/install-beszel.sh deploy/provision.sh
+          echo "shell syntax and lint: OK"
+
+      - name: Verify the monitor systemd units
+        run: |
+          set -euo pipefail
+          # systemd-analyze verify resolves ExecStart and EnvironmentFile, so stage
+          # them first — the same trick deploy-validate.yml uses.
+          sudo install -d -m 0755 /usr/local/lib/jiuyue /etc/jiuyue /var/lib/jiuyue-monitor
+          printf '#!/bin/sh\nexit 0\n' | sudo tee /usr/local/lib/jiuyue/monitor.sh >/dev/null
+          sudo chmod 0755 /usr/local/lib/jiuyue/monitor.sh
+          sudo touch /etc/jiuyue/monitor.env
+          sudo cp deploy/systemd/jiuyue-monitor.service /etc/systemd/system/jiuyue-monitor.service
+          sudo cp deploy/systemd/jiuyue-monitor.timer   /etc/systemd/system/jiuyue-monitor.timer
+          sudo systemd-analyze verify /etc/systemd/system/jiuyue-monitor.service
+          sudo systemd-analyze verify /etc/systemd/system/jiuyue-monitor.timer
+          echo "monitor units verify: OK"
+
+      - name: Verify the Beszel systemd units
+        run: |
+          set -euo pipefail
+          sudo useradd --system --no-create-home --shell /usr/sbin/nologin beszel || true
+          sudo install -d -m 0755 /opt/beszel /var/lib/beszel /var/lib/beszel-agent
+          printf '#!/bin/sh\nexit 0\n' | sudo tee /opt/beszel/beszel >/dev/null
+          printf '#!/bin/sh\nexit 0\n' | sudo tee /opt/beszel/beszel-agent >/dev/null
+          sudo chmod 0755 /opt/beszel/beszel /opt/beszel/beszel-agent
+          sudo touch /etc/jiuyue/beszel.env
+          sudo cp deploy/systemd/beszel-hub.service   /etc/systemd/system/beszel-hub.service
+          sudo cp deploy/systemd/beszel-agent.service /etc/systemd/system/beszel-agent.service
+          sudo systemd-analyze verify /etc/systemd/system/beszel-hub.service
+          sudo systemd-analyze verify /etc/systemd/system/beszel-agent.service
+          echo "beszel units verify: OK"
+
+      - name: journald drop-in is picked up by systemd
+        run: |
+          set -euo pipefail
+          sudo install -d /etc/systemd/journald.conf.d
+          sudo cp deploy/systemd/journald.conf.d/10-jiuyue-limits.conf \
+                  /etc/systemd/journald.conf.d/10-jiuyue-limits.conf
+          merged="$(systemd-analyze cat-config systemd/journald.conf)"
+          echo "$merged"
+          fail=0
+          for kv in "SystemMaxUse=200M" "SystemMaxFileSize=20M" "SystemMaxFiles=10" \
+                    "MaxRetentionSec=2week" "SystemKeepFree=1G" "Storage=persistent" \
+                    "RuntimeMaxUse=64M"; do
+            if echo "$merged" | grep -qx -- "$kv"; then
+              echo "  ok: ${kv}"
+            else
+              echo "::error::journald config missing ${kv}"
+              fail=1
+            fi
+          done
+          [ "$fail" -eq 0 ] || exit 1
+          echo "journald limits: OK"
+
+      - name: PostgreSQL log config is accepted and bounds volume
+        run: |
+          set -euo pipefail
+          # No containers: install native PostgreSQL and initdb a throwaway cluster
+          # so a REAL postgres parses our conf.d drop-in. `postgres -C name` prints
+          # the effective value and exits — it rejects unknown/invalid parameters,
+          # which is exactly the assertion we want.
+          sudo apt-get update
+          sudo apt-get install -y postgresql-16 postgresql-client-16
+          base="$(mktemp -d)"
+          sudo chown postgres:postgres "$base"
+          pgdata="${base}/data"
+          sudo -u postgres /usr/lib/postgresql/16/bin/initdb -D "$pgdata" -E UTF8 --no-locale >/dev/null
+          sudo -u postgres tee -a "$pgdata/postgresql.conf" \
+            < deploy/postgresql/jiuyue-logging.conf >/dev/null
+          fail=0
+          for kv in "logging_collector=off" "log_destination=stderr" \
+                    "log_statement=none" "log_min_error_statement=error" \
+                    "log_min_duration_statement=500ms"; do
+            name="${kv%%=*}"
+            want="${kv#*=}"
+            got="$(sudo -u postgres /usr/lib/postgresql/16/bin/postgres -D "$pgdata" -C "$name")"
+            if [ "$got" = "$want" ]; then
+              echo "  ok: ${name}=${got}"
+            else
+              echo "::error::${name} is '${got}', expected '${want}'"
+              fail=1
+            fi
+          done
+          [ "$fail" -eq 0 ] || exit 1
+          echo "postgres log volume settings: OK"
+
+      - name: PostgreSQL logrotate config is valid and size-capped
+        run: |
+          set -euo pipefail
+          # PostgreSQL's own log_rotation_* do nothing under Debian's `pg_ctl -l`
+          # redirection, so the byte cap lives in logrotate — and is validated with
+          # a real logrotate dry run, not just by looking at the file.
+          sudo apt-get install -y logrotate
+          sudo install -d -m 0755 /var/log/postgresql
+          sudo touch /var/log/postgresql/postgresql-16-main.log
+          sudo cp deploy/logrotate/jiuyue-postgresql /etc/logrotate.d/jiuyue-postgresql
+          grep -qE '^[[:space:]]*size 50M$' deploy/logrotate/jiuyue-postgresql \
+            || { echo "::error::logrotate config is not size-capped at 50M"; exit 1; }
+          out="$(sudo logrotate -d /etc/logrotate.d/jiuyue-postgresql 2>&1)"
+          echo "$out"
+          echo "$out" | grep -q 'rotating pattern: /var/log/postgresql/\*.log' \
+            || { echo "::error::logrotate did not pick up /var/log/postgresql/*.log"; exit 1; }
+          echo "postgres logrotate: OK (size 50M, rotate 5, copytruncate)"
+
+      - name: Env templates cover the variables the monitor reads (placeholders only)
+        run: |
+          set -euo pipefail
+          missing=0
+          for var in ALERT_WEBHOOK_URL ALERT_COOLDOWN_SEC ALERT_STATE_DIR ALERT_NOTIFY_RECOVERY \
+                     MONITOR_SERVICES DISK_PATHS DISK_WARN_PERCENT DISK_CRIT_PERCENT \
+                     MEM_AVAILABLE_WARN_PERCENT MEM_AVAILABLE_CRIT_PERCENT SERVICE_DOWN_STRIKES \
+                     RESTART_SERVICE RESTART_WINDOW_SEC RESTART_THRESHOLD; do
+            if ! grep -qE "^${var}=" deploy/env/monitor.env.example; then
+              echo "::error::deploy/env/monitor.env.example is missing ${var}"
+              missing=1
+            fi
+          done
+          [ "$missing" -eq 0 ] || exit 1
+          if ! grep -qE '^ALERT_WEBHOOK_URL=https://[^/]*\.example\.com/' deploy/env/monitor.env.example; then
+            echo "::error::deploy/env/monitor.env.example must carry a .example.com placeholder webhook"
+            exit 1
+          fi
+          echo "monitor env template: OK (placeholders only)"
+          grep -qE '^LISTEN=' deploy/env/beszel.env.example \
+            || { echo "::error::deploy/env/beszel.env.example is missing LISTEN"; exit 1; }
+          grep -qE '^KEY=REPLACE_WITH_AGENT_PUBLIC_KEY$' deploy/env/beszel.env.example \
+            || { echo "::error::deploy/env/beszel.env.example does not carry the KEY placeholder"; exit 1; }
+          echo "beszel env template: OK (placeholders only)"
+
+      - name: install-beszel.sh refuses unverified binaries
+        run: |
+          set -euo pipefail
+          root="${RUNNER_TEMP}/beszel"
+          mkdir -p "${root}/asset" "${root}/opt"
+          # A fake but structurally real release: a tarball containing `beszel`.
+          printf '#!/bin/sh\necho fake-beszel\n' > "${root}/asset/beszel"
+          chmod 0755 "${root}/asset/beszel"
+          tar -czf "${root}/beszel_linux_amd64.tar.gz" -C "${root}/asset" beszel
+          good="$(sha256sum "${root}/beszel_linux_amd64.tar.gz" | awk '{print $1}')"
+
+          # 1. no checksum anywhere -> refuse
+          printf '0000000000000000000000000000000000000000000000000000000000000000  other.tar.gz\n' \
+            > "${root}/checksums-missing.txt"
+          if bash deploy/monitor/install-beszel.sh --version 9.9.9 --component hub \
+               --asset-url "${root}/beszel_linux_amd64.tar.gz" \
+               --checksums-file "${root}/checksums-missing.txt" \
+               --install-dir "${root}/opt" --no-systemd; then
+            echo "::error::install-beszel.sh installed a binary with no checksum"
+            exit 1
+          fi
+          echo "refused when no checksum was available: OK"
+
+          # 2. wrong checksum -> refuse
+          printf '%s  beszel_linux_amd64.tar.gz\n' \
+            "1111111111111111111111111111111111111111111111111111111111111111" \
+            > "${root}/checksums-bad.txt"
+          if bash deploy/monitor/install-beszel.sh --version 9.9.9 --component hub \
+               --asset-url "${root}/beszel_linux_amd64.tar.gz" \
+               --checksums-file "${root}/checksums-bad.txt" \
+               --install-dir "${root}/opt" --no-systemd; then
+            echo "::error::install-beszel.sh installed a binary with a mismatched checksum"
+            exit 1
+          fi
+          echo "refused on checksum mismatch: OK"
+
+          # 3. correct checksum -> installs the binary
+          printf '%s  beszel_linux_amd64.tar.gz\n' "${good}" \
+            > "${root}/checksums-good.txt"
+          bash deploy/monitor/install-beszel.sh --version 9.9.9 --component hub \
+            --asset-url "${root}/beszel_linux_amd64.tar.gz" \
+            --checksums-file "${root}/checksums-good.txt" \
+            --install-dir "${root}/opt" --no-systemd
+          [ -x "${root}/opt/beszel" ] || { echo "::error::beszel binary was not installed"; exit 1; }
+          echo "verified install: OK"
+
+  alerting:
+    name: 四类告警真的到达 sink（触发并捕获）
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    needs: lint
+    services: {} # 不使用 service container（ADR-0010）
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Start the capture endpoint (a stand-in for the webhook)
+        run: |
+          set -euo pipefail
+          root="${RUNNER_TEMP}/mon"
+          mkdir -p "$root"
+          cat > "${root}/capture.py" <<'PY'
+          import http.server, socketserver, sys
+          port, out = int(sys.argv[1]), sys.argv[2]
+          class H(http.server.BaseHTTPRequestHandler):
+              def _capture(self):
+                  length = int(self.headers.get('Content-Length') or 0)
+                  body = self.rfile.read(length).decode('utf-8', 'replace') if length else ''
+                  with open(out, 'a', encoding='utf-8') as fh:
+                      fh.write(self.command + ' ' + self.path + ' ' + body + '\n')
+                  self.send_response(200); self.end_headers(); self.wfile.write(b'ok')
+              def do_GET(self): self._capture()
+              def do_POST(self): self._capture()
+              def log_message(self, *a): pass
+          socketserver.TCPServer.allow_reuse_address = True
+          with socketserver.TCPServer(('127.0.0.1', port), H) as httpd:
+              httpd.serve_forever()
+          PY
+          : > "${root}/capture.txt"
+          nohup python3 "${root}/capture.py" "$ALERT_PORT" "${root}/capture.txt" \
+            > "${root}/capture.log" 2>&1 &
+          for _ in $(seq 1 30); do
+            if curl -fsS --max-time 1 "http://127.0.0.1:${ALERT_PORT}/ready" >/dev/null 2>&1; then break; fi
+            sleep 0.5
+          done
+          : > "${root}/capture.txt"   # discard the readiness probe
+          echo "capture endpoint is up on :${ALERT_PORT}"
+
+      - name: Trigger all four conditions and assert they reach the sink
+        env:
+          ALERT_WEBHOOK_URL: http://127.0.0.1:8097/hook
+        run: |
+          set -euo pipefail
+          root="${RUNNER_TEMP}/mon"
+          mkdir -p "${root}/bin" "${root}/state"
+
+          # --- stubs: make a crash loop and a dead service without crashing anything
+          cat > "${root}/bin/systemctl" <<'EOF'
+          #!/usr/bin/env bash
+          case "${1:-}" in
+            is-active) exit 3 ;;
+            show)
+              if [ "${2:-}" = "-p" ] && [ "${3:-}" = "NRestarts" ]; then echo 7; exit 0; fi
+              echo 0 ;;
+            *) echo 0 ;;
+          esac
+          EOF
+          cat > "${root}/bin/journalctl" <<'EOF'
+          #!/usr/bin/env bash
+          for i in 1 2 3 4 5 6; do echo "Scheduled restart job, restart counter is at $i."; done
+          echo "Main process exited, code=exited, status=1/FAILURE"
+          echo "Failed with result 'exit-code'."
+          EOF
+          chmod +x "${root}/bin/systemctl" "${root}/bin/journalctl"
+          printf 'MemTotal: 2048000 kB\nMemAvailable: 102400 kB\n' > "${root}/meminfo"
+
+          export ALERT_STATE_DIR="${root}/state"
+          export ALERT_COOLDOWN_SEC=3600
+
+          echo "--- 1. disk threshold (forced) ---"
+          DISK_PATHS=/ DISK_WARN_PERCENT=0 DISK_CRIT_PERCENT=0 \
+            bash deploy/monitor/monitor.sh resources
+
+          echo "--- 2. memory threshold (forced) ---"
+          MEMINFO="${root}/meminfo" DISK_WARN_PERCENT=99 DISK_CRIT_PERCENT=100 \
+            MEM_AVAILABLE_WARN_PERCENT=100 MEM_AVAILABLE_CRIT_PERCENT=100 \
+            bash deploy/monitor/monitor.sh resources
+
+          echo "--- 3. service down (stub reports inactive) ---"
+          MONITOR_SERVICES=jiuyue SERVICE_DOWN_STRIKES=1 SYSTEMCTL="${root}/bin/systemctl" \
+            bash deploy/monitor/monitor.sh services
+
+          echo "--- 4. restart loop (stub emits 6 auto-restarts) ---"
+          RESTART_SERVICE=jiuyue RESTART_THRESHOLD=5 \
+            SYSTEMCTL="${root}/bin/systemctl" JOURNALCTL="${root}/bin/journalctl" \
+            bash deploy/monitor/monitor.sh restarts
+
+          echo "--- 4b. same condition again: cooldown must suppress ---"
+          MONITOR_SERVICES=jiuyue SERVICE_DOWN_STRIKES=1 SYSTEMCTL="${root}/bin/systemctl" \
+            bash deploy/monitor/monitor.sh services
+
+          echo "--- 5. no false positive (real df, high disk thresholds, fresh state) ---"
+          rm -rf "${root}/state-ok"; mkdir -p "${root}/state-ok"
+          ALERT_STATE_DIR="${root}/state-ok" DISK_WARN_PERCENT=99 DISK_CRIT_PERCENT=100 \
+            MEM_AVAILABLE_WARN_PERCENT=0 MEM_AVAILABLE_CRIT_PERCENT=0 \
+            bash deploy/monitor/monitor.sh resources
+
+          echo "--- 6. synthetic test alert ---"
+          bash deploy/monitor/monitor.sh test-alert
+
+          sleep 1
+          cap="${root}/capture.txt"
+          echo "=== captured payloads ==="
+          cat "$cap"
+          echo "========================"
+
+          fail=0
+          check() { if grep -qF "$1" "$cap"; then echo "  ok: $2"; else echo "::error::missing: $2"; fail=1; fi; }
+          check '"event":"disk_usage"'          "a disk alert was delivered"
+          check '"severity":"critical"'         "alerts carry a severity"
+          check '"event":"memory_available"'    "a memory alert was delivered"
+          check '"event":"service_down"'        "a service-down alert was delivered"
+          check '"event":"service_restart_loop"' "a crash-loop alert was delivered"
+          check "'exit-code'"                   "the crash-loop alert carries the exit reason"
+          check '"event":"test"'                "the synthetic test alert was delivered"
+
+          # cooldown: the second service_down run must NOT have posted again
+          n_service_down="$(grep -c '"event":"service_down"' "$cap")"
+          [ "$n_service_down" -eq 1 ] \
+            || { echo "::error::cooldown dedup failed (service_down posted ${n_service_down}x)"; fail=1; }
+
+          # restart record: count + kind + reason must be on disk, not just in a log line
+          grep -q 'kind=auto-restart' "${root}/state/restarts.log" \
+            || { echo "::error::restart was not recorded with a kind/reason"; fail=1; }
+          grep -q "reason=Failed with result 'exit-code'." "${root}/state/restarts.log" \
+            || { echo "::error::restart record is missing the reason"; fail=1; }
+
+          # no false positive: 6 successful posts total, the OK run added none
+          total="$(wc -l < "$cap")"
+          [ "$total" -eq 6 ] \
+            || { echo "::error::expected exactly 6 alerts, captured ${total}"; fail=1; }
+
+          [ "$fail" -eq 0 ] || exit 1
+          echo "alert routing: OK (4 conditions triggered, captured, deduplicated)"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: monitor-alert-capture
+          path: ${{ runner.temp }}/mon/capture.txt
+          if-no-files-found: warn

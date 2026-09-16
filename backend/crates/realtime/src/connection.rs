@@ -14,23 +14,24 @@ use jiuyue_contract::{ServerEnvelope, ServerEvent};
 use tokio::sync::mpsc;
 
 use crate::session::Session;
-use crate::{CONTROL_QUEUE_CAPACITY, RealtimeError, RealtimeHub, SEND_QUEUE_CAPACITY};
+use crate::{CONTROL_QUEUE_CAPACITY, Device, RealtimeError, RealtimeHub, SEND_QUEUE_CAPACITY};
 
 /// Serve one authenticated connection, logging (not panicking) on failure.
 ///
-/// `user_id` must come from a verified access token; this function never sees the
+/// `device` must come from a verified access token; this function never sees the
 /// token itself.
-pub async fn serve_connection(socket: WebSocket, user_id: String, hub: Arc<RealtimeHub>) {
-    if let Err(error) = run_connection(socket, user_id, hub).await {
+pub async fn serve_connection(socket: WebSocket, device: Device, hub: Arc<RealtimeHub>) {
+    if let Err(error) = run_connection(socket, device, hub).await {
         tracing::debug!(%error, "realtime connection ended");
     }
 }
 
-/// Assign the connection sequence, push the opening heartbeat, then pump frames
-/// and fanned-out events until the socket closes.
+/// Assign the connection sequence, push the opening heartbeat and the Device's
+/// stored sync cursors, then pump frames and fanned-out events until the socket
+/// closes.
 async fn run_connection(
     socket: WebSocket,
-    user_id: String,
+    device: Device,
     hub: Arc<RealtimeHub>,
 ) -> Result<(), RealtimeError> {
     let (mut sink, mut stream) = socket.split();
@@ -57,10 +58,13 @@ async fn run_connection(
     // The registry holds the only control sender: fan-out reaches this connection
     // through the same bounded queue as any other Device of this User.
     let (control_tx, mut control_rx) = mpsc::channel::<ServerEvent>(CONTROL_QUEUE_CAPACITY);
-    let connection_id = hub.registry().register(user_id.clone(), control_tx).await;
+    let connection_id = hub
+        .registry()
+        .register(device.user_id.clone(), control_tx)
+        .await;
 
     let mut session = Session::new(
-        &user_id,
+        &device,
         &hub,
         envelope_tx,
         hub.replay_capacity(),
@@ -68,6 +72,10 @@ async fn run_connection(
     );
 
     session.send_ping().await?;
+    // The Device's stored positions, when it has any, so it can repair forward
+    // instead of re-reading whole Conversations. Bounded (positions, not Messages)
+    // and silent for a Device with no history.
+    session.send_sync_state().await?;
 
     let mut heartbeat = tokio::time::interval(hub.heartbeat_interval());
     // The first interval tick is immediate; the opening heartbeat already fired.
@@ -79,6 +87,10 @@ async fn run_connection(
                 if session.send_ping().await.is_err() {
                     break;
                 }
+                // The heartbeat is also the Sync Cursor checkpoint tick, so a
+                // long-lived connection cannot accumulate unflushed progress for
+                // longer than one interval.
+                session.flush_cursors().await;
             }
             incoming = control_rx.recv() => match incoming {
                 Some(event) => {
@@ -105,7 +117,15 @@ async fn run_connection(
         }
     }
 
-    hub.registry().unregister(&user_id, connection_id).await;
+    hub.registry()
+        .unregister(&device.user_id, connection_id)
+        .await;
+
+    // The last checkpoint this connection is sure to make: flush the cursor
+    // progress it coalesced before its state goes away. A clean teardown (a page
+    // reload, a closed laptop) therefore loses nothing; only a hard kill between
+    // heartbeats costs the Device a re-fetch of the tail.
+    session.flush_cursors().await;
 
     // Dropping the session drops the writer's sender, ending that task; awaiting it
     // lets the close frame flush before the connection is torn down.

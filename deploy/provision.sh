@@ -87,6 +87,17 @@ require_repo_assets() {
     "${SCRIPT_DIR}/env/backup.env.example"
     "${SCRIPT_DIR}/systemd/jiuyue-backup.service"
     "${SCRIPT_DIR}/systemd/jiuyue-backup.timer"
+    "${SCRIPT_DIR}/systemd/journald.conf.d/10-jiuyue-limits.conf"
+    "${SCRIPT_DIR}/postgresql/jiuyue-logging.conf"
+    "${SCRIPT_DIR}/logrotate/jiuyue-postgresql"
+    "${SCRIPT_DIR}/monitor/monitor.sh"
+    "${SCRIPT_DIR}/monitor/install-beszel.sh"
+    "${SCRIPT_DIR}/env/monitor.env.example"
+    "${SCRIPT_DIR}/env/beszel.env.example"
+    "${SCRIPT_DIR}/systemd/jiuyue-monitor.service"
+    "${SCRIPT_DIR}/systemd/jiuyue-monitor.timer"
+    "${SCRIPT_DIR}/systemd/beszel-hub.service"
+    "${SCRIPT_DIR}/systemd/beszel-agent.service"
   )
   local f
   for f in "${required[@]}"; do
@@ -281,6 +292,80 @@ install_backup_job() {
   log "  sudo systemctl start jiuyue-backup.service"
 }
 
+# Bound every log producer so `/` stays flat over the long run (docs/monitoring.md §4).
+# journald is the shared sink for the backend and Caddy; PostgreSQL writes its
+# own file, which journald does not capture on Debian.
+ensure_journald_limits() {
+  log "installing journald limits (SystemMaxUse=200M)"
+  install -d -m 0755 /etc/systemd/journald.conf.d
+  install -m 0644 "${SCRIPT_DIR}/systemd/journald.conf.d/10-jiuyue-limits.conf" \
+                  /etc/systemd/journald.conf.d/10-jiuyue-limits.conf
+  # Storage=persistent needs the directory before journald will write there.
+  install -d -m 2755 -o root -g systemd-journal /var/log/journal
+  systemctl restart systemd-journald
+}
+
+# Debian writes PostgreSQL logs through `pg_ctl -l`, so PostgreSQL's own
+# log_rotation_* do nothing; we own rotation with an explicit byte cap. The
+# conf.d drop-in is picked up by the restart in ensure_pg_tuning (called next).
+ensure_pg_logging() {
+  local conf_dir="/etc/postgresql/${PG_VERSION}/main/conf.d"
+  [ -d "$conf_dir" ] || die "PostgreSQL conf.d not found at ${conf_dir}; is postgresql-${PG_VERSION} installed?"
+  log "installing PostgreSQL log volume settings and rotation ownership"
+  install -m 0644 "${SCRIPT_DIR}/postgresql/jiuyue-logging.conf" \
+                  "${conf_dir}/30-jiuyue-logging.conf"
+
+  install -m 0644 "${SCRIPT_DIR}/logrotate/jiuyue-postgresql" \
+                  /etc/logrotate.d/jiuyue-postgresql
+  # logrotate refuses to process two entries for the same log path, so Debian's
+  # count-based config for /var/log/postgresql/*.log is retired in favour of the
+  # explicit 50M cap above. Idempotent: only the first run moves it.
+  if [ -f /etc/logrotate.d/postgresql-common ]; then
+    log "retiring Debian's /etc/logrotate.d/postgresql-common (jiuyue owns PG rotation)"
+    mv -f /etc/logrotate.d/postgresql-common \
+          /etc/logrotate.d/postgresql-common.jiuyue-disabled
+  fi
+}
+
+# The once-a-minute monitor: disk/memory thresholds, service liveness and the
+# Restart=always crash-loop counter, all pushed to a webhook (docs/monitoring.md).
+install_monitor() {
+  log "installing the monitor script, config and timer"
+  install -d -m 0755 /usr/local/lib/jiuyue
+  install -d -m 0750 /var/lib/jiuyue-monitor
+  install -m 0755 "${SCRIPT_DIR}/monitor/monitor.sh" \
+                  "${SCRIPT_DIR}/monitor/install-beszel.sh" /usr/local/lib/jiuyue/
+
+  if [ -f /etc/jiuyue/monitor.env ]; then
+    log "/etc/jiuyue/monitor.env exists; keeping it"
+  else
+    log "writing /etc/jiuyue/monitor.env from the template"
+    install -m 0640 -o root -g root "${SCRIPT_DIR}/env/monitor.env.example" /etc/jiuyue/monitor.env
+  fi
+
+  # The Beszel agent reads this; created here so the unit's EnvironmentFile
+  # resolves even before the view is installed (deploy/monitor/install-beszel.sh).
+  if [ -f /etc/jiuyue/beszel.env ]; then
+    log "/etc/jiuyue/beszel.env exists; keeping it"
+  else
+    install -m 0640 -o root -g root "${SCRIPT_DIR}/env/beszel.env.example" /etc/jiuyue/beszel.env
+  fi
+
+  install -m 0644 "${SCRIPT_DIR}/systemd/jiuyue-monitor.service" \
+                  /etc/systemd/system/jiuyue-monitor.service
+  install -m 0644 "${SCRIPT_DIR}/systemd/jiuyue-monitor.timer" \
+                  /etc/systemd/system/jiuyue-monitor.timer
+  systemctl daemon-reload
+  systemctl enable --now jiuyue-monitor.timer
+
+  if grep -q 'REPLACE_WITH_WEBHOOK_TOKEN' /etc/jiuyue/monitor.env; then
+    log "NOTE: /etc/jiuyue/monitor.env still has the ALERT_WEBHOOK_URL placeholder —"
+    log "      a triggered alert is logged but reaches nobody until a URL is set."
+  fi
+  log "resource view (Beszel) is installed separately:"
+  log "  sudo bash ${SCRIPT_DIR}/monitor/install-beszel.sh --version <pinned>"
+}
+
 install_caddyfile() {
   install -d -m 0755 /etc/caddy
   install -m 0644 "${SCRIPT_DIR}/Caddyfile" /etc/caddy/Caddyfile
@@ -323,12 +408,15 @@ main() {
   install_packages
   ensure_user_and_dirs
   ensure_swap
+  ensure_journald_limits
+  ensure_pg_logging
   ensure_pg_tuning
   write_env_file
   ensure_database
   install_systemd_units
   ensure_backup_config
   install_backup_job
+  install_monitor
   write_caddy_env
   install_caddyfile
   enable_services

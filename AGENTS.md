@@ -76,6 +76,8 @@ _每一项的选择理由与已否决的替代方案见 `docs/adr/`。改动前�
 ## 开发约束（项目特有）
 
 - **不使用容器**：本地、CI、生产都不用 Docker / Podman / 任何容器运行时（见 ADR-0010）。
+- **已应用的迁移文件绝不可修改**：sqlx 会记录每个迁移的校验和；改动一个已经应用过的迁移会让 `migrate()` 直接失败，**服务在启动时拒绝运行**。要改结构只能**新增**迁移文件。本地遇到 `fatal: failed to run database migrations` 时，先怀疑这条 —— 修复方式是重置开发库的 `public` schema（`DROP SCHEMA public CASCADE; CREATE SCHEMA public;`），而不是去改校验和。
+- **测试连 `jiuyue_test`，不要连 `jiuyue_dev`**：测试会为每个用例建独立 schema，连到开发库会在那里留下一大堆 `chat_test_*` / `auth_test_*` schema。见 `docs/agents/local-dev.md`。
 - **不在服务器上编译 Rust**：2C2G 跑 LTO release 构建会 OOM。构建走 CI 或本地，服务器只拉二进制制品。
 - **WebSocket 客户端必须有重连逻辑**：Caddy 重载配置会强制断开全部 WebSocket 连接，这是默认行为。
 - **不 mock 数据库做后端测试**：seq 原子分配、唯一约束、分区行为本身就是被测对象。

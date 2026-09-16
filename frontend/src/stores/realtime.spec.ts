@@ -349,4 +349,40 @@ describe("useRealtimeStore", () => {
 
     expect(resyncs).toEqual([]);
   });
+
+  it("forwards the Device's sync state to chat subscribers", () => {
+    const store = useRealtimeStore();
+    const received: string[] = [];
+    store.onChatEvent((event) => {
+      received.push(event.t);
+    });
+
+    store.connect();
+    const socket = FakeWebSocket.latest();
+    socket.emitOpen();
+
+    socket.emitMessage(
+      JSON.stringify({
+        v: 1,
+        s: 1,
+        ts: 1_000,
+        e: {
+          t: "SyncState",
+          d: {
+            cursors: [
+              {
+                conversation_id: "01JABC1234567890ABCDEFGHJ2",
+                last_seq: 5,
+              },
+            ],
+          },
+        },
+      }),
+    );
+
+    // SyncState is chat state carried by the socket: the connection store forwards
+    // it and keeps no opinion about how to resume.
+    expect(received).toEqual(["SyncState"]);
+    expect(store.connectionId).toBeNull();
+  });
 });

@@ -78,7 +78,14 @@ function conversationCreatedEnvelope(
 /** One outgoing frame, parsed to the shape the assertions need. */
 interface ClientFrame {
   v: number;
-  e: { t: string; d: { client_msg_id?: string } };
+  e: {
+    t: string;
+    d: {
+      client_msg_id?: string;
+      conversation_id?: string;
+      last_seq?: number;
+    };
+  };
 }
 
 function parseFrame(text: string): ClientFrame {
@@ -571,5 +578,188 @@ describe("useChatStore", () => {
       ]);
     });
     expect(store.messages).toHaveLength(4);
+  });
+
+  it("adopts the Device's stored cursor from SyncState and repairs what was missed", async () => {
+    const route = messagesRoute();
+    stubFetch({
+      "/api/conversations/direct": [() => jsonResponse(conversationPayload())],
+      // Opening the Conversation loads an empty page: this is a reloaded client,
+      // so nothing is held locally and only the server remembers the position.
+      [route]: [
+        () =>
+          jsonResponse({
+            messages: [],
+            next_before: null,
+            next_after: null,
+            has_more: false,
+          }),
+      ],
+      "/api/conversations": [
+        () => jsonResponse({ conversations: [conversationPayload()] }),
+      ],
+      [`${route}?after=5&limit=100`]: [
+        () =>
+          jsonResponse({
+            messages: [
+              messagePayload({ id: "M6", client_msg_id: "k6", seq: 6 }),
+              messagePayload({ id: "M7", client_msg_id: "k7", seq: 7 }),
+            ],
+            next_before: null,
+            next_after: null,
+            has_more: false,
+          }),
+      ],
+    });
+
+    const store = useChatStore();
+    await store.startDirect("bob");
+    const socket = openSocket();
+
+    // The server hands this Device back the position it had persisted.
+    socket.emitMessage(
+      envelope(2, {
+        t: "SyncState",
+        d: {
+          cursors: [{ conversation_id: CONVERSATION_ID, last_seq: 5 }],
+        },
+      }),
+    );
+
+    await vi.waitFor(() => {
+      expect(store.messages.map((message) => message.seq)).toEqual([6, 7]);
+    });
+    expect(store.syncCursors[CONVERSATION_ID]).toBe(5);
+    // The cursor-seeded walk leaves only the missed tail, so older history must
+    // still be reachable through the backwards cursor.
+    expect(store.hasMoreHistory).toBe(true);
+  });
+
+  it("reports its consumed position to the server as a per-Device cursor", async () => {
+    await openedStore();
+    const socket = openSocket();
+
+    socket.emitMessage(
+      newMessageEnvelope(
+        messagePayload({ id: "M1", client_msg_id: "k1", seq: 1 }),
+      ),
+    );
+
+    await vi.waitFor(() => {
+      const reported = socket.sent
+        .map((text) => parseFrame(text))
+        .some(
+          (frame) =>
+            frame.e.t === "SyncCursor" &&
+            frame.e.d.conversation_id === CONVERSATION_ID &&
+            frame.e.d.last_seq === 1,
+        );
+      expect(reported).toBe(true);
+    });
+  });
+
+  it("tolerates a duplicate re-delivered by a cursor repair", async () => {
+    const route = messagesRoute();
+    stubFetch({
+      "/api/conversations/direct": [() => jsonResponse(conversationPayload())],
+      [route]: [
+        () =>
+          jsonResponse({
+            messages: [
+              messagePayload({ id: "M1", client_msg_id: "k1", seq: 1 }),
+              messagePayload({ id: "M2", client_msg_id: "k2", seq: 2 }),
+            ],
+            next_before: 1,
+            next_after: null,
+            has_more: false,
+          }),
+      ],
+      "/api/conversations": [
+        () => jsonResponse({ conversations: [conversationPayload()] }),
+      ],
+      [`${route}?after=2&limit=100`]: [
+        () =>
+          jsonResponse({
+            // At-least-once: the walk re-delivers seq 2, which is already held.
+            messages: [
+              messagePayload({ id: "M2", client_msg_id: "k2", seq: 2 }),
+              messagePayload({ id: "M3", client_msg_id: "k3", seq: 3 }),
+            ],
+            next_before: null,
+            next_after: null,
+            has_more: false,
+          }),
+      ],
+    });
+
+    const store = useChatStore();
+    await store.startDirect("bob");
+    const socket = openSocket();
+
+    socket.emitMessage(
+      envelope(2, {
+        t: "SyncState",
+        d: {
+          cursors: [{ conversation_id: CONVERSATION_ID, last_seq: 2 }],
+        },
+      }),
+    );
+
+    await vi.waitFor(() => {
+      expect(store.messages.map((message) => message.seq)).toEqual([1, 2, 3]);
+    });
+    expect(store.messages).toHaveLength(3);
+  });
+
+  it("never reports a cursor past an unfilled gap", async () => {
+    const route = messagesRoute();
+    stubFetch({
+      "/api/conversations/direct": [() => jsonResponse(conversationPayload())],
+      [route]: [
+        () =>
+          jsonResponse({
+            messages: [
+              messagePayload({ id: "M1", client_msg_id: "k1", seq: 1 }),
+            ],
+            next_before: null,
+            next_after: null,
+            has_more: false,
+          }),
+      ],
+      "/api/conversations": [
+        () => jsonResponse({ conversations: [conversationPayload()] }),
+      ],
+      // The repair returns nothing, so the hole under seq 4 stays open.
+      [`${route}?after=1&limit=100`]: [
+        () =>
+          jsonResponse({
+            messages: [],
+            next_before: null,
+            next_after: null,
+            has_more: false,
+          }),
+      ],
+    });
+
+    const store = useChatStore();
+    await store.startDirect("bob");
+    const socket = openSocket();
+
+    // seq 4 arrives while 2 and 3 are missing: the Device may only promise seq 1.
+    socket.emitMessage(
+      newMessageEnvelope(
+        messagePayload({ id: "M4", client_msg_id: "k4", seq: 4 }),
+      ),
+    );
+
+    await vi.waitFor(() => {
+      const reports = socket.sent
+        .map((text) => parseFrame(text))
+        .filter((frame) => frame.e.t === "SyncCursor");
+      expect(reports.length).toBeGreaterThan(0);
+      // A cursor of 4 would make the next resume skip 2 and 3 forever.
+      expect(reports.every((frame) => frame.e.d.last_seq === 1)).toBe(true);
+    });
+    expect(store.messages.map((message) => message.seq)).toEqual([1, 4]);
   });
 });

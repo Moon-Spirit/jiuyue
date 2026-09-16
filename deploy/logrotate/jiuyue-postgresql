@@ -1,0 +1,34 @@
+# PostgreSQL log rotation for the jiuyue box.
+#
+# Installed by deploy/provision.sh to /etc/logrotate.d/jiuyue-postgresql.
+#
+# On Debian/Ubuntu PostgreSQL writes a plain file via `pg_ctl -l`
+# (/var/log/postgresql/postgresql-<ver>-<cluster>.log) and does NOT run its own
+# collector, so PostgreSQL's log_rotation_* settings do nothing and rotation is
+# logrotate's job. This repository takes ownership of that rotation so the cap is
+# an explicit BYTE limit instead of Debian's count-based default:
+#
+#   size 50M     -> the live file never exceeds ~50 MB
+#   rotate 5     -> 5 compressed generations are kept
+#   compress     -> generations are gzipped (a chat app's text logs compress ~10x)
+#   copytruncate -> the file is copied and truncated IN PLACE; PostgreSQL keeps
+#                   writing to the same append-mode fd, so no reload/restart is
+#                   needed (this is exactly what Debian's own config does)
+#
+# Arithmetic: ceiling ~ 50 MB live + 5 compressed generations (typically tens of
+# MB total). At the cap logrotate copies the file, truncates it to zero, and
+# deletes the oldest generation — `/` does not grow over time.
+#
+# `provision.sh` moves Debian's /etc/logrotate.d/postgresql-common aside, because
+# logrotate refuses to process two entries for the same log path.
+
+/var/log/postgresql/*.log {
+	size 50M
+	rotate 5
+	compress
+	delaycompress
+	missingok
+	notifempty
+	copytruncate
+	su root root
+}

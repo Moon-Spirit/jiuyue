@@ -1,0 +1,48 @@
+# Beszel agent — host metrics for the Beszel hub. No containers (ADR-0010).
+#
+# Installed to /etc/systemd/system/beszel-agent.service by
+# deploy/monitor/install-beszel.sh.
+#
+# Agent RSS is 10-30 MB (docs/research/2026-09-16-vps-2gb-ops-research.md §(e)).
+# It reads host CPU/memory/disk/network and exposes them on loopback; the hub
+# dials in. The KEY/HUB_URL/TOKEN values live in /etc/jiuyue/beszel.env, never
+# in this unit.
+#
+# This unit is validated on every push by .github/workflows/monitor-validate.yml
+# (`systemd-analyze verify`).
+
+[Unit]
+Description=Beszel agent (host metrics)
+Documentation=https://github.com/Moon-Spirit/jiuyue/blob/main/docs/monitoring.md
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=beszel
+Group=beszel
+WorkingDirectory=/var/lib/beszel-agent
+EnvironmentFile=/etc/jiuyue/beszel.env
+ExecStart=/opt/beszel/beszel-agent
+
+Restart=always
+RestartSec=5
+
+# Blast-radius cap (agent typical 10-30 MB). See docs/monitoring.md §3.
+MemoryAccounting=yes
+MemoryHigh=32M
+MemoryMax=64M
+
+# --- hardening --------------------------------------------------------------
+NoNewPrivileges=yes
+# The agent reads /proc and /sys (allowed read-only under ProtectSystem=strict)
+# and writes nothing outside its own state directory.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+ReadWritePaths=/var/lib/beszel-agent
+
+[Install]
+WantedBy=multi-user.target

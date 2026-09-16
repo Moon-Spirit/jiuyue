@@ -1,0 +1,26 @@
+# jiuyue monitor timer — the once-a-minute check. No containers (ADR-0010).
+#
+# Installed to /etc/systemd/system/jiuyue-monitor.timer by deploy/provision.sh.
+#
+# A minute is the resolution at which "the service is down" or "a crash loop
+# started" becomes useful without being expensive: the checks are a few
+# `systemctl`/`df`/`journalctl` calls and at most one HTTP POST. systemd skips a
+# tick if the previous `jiuyue-monitor.service` run has not finished.
+#
+# Persistent=true catches up one missed run after a reboot; the monitor also
+# records restart counts to /var/lib/jiuyue-monitor/restarts.log, so nothing is
+# lost while the box was down.
+
+[Unit]
+Description=Run the jiuyue monitor every minute
+Documentation=https://github.com/Moon-Spirit/jiuyue/blob/main/docs/monitoring.md
+
+[Timer]
+OnCalendar=*:0/1
+AccuracySec=15s
+RandomizedDelaySec=5s
+Persistent=true
+Unit=jiuyue-monitor.service
+
+[Install]
+WantedBy=timers.target

@@ -8,11 +8,13 @@ import type { MessageList } from "../generated/MessageList";
 import type { MessageRejected } from "../generated/MessageRejected";
 import type { NewMessage } from "../generated/NewMessage";
 import type { ServerEvent } from "../generated/ServerEvent";
+import type { SyncState } from "../generated/SyncState";
 import { useAuthStore } from "./auth";
 import {
   compareMessages,
   fromView,
   maxSeq,
+  minSeq,
   newClientMsgId,
   repairStartSeq,
   upsert,
@@ -67,6 +69,23 @@ export const useChatStore = defineStore("chat", () => {
   const nextBeforeByConversation = ref<Record<string, number | null>>({});
   /** Whether a Conversation has history older than what is loaded. */
   const hasMoreByConversation = ref<Record<string, boolean>>({});
+
+  /**
+   * The **Device's** persisted Sync Cursor per Conversation, learned from the
+   * server's `SyncState` frame.
+   *
+   * This is deliberately not derived from the in-memory buckets: the point of a
+   * per-Device cursor is that it outlives the page. The server remembers what this
+   * Device consumed, and re-sends those positions on connect so a returning client
+   * repairs forward from exactly where it stopped instead of re-reading whole
+   * Conversations.
+   */
+  const syncCursors = ref<Record<string, number>>({});
+
+  /** Cursor reports waiting to be sent, one per Conversation. */
+  const pendingCursorReports = new Map<string, number>();
+  /** Whether a flush is already queued for the current batch of reports. */
+  let cursorReportScheduled = false;
 
   /** The in-flight repair walk, so concurrent repair triggers can coalesce. */
   let repairInFlight: Promise<void> | null = null;
@@ -213,6 +232,8 @@ export const useChatStore = defineStore("chat", () => {
       nextBeforeByConversation.value[conversationId] =
         payload.next_before ?? null;
       hasMoreByConversation.value[conversationId] = payload.has_more === true;
+      // The newest page is the position this Device now holds.
+      scheduleCursorReport(conversationId);
     } catch (cause) {
       applyError(cause);
     } finally {
@@ -256,6 +277,9 @@ export const useChatStore = defineStore("chat", () => {
       nextBeforeByConversation.value[conversationId] =
         payload.next_before ?? null;
       hasMoreByConversation.value[conversationId] = payload.has_more === true;
+      // Older history does not move the high-water mark, but the report keeps the
+      // persisted Device cursor honest with what is loaded.
+      scheduleCursorReport(conversationId);
       return true;
     } catch (cause) {
       applyError(cause);
@@ -266,12 +290,88 @@ export const useChatStore = defineStore("chat", () => {
   }
 
   /**
-   * Pull one Conversation forward from the last Sequence Number it holds.
+   * Note how far this Device has consumed a Conversation.
+   *
+   * Called wherever a Message is applied — live delivery, history, repair — so the
+   * persisted Sync Cursor follows the client's real position, not a guess.
+   *
+   * The value reported is {@link repairStartSeq}, not the highest Sequence Number
+   * held: a report is a promise that nothing at or below it still needs sending, so
+   * a position with a hole under it would make a later resume skip that hole
+   * silently. `repairStartSeq` is exactly the highest position with no hole below
+   * it (or the highest held when there is none), i.e. the largest value it is safe
+   * to promise.
+   *
+   * Reports are batched on a microtask: several Messages applied in one turn become
+   * one frame, which the server coalesces again before it writes anything, so a
+   * chatty client cannot become a write per Message.
+   */
+  function scheduleCursorReport(conversationId: string): void {
+    const safe = repairStartSeq(
+      messagesByConversation.value[conversationId] ?? [],
+    );
+    if (safe === null) return;
+
+    const queued = pendingCursorReports.get(conversationId);
+    pendingCursorReports.set(
+      conversationId,
+      queued === undefined ? safe : Math.max(queued, safe),
+    );
+
+    if (cursorReportScheduled) return;
+    cursorReportScheduled = true;
+    queueMicrotask(flushCursorReports);
+  }
+
+  /**
+   * Send every queued report, keeping the ones the socket refused.
+   *
+   * A closed socket is not a lost position: the entry stays queued, and the next
+   * applied Message re-arms the flush. If the client never reconnects, the server
+   * simply re-sends the tail on the next connect — at-least-once tolerates that.
+   */
+  function flushCursorReports(): void {
+    cursorReportScheduled = false;
+    if (pendingCursorReports.size === 0) return;
+
+    const realtime = useRealtimeStore();
+    for (const [conversationId, lastSeq] of [...pendingCursorReports]) {
+      const sent = realtime.send({
+        t: "SyncCursor",
+        d: { conversation_id: conversationId, last_seq: lastSeq },
+      });
+      if (sent) pendingCursorReports.delete(conversationId);
+    }
+  }
+
+  /**
+   * Adopt the Device's persisted cursors from `SyncState`, then catch up.
+   *
+   * The server pushes this once per connection when this Device has stored
+   * positions. Recording them is what makes a reload resumable; the repair then
+   * walks each Conversation forward from its cursor — the same bounded primitive a
+   * reconnect uses, not a parallel path.
+   */
+  function adoptSyncState(state: SyncState): void {
+    for (const cursor of state.cursors) {
+      syncCursors.value[cursor.conversation_id] = cursor.last_seq;
+    }
+
+    void repairConversations();
+  }
+
+  /**
+   * Pull one Conversation forward from the Device's cursor.
    *
    * This is the Conversation-layer half of ADR-0003's repair: everything with a
-   * `seq` greater than the client's cursor, oldest first, page by page. Every
+   * `seq` greater than the client's position, oldest first, page by page. Every
    * merge goes through {@link upsert}, so re-delivered Messages are absorbed by
    * Message ID and applying a duplicate is a no-op.
+   *
+   * The start is the client's own contiguous position when it holds Messages, and
+   * the **persisted Device cursor** when it holds nothing (a reload, a restarted
+   * process): the server's record of what this Device consumed is the floor, so the
+   * client is told exactly what it missed rather than re-reading the Conversation.
    */
   async function repairConversation(
     conversationId: string,
@@ -280,15 +380,19 @@ export const useChatStore = defineStore("chat", () => {
     const list = messagesByConversation.value[conversationId];
     if (list === undefined) return;
 
-    // Nothing held means there is no cursor to walk from; the newest page is the
-    // only sensible starting point.
-    if (list.length === 0) {
+    const floor = syncCursors.value[conversationId] ?? null;
+    const start = repairStartSeq(list) ?? floor;
+
+    // Nothing held and no stored cursor: the newest page is the only sensible start.
+    if (start === null) {
       await loadMessages(conversationId);
       return;
     }
 
-    const start = repairStartSeq(list);
-    if (start === null) return;
+    // Whether the walk's start came from the persisted cursor rather than from
+    // Messages already held. Only that case can leave the bucket holding just the
+    // missed tail, which needs a backwards cursor wired in below.
+    const seededFromCursor = repairStartSeq(list) === null;
     let cursor = start;
 
     for (;;) {
@@ -305,6 +409,18 @@ export const useChatStore = defineStore("chat", () => {
       if (next === null || next <= cursor) break;
       cursor = next;
     }
+
+    // A cursor-seeded walk can leave only the missed tail in the bucket. Wire the
+    // backwards cursor so the older history stays reachable and the view is not
+    // stuck on a partial list.
+    if (seededFromCursor) {
+      const oldest = minSeq(list);
+      nextBeforeByConversation.value[conversationId] = oldest;
+      hasMoreByConversation.value[conversationId] =
+        oldest !== null && oldest > 1;
+    }
+
+    scheduleCursorReport(conversationId);
   }
 
   /**
@@ -416,6 +532,7 @@ export const useChatStore = defineStore("chat", () => {
   /** The server stored a Message this client sent. */
   function applyAck(ack: MessageAck): void {
     upsert(bucket(ack.message.conversation_id), fromView(ack.message, "sent"));
+    scheduleCursorReport(ack.message.conversation_id);
   }
 
   /**
@@ -438,6 +555,8 @@ export const useChatStore = defineStore("chat", () => {
     if (before !== null && view.seq > before + 1) {
       void repairConversations();
     }
+
+    scheduleCursorReport(view.conversation_id);
 
     const known = conversations.value.some(
       (conversation) => conversation.id === view.conversation_id,
@@ -486,6 +605,9 @@ export const useChatStore = defineStore("chat", () => {
       case "ConversationCreated":
         applyConversationCreated(event.d.conversation);
         break;
+      case "SyncState":
+        adoptSyncState(event.d);
+        break;
       default:
         assertExhaustive(event);
     }
@@ -511,6 +633,7 @@ export const useChatStore = defineStore("chat", () => {
     activeConversationId,
     activeConversation,
     messages,
+    syncCursors,
     hasMoreHistory,
     loadingConversations,
     loadingMessages,

@@ -122,6 +122,10 @@ export const useRealtimeStore = defineStore("realtime", () => {
       case "NewMessage":
       case "MessageRejected":
       case "ConversationCreated":
+      case "SyncState":
+        // `SyncState` is the Device's persisted Sync Cursors, pushed once per
+        // connection. It is chat state, not connection state — this store only
+        // forwards it, and the chat store decides how to resume from it.
         for (const listener of listeners) listener(event);
         break;
       default:

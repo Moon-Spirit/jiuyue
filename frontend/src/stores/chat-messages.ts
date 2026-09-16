@@ -57,6 +57,16 @@ export function maxSeq(list: readonly ChatMessage[]): number | null {
   return highest;
 }
 
+/** The lowest Sequence Number in a bucket, ignoring not-yet-acknowledged bubbles. */
+export function minSeq(list: readonly ChatMessage[]): number | null {
+  let lowest: number | null = null;
+  for (const message of list) {
+    if (message.seq === null) continue;
+    lowest = lowest === null ? message.seq : Math.min(lowest, message.seq);
+  }
+  return lowest;
+}
+
 /**
  * Where a forward repair must start.
  *

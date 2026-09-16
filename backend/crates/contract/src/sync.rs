@@ -72,3 +72,44 @@ pub struct Resync {
     #[ts(type = "number")]
     pub replayed: u64,
 }
+
+/// One Device's consumed position in one Conversation (CONTEXT.md: **Sync Cursor**).
+///
+/// The cursor is scoped to a **Device**, not to a connection and not to a User:
+/// `sessions` is the Device, and this pair is `(session, conversation)`. It is the
+/// Conversation's Sequence Number (ADR-0003) — the one ordering authority.
+///
+/// `last_seq` is a **safe promise**: nothing at or below it still needs sending. A
+/// client must therefore never report a value with a hole below it, or a later
+/// resume would skip that hole silently. Everything after it is what a returning
+/// Device still has to pull, using the existing forward walk (`after` on
+/// [`crate::MessagePageQuery`]) rather than a parallel path. The client advances it
+/// as it applies Messages; the server coalesces those reports and checkpoints them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct SyncCursor {
+    /// ULID of the Conversation the position is in.
+    pub conversation_id: String,
+    /// Highest Sequence Number this Device has consumed in that Conversation.
+    #[ts(type = "number")]
+    pub last_seq: i64,
+}
+
+/// `ServerEvent::SyncState` payload: the Device's stored Sync Cursors.
+///
+/// Sent once per connection, immediately after the opening heartbeat, **only when
+/// the Device has at least one stored cursor** — a Device with no history needs no
+/// hint and keeps the pre-cursor behaviour (load the newest page). This is the
+/// "resume/sync response" of the delivery protocol: it carries **positions, never
+/// Messages**, so its size is bounded by the Device's Conversation count and a
+/// long absence is always repaired in bounded pages over the forward walk. A
+/// client that receives it repairs each listed Conversation forward from
+/// [`SyncCursor::last_seq`], and must apply duplicates idempotently by Message ID:
+/// at-least-once delivery means a repair may re-send a Message the Device already
+/// holds (ADR-0003).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct SyncState {
+    /// Every non-empty cursor the Device has stored, most recently advanced first.
+    pub cursors: Vec<SyncCursor>,
+}

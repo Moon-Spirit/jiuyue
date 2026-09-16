@@ -39,4 +39,4 @@ pub use chat::{
 };
 pub use envelope::{ClientEnvelope, PROTOCOL_VERSION, ServerEnvelope};
 pub use events::{ClientEvent, Ping, ServerEvent};
-pub use sync::{Resume, Resync, ResyncReason};
+pub use sync::{Resume, Resync, ResyncReason, SyncCursor, SyncState};

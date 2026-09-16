@@ -38,4 +38,6 @@ mod service;
 
 pub use error::ChatError;
 pub use repository::ChatRepository;
-pub use service::{ChatService, ConversationNotice, OpenedConversation, SentMessage};
+pub use service::{
+    ChatService, ConversationNotice, MAX_SYNC_CURSORS, OpenedConversation, SentMessage,
+};

@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
 use crate::chat::{ConversationCreated, MessageAck, MessageRejected, NewMessage, SendMessage};
-use crate::sync::{Resume, Resync};
+use crate::sync::{Resume, Resync, SyncCursor, SyncState};
 
 /// Events the server pushes to a client.
 ///
@@ -36,6 +36,11 @@ pub enum ServerEvent {
     /// missed envelopes were replayed, or whether the client must repair
     /// Conversations from its cursors (ADR-0003).
     Resync(Resync),
+    /// The Device's persisted per-Conversation Sync Cursors, pushed once on connect
+    /// when any are stored. The client repairs forward from these positions, which
+    /// is what lets a Device that was away — a closed laptop, a new process — learn
+    /// exactly what it missed instead of re-reading whole Conversations.
+    SyncState(SyncState),
 }
 
 /// Events a client sends to the server.
@@ -49,6 +54,13 @@ pub enum ClientEvent {
     SendMessage(SendMessage),
     /// Wake-up handshake after (re)connecting or noticing a gap in `s`.
     Resume(Resume),
+    /// Advance this Device's Sync Cursor for one Conversation.
+    ///
+    /// Best-effort and monotonic: the server keeps the highest value it is told
+    /// (never a rewind), coalesces reports in memory, and checkpoints them in
+    /// batches. A report the server never receives costs the Device a re-fetch of
+    /// the tail on its next connect — harmless under at-least-once delivery.
+    SyncCursor(SyncCursor),
 }
 
 /// Heartbeat payload shared by both directions.

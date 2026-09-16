@@ -11,6 +11,7 @@
 //! instructions — a silently skipped test would hide a broken delivery path,
 //! which is worse than no test at all.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -25,7 +26,7 @@ use jiuyue_chat::ChatService;
 use jiuyue_contract::{
     AuthSession, ClientEnvelope, ClientEvent, ConversationSummary, MessageAck, MessageList,
     MessageRejected, MessageView, NewMessage, Resume, Resync, SendMessage, ServerEnvelope,
-    ServerEvent,
+    ServerEvent, SyncCursor, SyncState,
 };
 use jiuyue_realtime::{HEARTBEAT_INTERVAL, RealtimeHub};
 use jiuyue_server::{AppState, Config, Services, app};
@@ -175,6 +176,38 @@ pub async fn register(app: &TestApp, username: &str, email: &str, password: &str
     serde_json::from_value(body).expect("the registration response must match AuthSession")
 }
 
+/// Log in an existing account, opening a second Device for it.
+///
+/// A second login is a second `sessions` row — the Device identity a Sync Cursor is
+/// scoped to — so this is how a test gets two Devices of one account.
+pub async fn login(app: &TestApp, email: &str, password: &str) -> AuthSession {
+    let (status, body) = post_json(
+        app,
+        "/auth/login",
+        &json!({ "email": email, "password": password }),
+    )
+    .await;
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "login must succeed, got {status}: {body}"
+    );
+
+    serde_json::from_value(body).expect("the login response must match AuthSession")
+}
+
+/// The `sessions` id behind an access token, as `GET /auth/whoami` reports it.
+pub async fn session_id(app: &TestApp, token: &str) -> String {
+    let (status, body) = get_with_token(app, "/auth/whoami", token).await;
+    assert_eq!(status, StatusCode::OK, "whoami must succeed: {body}");
+
+    body["session_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("whoami must carry session_id: {body}"))
+        .to_owned()
+}
+
 /// Open (or reopen) a Direct Conversation and return the summary.
 pub async fn create_direct(app: &TestApp, token: &str, peer_username: &str) -> ConversationSummary {
     let (status, body) = post_json_with_token(
@@ -212,6 +245,18 @@ pub fn resume(last_seq: u64, connection_id: Option<u64>) -> ClientEvent {
     ClientEvent::Resume(Resume {
         last_seq,
         connection_id,
+    })
+}
+
+/// A `SyncCursor` report: "this Device has consumed up to `last_seq` here".
+///
+/// This is the client half of the per-Device Sync Cursor: the server persists it
+/// (coalesced and checkpointed) so the Device can be told, on its next connect,
+/// exactly what it missed.
+pub fn sync_cursor(conversation_id: &str, last_seq: i64) -> ClientEvent {
+    ClientEvent::SyncCursor(SyncCursor {
+        conversation_id: conversation_id.to_owned(),
+        last_seq,
     })
 }
 
@@ -351,6 +396,19 @@ pub async fn expect_resync(socket: &mut TestSocket) -> Resync {
     }
 }
 
+/// Read until the Device's stored Sync Cursors arrive, ignoring everything else.
+///
+/// The server pushes `SyncState` once per connection, right after the opening
+/// heartbeat, and only when the Device has stored cursors — so a test that gets
+/// here has already proven the persistence round-tripped.
+pub async fn expect_sync_state(socket: &mut TestSocket) -> SyncState {
+    loop {
+        if let ServerEvent::SyncState(state) = next_event(socket).await {
+            return state;
+        }
+    }
+}
+
 /// `POST` a JSON body and return the status and parsed body.
 pub async fn post_json(app: &TestApp, path: &str, body: &Value) -> (StatusCode, Value) {
     let request = Request::builder()
@@ -446,6 +504,98 @@ pub async fn count_rows(pool: &PgPool, table: &str) -> i64 {
         .fetch_one(pool)
         .await
         .unwrap_or_else(|error| panic!("counting `{table}` must succeed: {error}"))
+}
+
+/// Every Device's stored cursor for one Conversation, ordered by Device id.
+///
+/// Read straight from the schema, so it proves the value lives in PostgreSQL rather
+/// than in a hub's memory. Ordered by the Device's ULID, which is time-sortable, so
+/// "the first Device" is stable across calls.
+pub async fn device_cursors_for_user(
+    pool: &PgPool,
+    user_id: &str,
+    conversation_id: &str,
+) -> Vec<i64> {
+    sqlx::query_scalar(
+        "SELECT sc.last_seq FROM sync_cursors AS sc \
+         JOIN sessions AS s ON s.id = sc.session_id \
+         WHERE s.user_id = $1 AND sc.conversation_id = $2 \
+         ORDER BY s.id",
+    )
+    .bind(user_id)
+    .bind(conversation_id)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_else(|error| panic!("reading sync_cursors must succeed: {error}"))
+}
+
+/// Apply a delivery stream idempotently (keyed on Message ID) and assert the
+/// result is exactly `seq 1..=count`, once each.
+///
+/// This is the client contract written as an assertion: delivery is at-least-once,
+/// so a repair may re-deliver a Message the client already holds, and application
+/// keys on Message ID. It returns the surviving ids for callers that also want to
+/// assert the raw delivery shape.
+pub fn assert_exact_sequence_set(messages: Vec<MessageView>, count: i64) -> BTreeSet<String> {
+    let mut by_id: BTreeMap<String, MessageView> = BTreeMap::new();
+    for message in messages {
+        by_id.insert(message.id.clone(), message);
+    }
+
+    let mut merged: Vec<MessageView> = by_id.into_values().collect();
+    merged.sort_by_key(|message| message.seq);
+
+    let ids: BTreeSet<String> = merged.iter().map(|message| message.id.clone()).collect();
+    assert_eq!(
+        merged.len(),
+        count as usize,
+        "the client must hold exactly the {count} sent Messages"
+    );
+    assert_eq!(
+        ids.len(),
+        count as usize,
+        "no Message may appear twice after idempotent application"
+    );
+    assert_eq!(
+        merged.iter().map(|message| message.seq).collect::<Vec<_>>(),
+        (1..=count).collect::<Vec<_>>(),
+        "the repaired set must cover seq 1..={count} with no hole"
+    );
+
+    ids
+}
+
+/// Wait until some Device of `user_id` has exactly `expected` as its cursor.
+///
+/// The teardown checkpoint is asynchronous with respect to the client dropping its
+/// socket: the server flushes after its frame loop ends. Polling the database is
+/// how a test waits for that without racing a fixed sleep.
+pub async fn wait_for_device_cursor(
+    pool: &PgPool,
+    user_id: &str,
+    conversation_id: &str,
+    expected: i64,
+) {
+    let deadline = tokio::time::Instant::now() + EVENT_TIMEOUT;
+
+    loop {
+        if device_cursors_for_user(pool, user_id, conversation_id)
+            .await
+            .contains(&expected)
+        {
+            return;
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            panic!(
+                "no Device cursor reached {expected} within {EVENT_TIMEOUT:?}; \
+                 stored cursors: {:?}",
+                device_cursors_for_user(pool, user_id, conversation_id).await
+            );
+        }
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 /// Panics with an actionable message when no database is configured.

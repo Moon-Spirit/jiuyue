@@ -10,17 +10,29 @@
 //! Conversation twice returns the same Conversation, and sending with the same
 //! Client Message ID twice returns the same Message.
 
+use std::collections::HashMap;
+
 use sqlx::PgPool;
 use sqlx::types::time::OffsetDateTime;
 
 use jiuyue_contract::{
     ConversationKind, ConversationSummary, DEFAULT_MESSAGE_PAGE_SIZE, FieldError, FieldErrorCode,
     MAX_CLIENT_MSG_ID_BYTES, MAX_MESSAGE_BODY_CHARS, MAX_MESSAGE_PAGE_SIZE, MessageList,
-    MessagePageQuery, MessageView, PeerSummary, SendMessage,
+    MessagePageQuery, MessageView, PeerSummary, SendMessage, SyncCursor,
 };
 
 use crate::error::ChatError;
 use crate::repository::{ChatRepository, ConversationRow, MessageRow, NewMessageRow, PeerRow};
+
+/// Upper bound on the cursors one connection is handed at once.
+///
+/// The per-connection sync frame is O(conversations), and an unbounded frame would
+/// be a memory risk on the 2 vCPU / 2 GB box (the socket's `MAX_MESSAGE_SIZE` is
+/// the backstop, not the plan). A Device holding more stored cursors than this is
+/// sent the most recently advanced ones; the remainder fall back to the
+/// pre-cursor behaviour of loading the newest page, which never loses a Message —
+/// it only re-reads, because the Conversation stream is the durable record.
+pub const MAX_SYNC_CURSORS: i64 = 1000;
 
 /// The notification one Participant should receive when a Conversation is created.
 ///
@@ -311,6 +323,72 @@ impl ChatService {
             created,
         })
     }
+
+    /// The Device's stored Sync Cursors, most recently advanced first.
+    ///
+    /// `device_id` is a `sessions` row id — the Device identity CONTEXT.md draws —
+    /// not a `user_id`: two Devices of one account hold independent positions, and
+    /// conflating them would let a phone's progress hide a laptop's gap.
+    pub async fn list_sync_cursors(&self, device_id: &str) -> Result<Vec<SyncCursor>, ChatError> {
+        self.repository
+            .list_sync_cursors(device_id, MAX_SYNC_CURSORS)
+            .await
+    }
+
+    /// Checkpoint a batch of a Device's consumed positions.
+    ///
+    /// The batch is normalised first (see [`normalise_cursors`]): reporting is
+    /// advisory state for one Device, so malformed or duplicate entries are
+    /// discarded rather than turned into a connection failure. What survives is
+    /// persisted monotonically, so a replayed report cannot rewind a cursor.
+    pub async fn save_sync_cursors(
+        &self,
+        device_id: &str,
+        cursors: &[SyncCursor],
+    ) -> Result<(), ChatError> {
+        let normalised = normalise_cursors(cursors);
+        if normalised.is_empty() {
+            return Ok(());
+        }
+
+        self.repository
+            .upsert_sync_cursors(device_id, &normalised)
+            .await
+    }
+}
+
+/// Keep only the well-formed, highest cursor per Conversation.
+///
+/// Three things are dropped, each for a concrete reason:
+///
+/// - a Conversation id that is not a ULID cannot name a row;
+/// - a `last_seq` below 1 is the "no row" value (see the schema's
+///   `sync_cursors_last_seq_positive`) and would be silently wrong;
+/// - a repeated Conversation would make the single `INSERT ... ON CONFLICT DO
+///   UPDATE` touch one row twice, which PostgreSQL rejects outright, so the
+///   batch must collapse to one entry per Conversation before it reaches SQL.
+///
+/// The surviving entry keeps the **highest** value: cursors only move forward.
+fn normalise_cursors(cursors: &[SyncCursor]) -> Vec<SyncCursor> {
+    let mut highest: HashMap<&str, i64> = HashMap::new();
+
+    for cursor in cursors {
+        if !is_ulid(&cursor.conversation_id) || cursor.last_seq < 1 {
+            continue;
+        }
+        highest
+            .entry(cursor.conversation_id.as_str())
+            .and_modify(|value| *value = (*value).max(cursor.last_seq))
+            .or_insert(cursor.last_seq);
+    }
+
+    highest
+        .into_iter()
+        .map(|(conversation_id, last_seq)| SyncCursor {
+            conversation_id: conversation_id.to_owned(),
+            last_seq,
+        })
+        .collect()
 }
 
 /// Refuse the caller unless the Conversation exists and they are a Participant.
@@ -471,8 +549,12 @@ fn unix_millis(value: OffsetDateTime) -> i64 {
 mod tests {
     use sqlx::types::time::OffsetDateTime;
 
-    use super::{canonical_direct_key, is_ulid, kind_from, page_size, unix_millis};
-    use jiuyue_contract::{ConversationKind, DEFAULT_MESSAGE_PAGE_SIZE, MAX_MESSAGE_PAGE_SIZE};
+    use super::{
+        canonical_direct_key, is_ulid, kind_from, normalise_cursors, page_size, unix_millis,
+    };
+    use jiuyue_contract::{
+        ConversationKind, DEFAULT_MESSAGE_PAGE_SIZE, MAX_MESSAGE_PAGE_SIZE, SyncCursor,
+    };
 
     #[test]
     fn the_pair_key_does_not_depend_on_argument_order() {
@@ -526,5 +608,61 @@ mod tests {
             .expect("a valid millisecond");
 
         assert_eq!(unix_millis(instant), 1_700_000_000_250);
+    }
+
+    /// A cursor naming `conversation_id` at `last_seq`.
+    fn cursor(conversation_id: &str, last_seq: i64) -> SyncCursor {
+        SyncCursor {
+            conversation_id: conversation_id.to_owned(),
+            last_seq,
+        }
+    }
+
+    #[test]
+    fn cursors_collapse_to_the_highest_per_conversation() {
+        const FIRST: &str = "01JABC1234567890ABCDEFGHJ1";
+        const SECOND: &str = "01JABC1234567890ABCDEFGHJ2";
+
+        // Out-of-order reports — several connections of one Device — must not
+        // rewind, and the duplicate that would break `ON CONFLICT` is gone.
+        let normalised = normalise_cursors(&[
+            cursor(FIRST, 9),
+            cursor(SECOND, 4),
+            cursor(FIRST, 3),
+            cursor(FIRST, 12),
+        ]);
+
+        assert_eq!(normalised.len(), 2, "one entry per conversation, never two");
+        let mut by_id: Vec<(&str, i64)> = normalised
+            .iter()
+            .map(|cursor| (cursor.conversation_id.as_str(), cursor.last_seq))
+            .collect();
+        by_id.sort_unstable();
+        assert_eq!(by_id, vec![(FIRST, 12), (SECOND, 4)]);
+    }
+
+    #[test]
+    fn malformed_cursors_are_dropped_rather_than_failing_the_batch() {
+        let normalised = normalise_cursors(&[
+            cursor("not-a-ulid", 5),
+            cursor("01JABC1234567890ABCDEFGHI1", 5), // `I` is not Crockford Base32
+            cursor("01JABC1234567890ABCDEFGHJ1", 5),
+        ]);
+
+        assert_eq!(normalised.len(), 1);
+        assert_eq!(normalised[0].last_seq, 5);
+    }
+
+    #[test]
+    fn a_non_positive_cursor_is_dropped() {
+        let normalised = normalise_cursors(&[
+            cursor("01JABC1234567890ABCDEFGHJ1", 0),
+            cursor("01JABC1234567890ABCDEFGHJ2", -7),
+        ]);
+
+        assert!(
+            normalised.is_empty(),
+            "0 is the schema's `no row` value and must never be stored"
+        );
     }
 }
