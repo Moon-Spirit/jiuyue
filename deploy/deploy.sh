@@ -204,7 +204,7 @@ rollback_to() {
   local previous="$1"
   log "health check failed — rolling back to ${previous}"
   switch_current "$previous"
-  systemctl restart "$SERVICE" || true
+  systemctl restart "$SERVICE" 9>&- || true
   if wait_healthy "$HEALTH_URL" "$HEALTH_TIMEOUT"; then
     log "rollback healthy; the box is serving the previous release again"
     return 0
@@ -246,6 +246,13 @@ main() {
   [ -f "$ENV_FILE" ] || die "environment file not found: ${ENV_FILE} (run deploy/provision.sh first)"
   [ -d "$DATA_DIR" ] || die "data directory not found: ${DATA_DIR} (run deploy/provision.sh first)"
 
+  # The lock lives on fd 9 for the lifetime of this script. Bash does not set
+  # FD_CLOEXEC on a descriptor opened this way, so **every child inherits it** -
+  # and any child that outlives the deploy would hold the lock forever, making
+  # every later deploy die with a misleading "another deploy appears to be in
+  # progress". Real systemd starts the unit from PID 1 and would never inherit
+  # it, but that is a property of systemd, not of this script. So the lock fd is
+  # closed explicitly wherever a long-lived process can be spawned (`9>&-`).
   mkdir -p -- "$(dirname -- "$LOCK_FILE")"
   exec 9>"$LOCK_FILE"
   flock -n 9 || die "another deploy appears to be in progress (${LOCK_FILE})"
@@ -276,7 +283,7 @@ main() {
   switch_current "$final"
 
   log "restarting ${SERVICE} (embedded migrations run at startup)"
-  if ! systemctl restart "$SERVICE"; then
+  if ! systemctl restart "$SERVICE" 9>&-; then
     if [ -n "$previous" ] && [ -d "$previous" ]; then
       rollback_to "$previous"
     fi
