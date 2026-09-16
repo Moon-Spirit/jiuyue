@@ -6,9 +6,16 @@ import type { ConversationSummary } from "./ConversationSummary";
  *
  * Pushed to a Participant's live sessions when a Conversation is created, so the
  * peer's conversation list updates without a refresh.
+ *
+ * It is also how a Group's announcement reaches every Participant without a
+ * reload: an announcement edit sends each member **their own** updated
+ * [`ConversationSummary`], whose `group.announcement` carries the new text. That
+ * reuses this one shape rather than adding a parallel event, so a client that
+ * already upserts on creation needs no new case — and a client that predates the
+ * field simply ignores it. See `jiuyue-contract`'s `group` module.
  */
 export type ConversationCreated = { 
 /**
- * The Conversation the caller now participates in.
+ * The Conversation the caller now participates in (or whose summary changed).
  */
 conversation: ConversationSummary, };

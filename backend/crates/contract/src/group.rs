@@ -88,6 +88,15 @@ pub const MIN_GROUP_MEMBERS: i64 = 3;
 /// Hard cap on a group title, in Unicode scalar values.
 pub const MAX_GROUP_TITLE_CHARS: usize = 100;
 
+/// Hard cap on a Group announcement, in Unicode scalar values.
+///
+/// The server enforces it and the client mirrors it so the limit is felt before a
+/// round trip. It matches the `conversations_announcement_length` check in the
+/// schema. Deliberately below [`crate::chat::MAX_MESSAGE_BODY_CHARS`]: an
+/// announcement is a pinned notice, not a Message stream, and the cap is what
+/// keeps a hostile client from forcing an unbounded row on the 2 vCPU / 2 GB box.
+pub const MAX_ANNOUNCEMENT_CHARS: usize = 2000;
+
 /// One Participant as the member list renders them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[ts(export)]
@@ -120,6 +129,17 @@ pub struct GroupSummary {
     pub member_count: i64,
     /// The **caller's own** Role in the group.
     pub my_role: Role,
+    /// The group announcement (CONTEXT.md: Group Conversation), or `None` when
+    /// the group has none.
+    ///
+    /// Optional on the wire as well as in Rust, and omitted when absent, so an
+    /// older client that never learned the field still accepts a payload that
+    /// carries it, and a group with no announcement stays small (ADR-0003).
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    #[ts(type = "string | null")]
+    pub announcement: Option<String>,
 }
 
 /// `POST /conversations/group` body.
@@ -161,6 +181,21 @@ pub struct ChangeMemberRoleRequest {
 pub struct TransferOwnershipRequest {
     /// ULID of the Participant who becomes the new owner. Must currently be one.
     pub user_id: String,
+}
+
+/// `PATCH /conversations/{id}/announcement` body.
+///
+/// `announcement` is the new text, or `null` / absent to clear it. The service
+/// trims it and treats a blank string as a clear, so "delete the announcement"
+/// has exactly one representation in storage — SQL `NULL`, never `''`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct UpdateAnnouncementRequest {
+    /// The new announcement, or `None` to clear it.
+    #[serde(default)]
+    #[ts(optional)]
+    #[ts(type = "string | null")]
+    pub announcement: Option<String>,
 }
 
 /// `GET /conversations/{id}` response: the info panel's data.
@@ -277,6 +312,7 @@ mod tests {
                 title: "九月小组".to_owned(),
                 member_count: 3,
                 my_role: Role::Owner,
+                announcement: Some("周六下午三点线上会议".to_owned()),
             }),
             unread_count: 0,
             created_at_ms: 1_700_000_000_000,
@@ -286,6 +322,41 @@ mod tests {
 
         assert_eq!(wire["group"]["title"], "九月小组");
         assert_eq!(wire["group"]["my_role"], "owner");
+        assert_eq!(wire["group"]["announcement"], "周六下午三点线上会议");
         assert!(wire["peer"].is_null());
+    }
+
+    /// A group with no announcement omits the field entirely rather than sending
+    /// `null`, which is what keeps the payload additive for older clients.
+    #[test]
+    fn an_absent_announcement_is_omitted_from_the_wire() {
+        let summary = super::GroupSummary {
+            title: "九月小组".to_owned(),
+            member_count: 3,
+            my_role: Role::Member,
+            announcement: None,
+        };
+
+        let wire = serde_json::to_value(&summary).expect("a summary must serialise");
+
+        assert!(
+            wire.get("announcement").is_none(),
+            "an absent announcement must not appear on the wire: {wire}"
+        );
+    }
+
+    /// Clearing has one representation: `null` and an absent field are the same
+    /// request, and both decode to `None`.
+    #[test]
+    fn clearing_an_announcement_accepts_null_or_absence() {
+        for body in [r#"{"announcement":null}"#, "{}"] {
+            let request: super::UpdateAnnouncementRequest =
+                serde_json::from_str(body).expect("the body must decode");
+            assert_eq!(request.announcement, None, "body was {body}");
+        }
+
+        let request: super::UpdateAnnouncementRequest =
+            serde_json::from_str(r#"{"announcement":"新公告"}"#).expect("the body must decode");
+        assert_eq!(request.announcement.as_deref(), Some("新公告"));
     }
 }

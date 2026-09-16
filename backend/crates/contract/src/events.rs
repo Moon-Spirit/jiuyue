@@ -32,7 +32,14 @@ pub enum ServerEvent {
     NewMessage(NewMessage),
     /// A Message this connection submitted was refused and was not stored.
     MessageRejected(MessageRejected),
-    /// A Conversation this connection now participates in was created.
+    /// A Conversation this connection now participates in was created, **or** its
+    /// own summary changed in a way every Participant must see live — today, a
+    /// Group announcement edit.
+    ///
+    /// Deliberately one shape rather than a second event: a client already upserts
+    /// a Conversation on creation, so an updated summary rides the same reducer,
+    /// and the announcement is a new optional field an older client ignores
+    /// (ADR-0003's additive rule).
     ConversationCreated(ConversationCreated),
     /// A Group Conversation's membership changed: someone joined, left or was
     /// removed, a Role changed, ownership was transferred, or the group was

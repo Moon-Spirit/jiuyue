@@ -14,6 +14,8 @@
 //!   send turns out to be a replay. That is what keeps `seq` gapless *and* keeps a
 //!   retry from writing twice.
 
+use std::collections::HashMap;
+
 use jiuyue_contract::{ReadReceipt, Role, SyncCursor};
 use sqlx::postgres::PgRow;
 use sqlx::types::time::OffsetDateTime;
@@ -24,14 +26,14 @@ use crate::error::ChatError;
 const INSERT_DIRECT_CONVERSATION: &str = "\
     INSERT INTO conversations (id, kind, direct_key) VALUES ($1, 'direct', $2) \
     ON CONFLICT (direct_key) DO NOTHING \
-    RETURNING id::text AS id, kind, title, created_at";
+    RETURNING id::text AS id, kind, title, announcement, created_at";
 
 const SELECT_CONVERSATION_BY_DIRECT_KEY: &str = "\
-    SELECT id::text AS id, kind, title, created_at \
+    SELECT id::text AS id, kind, title, announcement, created_at \
     FROM conversations WHERE direct_key = $1";
 
 const SELECT_CONVERSATION: &str = "\
-    SELECT id::text AS id, kind, title, created_at \
+    SELECT id::text AS id, kind, title, announcement, created_at \
     FROM conversations WHERE id = $1";
 
 /// Create a Group Conversation.
@@ -41,7 +43,25 @@ const SELECT_CONVERSATION: &str = "\
 /// supplies a fresh ULID.
 const INSERT_GROUP_CONVERSATION: &str = "\
     INSERT INTO conversations (id, kind, title) VALUES ($1, 'group', $2) \
-    RETURNING id::text AS id, kind, title, created_at";
+    RETURNING id::text AS id, kind, title, announcement, created_at";
+
+/// Replace a Group's announcement. `NULL` clears it.
+///
+/// Only the announcement is written; `updated_at` moves with it so the row's own
+/// clock stays honest. The kind/role checks happen in the service, which resolves
+/// the caller's Role first — this statement carries no permission logic.
+const SET_ANNOUNCEMENT: &str = "\
+    UPDATE conversations SET announcement = $2, updated_at = now() \
+    WHERE id = $1";
+
+/// Every Participant's stored Unread Count in one Conversation.
+///
+/// Used when one change must be rendered **per recipient** — an announcement edit
+/// sends each Participant their own summary, and that summary carries their own
+/// Unread Count. One query for the whole group, never one per Participant.
+const SELECT_MEMBER_UNREADS: &str = "\
+    SELECT user_id::text AS user_id, unread_count \
+    FROM conversation_members WHERE conversation_id = $1";
 
 const INSERT_MEMBERS: &str = "\
     INSERT INTO conversation_members (conversation_id, user_id) \
@@ -57,7 +77,7 @@ const SELECT_USER_BY_ID: &str = "\
     FROM users WHERE id = $1";
 
 const SELECT_CONVERSATIONS_FOR_USER: &str = "\
-    SELECT c.id::text AS id, c.kind, c.title, c.created_at, me.unread_count, \
+    SELECT c.id::text AS id, c.kind, c.title, c.announcement, c.created_at, me.unread_count, \
            u.id::text AS peer_id, u.username AS peer_username, \
            u.display_name AS peer_display_name, u.avatar_url AS peer_avatar_url \
     FROM conversation_members AS me \
@@ -76,7 +96,7 @@ const SELECT_CONVERSATIONS_FOR_USER: &str = "\
 /// nullable peer and a nullable group) keeps each projection exactly the columns
 /// its kind has, and the service merges the two lists.
 const SELECT_GROUP_CONVERSATIONS_FOR_USER: &str = "\
-    SELECT c.id::text AS id, c.kind, c.title, c.created_at, me.role, me.unread_count, \
+    SELECT c.id::text AS id, c.kind, c.title, c.announcement, c.created_at, me.role, me.unread_count, \
            (SELECT count(*) FROM conversation_members AS counted \
             WHERE counted.conversation_id = c.id) AS member_count \
     FROM conversation_members AS me \
@@ -334,6 +354,8 @@ pub struct ConversationRow {
     pub kind: String,
     /// The group's display name; `None` for a Direct Conversation.
     pub title: Option<String>,
+    /// The group's announcement; `None` when absent, cleared, or Direct.
+    pub announcement: Option<String>,
     /// Creation time.
     pub created_at: OffsetDateTime,
 }
@@ -677,6 +699,44 @@ impl ChatRepository {
 
         transaction.commit().await.map_err(ChatError::Database)?;
         Ok(true)
+    }
+
+    /// Replace a Conversation's announcement; `None` clears it.
+    ///
+    /// Returns whether a row changed. The caller has already resolved the group
+    /// and the Role, so this is the plain write, not a permission check.
+    pub async fn set_announcement(
+        &self,
+        conversation_id: &str,
+        announcement: Option<&str>,
+    ) -> Result<bool, ChatError> {
+        sqlx::query(SET_ANNOUNCEMENT)
+            .bind(conversation_id)
+            .bind(announcement)
+            .execute(&self.pool)
+            .await
+            .map(|result| result.rows_affected() > 0)
+            .map_err(ChatError::Database)
+    }
+
+    /// Every Participant's Unread Count in one Conversation, keyed by User id.
+    ///
+    /// A Participant with no row cannot exist (membership is the row), so a
+    /// missing key at a call site would be a programming error, not a state.
+    pub async fn member_unread_counts(
+        &self,
+        conversation_id: &str,
+    ) -> Result<HashMap<String, i64>, ChatError> {
+        sqlx::query(SELECT_MEMBER_UNREADS)
+            .bind(conversation_id)
+            .fetch_all(&self.pool)
+            .await
+            .map(|rows| {
+                rows.iter()
+                    .map(|row| (row.get("user_id"), row.get("unread_count")))
+                    .collect()
+            })
+            .map_err(ChatError::Database)
     }
 
     /// Every Group Conversation the User participates in, newest first.
@@ -1099,6 +1159,7 @@ fn conversation_from_row(row: &PgRow) -> ConversationRow {
         id: row.get("id"),
         kind: row.get("kind"),
         title: row.get("title"),
+        announcement: row.get("announcement"),
         created_at: row.get("created_at"),
     }
 }

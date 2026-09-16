@@ -28,6 +28,7 @@ use axum::http::StatusCode;
 use axum::routing::{get, patch, post};
 use axum::{Json, Router};
 use jiuyue_chat::{MembershipNotice, MembershipUpdate};
+use jiuyue_contract::group::UpdateAnnouncementRequest;
 use jiuyue_contract::{
     AddGroupMembersRequest, ChangeMemberRoleRequest, ConversationCreated, ConversationList,
     ConversationSummary, CreateDirectConversationRequest, CreateGroupConversationRequest,
@@ -59,6 +60,10 @@ pub fn router() -> Router<AppState> {
         .route(
             "/conversations/{conversation_id}/members/{member_id}",
             patch(change_member_role).delete(remove_group_member),
+        )
+        .route(
+            "/conversations/{conversation_id}/announcement",
+            patch(update_group_announcement),
         )
         .route("/conversations/{conversation_id}/leave", post(leave_group))
         .route(
@@ -220,6 +225,36 @@ async fn change_member_role(
 
     let update = chat
         .change_member_role(&session.user_id, &conversation_id, &member_id, body)
+        .await
+        .map_err(ApiError::from)?;
+    fan_out_membership(&state, &update).await?;
+
+    let info = chat
+        .group_info(&session.user_id, &conversation_id)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(info))
+}
+
+/// `PATCH /conversations/{id}/announcement` — replace or clear a Group's announcement.
+///
+/// Owner or admin only, enforced by `Capability::EditGroupInfo` in the domain; a
+/// member is refused with `403 FORBIDDEN`, which is distinguishable from "not a
+/// participant" (`NOT_A_PARTICIPANT`) and from a bad body (`VALIDATION_FAILED`).
+/// Every current Participant receives their own updated summary live, so the new
+/// text needs no reload; a member who was removed is not a Participant and so is
+/// not in the fan-out.
+async fn update_group_announcement(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path(conversation_id): Path<String>,
+    Json(body): Json<UpdateAnnouncementRequest>,
+) -> Result<Json<GroupInfo>, ApiError> {
+    let session = authenticate(&state, &headers).await?;
+    let chat = state.chat()?;
+
+    let update = chat
+        .update_group_announcement(&session.user_id, &conversation_id, body)
         .await
         .map_err(ApiError::from)?;
     fan_out_membership(&state, &update).await?;

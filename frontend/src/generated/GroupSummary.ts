@@ -18,4 +18,13 @@ member_count: number,
 /**
  * The **caller's own** Role in the group.
  */
-my_role: Role, };
+my_role: Role, 
+/**
+ * The group announcement (CONTEXT.md: Group Conversation), or `None` when
+ * the group has none.
+ *
+ * Optional on the wire as well as in Rust, and omitted when absent, so an
+ * older client that never learned the field still accepts a payload that
+ * carries it, and a group with no announcement stays small (ADR-0003).
+ */
+announcement?: string | null, };

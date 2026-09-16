@@ -15,6 +15,7 @@ use std::collections::{HashMap, HashSet};
 use sqlx::PgPool;
 use sqlx::types::time::OffsetDateTime;
 
+use jiuyue_contract::group::{MAX_ANNOUNCEMENT_CHARS, UpdateAnnouncementRequest};
 use jiuyue_contract::{
     AddGroupMembersRequest, ChangeMemberRoleRequest, ConversationKind, ConversationSummary,
     CreateGroupConversationRequest, DEFAULT_MESSAGE_PAGE_SIZE, FieldError, FieldErrorCode,
@@ -438,6 +439,79 @@ impl ChatService {
                 unread_count,
             ),
             members: members.iter().map(member_view).collect(),
+        })
+    }
+
+    /// Replace a Group's announcement, or clear it.
+    ///
+    /// Owner or admin only — the same [`Capability::EditGroupInfo`] row that
+    /// governs the group's title, because both edit the group's own profile. The
+    /// capability is asked through the one permission module, never re-derived
+    /// here, so the answer is written down in [`crate::permission`]'s table.
+    ///
+    /// The write happens first and the fan-out second, so the text that reaches
+    /// the members is the text that is stored — never a value the database
+    /// refused. Every current Participant receives **their own** updated
+    /// [`ConversationSummary`] (their Role and their Unread Count), which the
+    /// transport delivers as a `ConversationCreated` event. A User who left or was
+    /// removed is not a Participant any more and is therefore not among the
+    /// recipients, so a removed member receives no announcement update.
+    ///
+    /// Clearing is expressed as `None`, and a blank string normalises to it: an
+    /// announcement is either a non-empty notice or absent, never `''`.
+    pub async fn update_group_announcement(
+        &self,
+        caller_id: &str,
+        conversation_id: &str,
+        request: UpdateAnnouncementRequest,
+    ) -> Result<MembershipUpdate, ChatError> {
+        let (mut conversation, role) =
+            require_group_role(&self.repository, conversation_id, caller_id).await?;
+        permission::ensure(role, Capability::EditGroupInfo)?;
+
+        let announcement = normalise_announcement(request.announcement)?;
+
+        if !self
+            .repository
+            .set_announcement(conversation_id, announcement.as_deref())
+            .await?
+        {
+            return Err(ChatError::ConversationNotFound);
+        }
+
+        // The recipients' summaries must carry the **new** text, so the in-memory
+        // row is brought in step with the write before it is projected.
+        conversation.announcement = announcement;
+
+        let members = self.repository.list_members(conversation_id).await?;
+        let unread = self
+            .repository
+            .member_unread_counts(conversation_id)
+            .await?;
+        let member_count = members.len() as i64;
+
+        let notices = members
+            .iter()
+            .map(|member| MembershipNotice::Conversation {
+                user_id: member.user_id.clone(),
+                conversation: group_summary_from(
+                    &conversation,
+                    Role::from_stored(&member.role),
+                    member_count,
+                    unread.get(&member.user_id).copied().unwrap_or(0),
+                ),
+            })
+            .collect();
+
+        tracing::info!(
+            conversation_id = %conversation_id,
+            "group announcement updated"
+        );
+
+        Ok(MembershipUpdate {
+            conversation_id: conversation_id.to_owned(),
+            actor_id: caller_id.to_owned(),
+            notices,
         })
     }
 
@@ -1262,6 +1336,9 @@ fn group_summary_from(
             title: conversation.title.clone().unwrap_or_default(),
             member_count,
             my_role,
+            // An announcement is optional: `None` means the group has none, which
+            // is a normal state and not a missing column.
+            announcement: conversation.announcement.clone(),
         }),
         unread_count,
         created_at_ms: unix_millis(conversation.created_at),
@@ -1312,6 +1389,34 @@ async fn require_group_role(
     }
 
     Ok((conversation, Role::from_stored(&role)))
+}
+
+/// Normalise a requested announcement to the one stored shape.
+///
+/// Three outcomes, and no fourth:
+///
+/// - absent, blank or whitespace-only → `None` (clear it); this is why "delete the
+///   announcement" has a single representation, SQL `NULL`, and never `''`;
+/// - 1–[`MAX_ANNOUNCEMENT_CHARS`] characters → `Some` with the surrounding
+///   whitespace trimmed;
+/// - longer → a field-level validation failure, refused **before** the write, so
+///   an over-length announcement stores nothing.
+fn normalise_announcement(announcement: Option<String>) -> Result<Option<String>, ChatError> {
+    let trimmed = announcement.unwrap_or_default();
+    let trimmed = trimmed.trim();
+
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    if trimmed.chars().count() > MAX_ANNOUNCEMENT_CHARS {
+        return Err(validation(
+            "announcement",
+            FieldErrorCode::TooLong,
+            "群公告最多 2000 个字符",
+        ));
+    }
+
+    Ok(Some(trimmed.to_owned()))
 }
 
 /// Trim, lowercase, drop blanks, and drop repeats — keeping first-seen order.
@@ -1384,10 +1489,14 @@ mod tests {
     use sqlx::types::time::OffsetDateTime;
 
     use super::{
-        canonical_direct_key, is_ulid, kind_from, normalise_cursors, page_size, unix_millis,
+        canonical_direct_key, is_ulid, kind_from, normalise_announcement, normalise_cursors,
+        page_size, unix_millis,
     };
+    use crate::error::ChatError;
+    use jiuyue_contract::group::MAX_ANNOUNCEMENT_CHARS;
     use jiuyue_contract::{
-        ConversationKind, DEFAULT_MESSAGE_PAGE_SIZE, MAX_MESSAGE_PAGE_SIZE, SyncCursor,
+        ConversationKind, DEFAULT_MESSAGE_PAGE_SIZE, FieldErrorCode, MAX_MESSAGE_PAGE_SIZE,
+        SyncCursor,
     };
 
     #[test]
@@ -1498,5 +1607,44 @@ mod tests {
             normalised.is_empty(),
             "0 is the schema's `no row` value and must never be stored"
         );
+    }
+
+    #[test]
+    fn an_announcement_is_trimmed_and_absence_or_blank_clears_it() {
+        assert_eq!(
+            normalise_announcement(None).expect("absence clears"),
+            None,
+            "an absent announcement means 'clear it'"
+        );
+        assert_eq!(
+            normalise_announcement(Some("   ".to_owned())).expect("blank clears"),
+            None,
+            "whitespace-only is a clear, never a stored empty string"
+        );
+        assert_eq!(
+            normalise_announcement(Some("  周六开会  ".to_owned())).expect("valid"),
+            Some("周六开会".to_owned())
+        );
+    }
+
+    #[test]
+    fn an_announcement_at_the_cap_is_accepted_and_one_over_is_refused() {
+        let at_cap = "九".repeat(MAX_ANNOUNCEMENT_CHARS);
+        assert_eq!(
+            normalise_announcement(Some(at_cap)).expect("the cap itself is allowed"),
+            Some("九".repeat(MAX_ANNOUNCEMENT_CHARS))
+        );
+
+        let over = "九".repeat(MAX_ANNOUNCEMENT_CHARS + 1);
+        let error = normalise_announcement(Some(over)).expect_err("one over the cap is refused");
+
+        match error {
+            ChatError::Validation(fields) => {
+                assert_eq!(fields.len(), 1);
+                assert_eq!(fields[0].field, "announcement");
+                assert_eq!(fields[0].code, FieldErrorCode::TooLong);
+            }
+            other => panic!("expected a validation failure, got {other:?}"),
+        }
     }
 }

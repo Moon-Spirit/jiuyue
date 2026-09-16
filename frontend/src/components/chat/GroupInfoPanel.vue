@@ -3,19 +3,26 @@ import { computed, ref } from "vue";
 import type { ConversationSummary } from "../../generated/ConversationSummary";
 import type { MemberView } from "../../generated/MemberView";
 import type { Role } from "../../generated/Role";
+import {
+  MAX_ANNOUNCEMENT_CHARS,
+  announcementProblem,
+  editAnnouncement,
+  may,
+  mayLeave as roleMayLeave,
+  mayRemove as roleMayRemove,
+} from "../../stores/groups";
 
 /**
- * The Group info panel: Participants, their Roles, and the actions the caller's
- * own Role permits.
+ * The Group info panel: Participants, their Roles, the announcement, and the
+ * actions the caller's own Role permits.
  *
  * # The UI mirrors the server, it does not decide
  *
- * `jiuyue-chat::permission` is the one authority on who may do what; the
- * predicate helpers below mirror that decision table so the panel does not offer
- * an action that will be refused. They are **not** the enforcement — the server
- * re-checks every action, and a panel that showed a forbidden button would still
- * be refused. Keeping the mirror small and in one file is what stops it drifting
- * into a second, wrong, permission model.
+ * `jiuyue-chat::permission` is the one authority on who may do what. Every
+ * predicate below delegates to `../../stores/groups`, which mirrors that decision
+ * table in one place, so the panel cannot drift into a second, wrong, permission
+ * model. They are **not** the enforcement — the server re-checks every action,
+ * and a panel that showed a forbidden button would still be refused.
  */
 const props = defineProps<{
   conversation: ConversationSummary;
@@ -38,37 +45,70 @@ const inviteInput = ref("");
 const myRole = computed<Role>(
   () => props.conversation.group?.my_role ?? "member",
 );
-const isOwner = computed(() => myRole.value === "owner");
-const isAdmin = computed(() => isOwner.value || myRole.value === "admin");
+
+/** The group's announcement, or `null` when it has none. */
+const announcement = computed<string | null>(
+  () => props.conversation.group?.announcement ?? null,
+);
+
+/** Whether the announcement editor is open. */
+const editingAnnouncement = ref(false);
+/** The draft the editor holds while it is open. */
+const announcementDraft = ref("");
+/** The last edit failure, from the server or the local length mirror. */
+const announcementError = ref<string | null>(null);
+/** Whether a save is in flight. */
+const savingAnnouncement = ref(false);
+
+/** The draft's length in Unicode code points, for the live counter. */
+const announcementLength = computed(() => [...announcementDraft.value].length);
+/** Whether the draft is over the cap, so saving is refused before a round trip. */
+const announcementTooLong = computed(
+  () => announcementProblem(announcementDraft.value) !== null,
+);
+
+/**
+ * The problem to show under the editor: the local length mirror first, then the
+ * last server failure. `null` means there is nothing to report.
+ */
+const announcementMessage = computed<string | null>(
+  () => announcementProblem(announcementDraft.value) ?? announcementError.value,
+);
 
 /** Owner or admin may invite (mirrors `Capability::InviteMembers`). */
-const mayInvite = computed(() => isAdmin.value);
+const mayInvite = computed(() => may(myRole.value, "inviteMembers"));
 
-/** Only the owner may dissolve or transfer (mirrors the owner-only rows). */
-const mayDissolve = computed(() => isOwner.value);
+/** Owner or admin may edit the group's own profile — title and announcement. */
+const mayEditAnnouncement = computed(() => may(myRole.value, "editGroupInfo"));
+
+/** Only the owner may dissolve (mirrors the owner-only rows). */
+const mayDissolve = computed(() => may(myRole.value, "dissolve"));
 
 /**
  * An owner with others present cannot leave; they must transfer or dissolve
  * first (mirrors `may_leave`). The panel says so instead of offering a refusal.
  */
-const mayLeave = computed(() => !isOwner.value || props.members.length <= 1);
+const mayLeave = computed(() =>
+  roleMayLeave(myRole.value, props.members.length - 1),
+);
 
 /** Whether the caller may remove `member` (mirrors `may_remove`). */
 function mayRemove(member: MemberView): boolean {
   if (member.user_id === props.currentUserId) return false;
-  if (myRole.value === "owner") return member.role !== "owner";
-  if (myRole.value === "admin") return member.role === "member";
-  return false;
+  return roleMayRemove(myRole.value, member.role);
 }
 
 /** Only the owner changes Roles, and never their own (mirrors `ChangeRoles`). */
 function mayChangeRole(member: MemberView): boolean {
-  return isOwner.value && member.role !== "owner";
+  return may(myRole.value, "changeRoles") && member.role !== "owner";
 }
 
 /** Only the owner transfers, and only to someone else. */
 function mayTransfer(member: MemberView): boolean {
-  return isOwner.value && member.user_id !== props.currentUserId;
+  return (
+    may(myRole.value, "transferOwnership") &&
+    member.user_id !== props.currentUserId
+  );
 }
 
 const ROLE_LABELS: Record<Role, string> = {
@@ -91,6 +131,50 @@ function invite(): void {
   emit("invite", usernames);
   inviteInput.value = "";
 }
+
+/** Open the editor with the stored announcement as its starting draft. */
+function startEditingAnnouncement(): void {
+  announcementDraft.value = announcement.value ?? "";
+  announcementError.value = null;
+  editingAnnouncement.value = true;
+}
+
+/** Abandon the draft; the stored announcement is unchanged. */
+function cancelAnnouncement(): void {
+  editingAnnouncement.value = false;
+  announcementError.value = null;
+}
+
+/**
+ * Save the draft through the shared announcement flow.
+ *
+ * The flow owns the server call and the length mirror; the panel only reports
+ * what came back, so an over-long draft and a permission refusal are both
+ * visible without the panel deciding either.
+ */
+async function saveAnnouncement(): Promise<void> {
+  if (savingAnnouncement.value) return;
+
+  const problem = announcementProblem(announcementDraft.value);
+  if (problem !== null) {
+    announcementError.value = problem;
+    return;
+  }
+
+  savingAnnouncement.value = true;
+  announcementError.value = null;
+  const result = await editAnnouncement(
+    props.conversation.id,
+    announcementDraft.value,
+  );
+  savingAnnouncement.value = false;
+
+  if (!result.ok) {
+    announcementError.value = result.message;
+    return;
+  }
+  editingAnnouncement.value = false;
+}
 </script>
 
 <template>
@@ -108,6 +192,82 @@ function invite(): void {
         我的角色：{{ ROLE_LABELS[myRole] }}
       </p>
     </header>
+
+    <section
+      class="border-b border-zinc-200 px-4 py-3 dark:border-zinc-800"
+      data-test="announcement"
+    >
+      <div class="flex items-center justify-between gap-2">
+        <h4 class="text-xs font-semibold text-zinc-500">群公告</h4>
+        <button
+          v-if="mayEditAnnouncement && !editingAnnouncement"
+          type="button"
+          class="rounded border border-zinc-300 px-2 py-1 text-xs transition-colors hover:bg-zinc-100 dark:border-zinc-700 dark:hover:bg-zinc-800"
+          data-test="announcement-edit"
+          @click="startEditingAnnouncement"
+        >
+          编辑
+        </button>
+      </div>
+
+      <template v-if="editingAnnouncement">
+        <textarea
+          v-model="announcementDraft"
+          rows="4"
+          placeholder="输入群公告，留空则清除"
+          class="mt-2 w-full resize-y rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm outline-none transition-colors focus:border-zinc-500 dark:border-zinc-700 dark:bg-zinc-950"
+          data-test="announcement-input"
+        />
+        <p
+          class="mt-1 text-right text-xs text-zinc-400"
+          data-test="announcement-count"
+        >
+          {{ announcementLength }} / {{ MAX_ANNOUNCEMENT_CHARS }}
+        </p>
+        <p
+          v-if="announcementMessage !== null"
+          class="mt-1 text-xs text-red-600 dark:text-red-400"
+          data-test="announcement-error"
+        >
+          {{ announcementMessage }}
+        </p>
+        <div class="mt-2 flex gap-2">
+          <button
+            type="button"
+            class="rounded-lg bg-zinc-900 px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-zinc-700 disabled:cursor-not-allowed disabled:opacity-50 dark:bg-zinc-100 dark:text-zinc-900 dark:hover:bg-zinc-300"
+            :disabled="savingAnnouncement || announcementTooLong"
+            data-test="announcement-save"
+            @click="saveAnnouncement"
+          >
+            保存
+          </button>
+          <button
+            type="button"
+            class="rounded-lg border border-zinc-300 px-3 py-1.5 text-xs transition-colors hover:bg-zinc-100 disabled:cursor-not-allowed disabled:opacity-50 dark:border-zinc-700 dark:hover:bg-zinc-800"
+            :disabled="savingAnnouncement"
+            data-test="announcement-cancel"
+            @click="cancelAnnouncement"
+          >
+            取消
+          </button>
+        </div>
+      </template>
+
+      <p
+        v-else-if="announcement !== null"
+        class="mt-2 whitespace-pre-wrap break-words text-sm"
+        data-test="announcement-text"
+      >
+        {{ announcement }}
+      </p>
+      <p
+        v-else
+        class="mt-2 text-sm text-zinc-400"
+        data-test="announcement-empty"
+      >
+        暂无群公告
+      </p>
+    </section>
 
     <p v-if="loading" class="p-4 text-sm text-zinc-500">加载中…</p>
 
