@@ -53,16 +53,25 @@ _每一项的选择理由与已否决的替代方案见 `docs/adr/`。改动前�
 
 ## 常用命令
 
-> 随脚手架落地逐步补齐。
+> 以下命令均已实测可用（2026-09-16）。环境：Windows / PowerShell 5.1。
 
-| 目的            | 命令                                   |
-| --------------- | -------------------------------------- |
-| 后端测试        | _TBD_                                  |
-| 后端 lint       | _TBD_                                  |
-| 前端测试        | _TBD_                                  |
-| 前端类型检查    | _TBD_                                  |
-| E2E             | _TBD_                                  |
-| 本地 PostgreSQL | `powershell scripts/pg-dev.ps1 status` |
+| 目的            | 命令                                                                           |
+| --------------- | ------------------------------------------------------------------------------ |
+| 后端测试        | `cargo test --manifest-path backend/Cargo.toml`                                |
+| 后端 lint       | `cargo clippy --manifest-path backend/Cargo.toml --all-targets -- -D warnings` |
+| 后端格式检查    | `cargo fmt --manifest-path backend/Cargo.toml --all --check`                   |
+| 后端运行        | `cargo run --manifest-path backend/Cargo.toml`                                 |
+| 前端依赖安装    | `pnpm --dir frontend install`                                                  |
+| 前端测试        | `pnpm --dir frontend test`                                                     |
+| 前端类型检查    | `pnpm --dir frontend type-check`                                               |
+| 前端构建        | `pnpm --dir frontend build`                                                    |
+| 前端开发服务器  | `pnpm --dir frontend dev`                                                      |
+| 本地 PostgreSQL | `powershell scripts/pg-dev.ps1 start\|stop\|status`                            |
+| 本地开发须知    | 见 [`docs/agents/local-dev.md`](./docs/agents/local-dev.md)                    |
+| E2E             | _TBD_（Playwright 接入后补齐）                                                 |
+
+> `cargo` / `rustc` 位于 `%USERPROFILE%\.cargo\bin`，新开的 shell 若未继承 PATH 需手动加。
+> 前端 dev server 默认监听 IPv6 `localhost:5173`（`::1`），并把 `/api` 代理到后端 `127.0.0.1:8080`。
 
 ## 开发约束（项目特有）
 
