@@ -55,14 +55,16 @@ jobs:
           set -euo pipefail
           missing=0
           for var in PORT RUST_LOG DATABASE_URL JWT_SECRET \
-                     ACCESS_TOKEN_TTL_SECS REFRESH_TOKEN_TTL_SECS; do
+                     ACCESS_TOKEN_TTL_SECS REFRESH_TOKEN_TTL_SECS \
+                     APP_BASE_URL EMAIL_VERIFICATION_TTL_SECS \
+                     PASSWORD_RESET_TTL_SECS SMTP_URL; do
             if ! grep -qE "^${var}=" deploy/env/jiuyue.env.example; then
               echo "::error::deploy/env/jiuyue.env.example is missing ${var}"
               missing=1
             fi
           done
           [ "$missing" -eq 0 ] || exit 1
-          echo "all six variables present"
+          echo "all ten variables present"
 
       - name: Install Caddy and PostgreSQL (native apt, no containers)
         run: |

@@ -203,14 +203,18 @@ curl -fsS http://127.0.0.1:8080/health
 [`deploy/env/jiuyue.env.example`](../deploy/env/jiuyue.env.example)。真源是
 `backend/crates/server/src/config.rs`，本表与其一致：
 
-| 变量                     | 必填 | 默认      | 说明                                                             |
-| ------------------------ | ---- | --------- | ---------------------------------------------------------------- |
-| `DATABASE_URL`           | 是   | —         | PostgreSQL DSN；缺失/空白启动即失败                              |
-| `JWT_SECRET`             | 是   | —         | HS256 签名密钥；**至少 32 字节**，过短在构造 token issuer 时被拒 |
-| `PORT`                   | 否   | `8080`    | 绑定端口（`0.0.0.0`，必须防火墙挡住）                            |
-| `RUST_LOG`               | 否   | `info`    | tracing filter                                                   |
-| `ACCESS_TOKEN_TTL_SECS`  | 否   | `900`     | 访问令牌有效期（15 分钟）                                        |
-| `REFRESH_TOKEN_TTL_SECS` | 否   | `2592000` | 刷新令牌有效期（30 天）                                          |
+| 变量                          | 必填 | 默认                    | 说明                                                                                                                                      |
+| ----------------------------- | ---- | ----------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| `DATABASE_URL`                | 是   | —                       | PostgreSQL DSN；缺失/空白启动即失败                                                                                                       |
+| `JWT_SECRET`                  | 是   | —                       | HS256 签名密钥；**至少 32 字节**，过短在构造 token issuer 时被拒                                                                          |
+| `PORT`                        | 否   | `8080`                  | 绑定端口（`0.0.0.0`，必须防火墙挡住）                                                                                                     |
+| `RUST_LOG`                    | 否   | `info`                  | tracing filter                                                                                                                            |
+| `ACCESS_TOKEN_TTL_SECS`       | 否   | `900`                   | 访问令牌有效期（15 分钟）                                                                                                                 |
+| `REFRESH_TOKEN_TTL_SECS`      | 否   | `2592000`               | 刷新令牌有效期（30 天）                                                                                                                   |
+| `APP_BASE_URL`                | 否   | `http://localhost:5173` | 前端公开地址；邮件里的验证 / 重置链接以此为前缀（生产填 Caddy 的站点地址）                                                                |
+| `EMAIL_VERIFICATION_TTL_SECS` | 否   | `86400`                 | 邮箱验证链接有效期（24 小时）                                                                                                             |
+| `PASSWORD_RESET_TTL_SECS`     | 否   | `3600`                  | 密码重置链接有效期（1 小时）                                                                                                              |
+| `SMTP_URL`                    | 否   | —                       | 事务邮件传输；**当前构建不内置任何服务商，设置它会使服务拒绝启动**（见 [ADR-0015](./adr/0015-email-verification-and-the-mailer-seam.md)） |
 
 **密钥处理**：
 
