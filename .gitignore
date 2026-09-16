@@ -23,3 +23,6 @@ data/
 uploads/
 # Logs
 *.log
+
+# magic-context session state (local tooling, not part of the project)
+.cortexkit/
