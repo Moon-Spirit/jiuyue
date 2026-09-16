@@ -122,14 +122,16 @@ export const useRealtimeStore = defineStore("realtime", () => {
       case "NewMessage":
       case "MessageRejected":
       case "ConversationCreated":
+      case "MembershipChanged":
       case "SyncState":
       case "ReadMarker":
       case "ReadReceipt":
         // `SyncState` is the Device's persisted Sync Cursors, pushed once per
         // connection. `ReadMarker` and `ReadReceipt` are read state: the first is
         // the account's own private position, the second a peer's public one.
-        // All three are chat state, not connection state — this store only
-        // forwards them, and the chat store decides what to do with them.
+        // `MembershipChanged` is a Group's membership moving. All are chat state,
+        // not connection state — this store only forwards them, and the chat
+        // store decides what to do with them.
         for (const listener of listeners) listener(event);
         break;
       default:

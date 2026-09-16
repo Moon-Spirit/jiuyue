@@ -10,20 +10,24 @@
 //! Conversation twice returns the same Conversation, and sending with the same
 //! Client Message ID twice returns the same Message.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use sqlx::PgPool;
 use sqlx::types::time::OffsetDateTime;
 
 use jiuyue_contract::{
-    ConversationKind, ConversationSummary, DEFAULT_MESSAGE_PAGE_SIZE, FieldError, FieldErrorCode,
-    MAX_CLIENT_MSG_ID_BYTES, MAX_MESSAGE_BODY_CHARS, MAX_MESSAGE_PAGE_SIZE, MarkRead, MessageList,
-    MessagePageQuery, MessageView, PeerSummary, ReadReceipt, SendMessage, SyncCursor,
+    AddGroupMembersRequest, ChangeMemberRoleRequest, ConversationKind, ConversationSummary,
+    CreateGroupConversationRequest, DEFAULT_MESSAGE_PAGE_SIZE, FieldError, FieldErrorCode,
+    GroupInfo, GroupSummary, MAX_CLIENT_MSG_ID_BYTES, MAX_GROUP_MEMBERS, MAX_GROUP_TITLE_CHARS,
+    MAX_MESSAGE_BODY_CHARS, MAX_MESSAGE_PAGE_SIZE, MIN_GROUP_MEMBERS, MarkRead, MemberView,
+    MembershipChange, MessageList, MessagePageQuery, MessageView, PeerSummary, ReadReceipt, Role,
+    SendMessage, SyncCursor, TransferOwnershipRequest,
 };
 
 use crate::error::ChatError;
+use crate::permission::{self, Capability};
 use crate::repository::{
-    ChatRepository, ConversationRow, MessageRow, NewMessageRow, PeerRow, ReadStateRow,
+    ChatRepository, ConversationRow, MemberRow, MessageRow, NewMessageRow, PeerRow, ReadStateRow,
 };
 
 /// Upper bound on the cursors one connection is handed at once.
@@ -58,6 +62,45 @@ pub struct OpenedConversation {
     pub notices: Vec<ConversationNotice>,
     /// Whether this call created the Conversation, as opposed to reopening it.
     pub created: bool,
+}
+
+/// One thing to tell one set of Users after a Group membership change.
+///
+/// The service decides **who** should learn **what**; the caller (the HTTP layer)
+/// is the only thing that knows how to deliver it. That split is deliberate: it
+/// keeps `jiuyue-chat` free of the realtime registry, and it is where "a removed
+/// member must not receive group traffic" is expressed in the domain rather than
+/// in client-side politeness.
+#[derive(Debug, Clone)]
+pub enum MembershipNotice {
+    /// This User should now see the Conversation; delivered as a
+    /// `ConversationCreated` event.
+    Conversation {
+        /// The User who gains the Conversation.
+        user_id: String,
+        /// The Conversation as that User sees it.
+        conversation: ConversationSummary,
+    },
+    /// These Users should apply this change; delivered as a
+    /// [`jiuyue_contract::MembershipChanged`] event.
+    Changed {
+        /// Every User who should receive the change.
+        user_ids: Vec<String>,
+        /// What changed.
+        change: MembershipChange,
+    },
+}
+
+/// The outcome of one membership mutation: who to tell, and what.
+#[derive(Debug, Clone)]
+pub struct MembershipUpdate {
+    /// The Conversation the change happened in.
+    pub conversation_id: String,
+    /// ULID of the User who caused the change, carried into the event so every
+    /// recipient can attribute it without a second lookup.
+    pub actor_id: String,
+    /// The recipients and their events.
+    pub notices: Vec<MembershipNotice>,
 }
 
 /// A stored Message, plus the Participants the caller must fan it out to.
@@ -219,20 +262,559 @@ impl ChatService {
         })
     }
 
-    /// Every Direct Conversation the caller participates in, newest first.
+    /// Every Conversation the caller participates in, newest first.
+    ///
+    /// Direct and Group Conversations are two projections (a Direct one names the
+    /// peer; a Group one carries its title, its Participant count and the caller's
+    /// Role) read separately and merged here, so a Group never has to pretend to
+    /// have a peer and vice versa. The merge is ordered by creation time, the same
+    /// order each query already returns.
     pub async fn list_conversations(
         &self,
         caller_id: &str,
     ) -> Result<Vec<ConversationSummary>, ChatError> {
-        Ok(self
+        let direct = self
             .repository
             .list_conversations(caller_id)
             .await?
             .into_iter()
             .map(|(conversation, peer, unread_count)| {
                 summary_from(&conversation, &peer, unread_count)
-            })
-            .collect())
+            });
+
+        let groups = self
+            .repository
+            .list_group_conversations(caller_id)
+            .await?
+            .into_iter()
+            .map(|group| {
+                group_summary_from(
+                    &group.conversation,
+                    Role::from_stored(&group.role),
+                    group.member_count,
+                    group.unread_count,
+                )
+            });
+
+        let mut summaries: Vec<ConversationSummary> = direct.chain(groups).collect();
+        // Newest first; `Reverse` keeps the key extraction cheap and the intent
+        // obvious, rather than a hand-written descending comparator.
+        summaries.sort_by_key(|summary| std::cmp::Reverse(summary.created_at_ms));
+        Ok(summaries)
+    }
+
+    /// Create a Group Conversation with the caller as owner.
+    ///
+    /// CONTEXT.md defines a Group as three or more Participants, so a create that
+    /// would leave fewer is refused: the caller plus at least two others. Members
+    /// are resolved by `@handle`, deduplicated by ULID, and written with the owner
+    /// and the members in one transaction, so a group never exists half-populated.
+    ///
+    /// The returned notices tell every invited member (and the caller's other
+    /// Devices) that the group now exists, each with **their own** Role in the
+    /// summary — the caller `owner`, everyone else `member`.
+    pub async fn create_group(
+        &self,
+        caller_id: &str,
+        request: CreateGroupConversationRequest,
+    ) -> Result<OpenedConversation, ChatError> {
+        let title = request.title.trim().to_owned();
+        if title.is_empty() {
+            return Err(validation(
+                "title",
+                FieldErrorCode::Required,
+                "请输入群名称",
+            ));
+        }
+        if title.chars().count() > MAX_GROUP_TITLE_CHARS {
+            return Err(validation(
+                "title",
+                FieldErrorCode::TooLong,
+                "群名称最多 100 个字符",
+            ));
+        }
+
+        let usernames = normalise_usernames(&request.member_usernames);
+        if usernames.is_empty() {
+            return Err(validation(
+                "member_usernames",
+                FieldErrorCode::Required,
+                "请至少邀请两位成员",
+            ));
+        }
+
+        let mut members: Vec<PeerRow> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        for username in &usernames {
+            let user = self
+                .repository
+                .find_user_by_username(username)
+                .await?
+                .ok_or(ChatError::UserNotFound)?;
+            if user.id == caller_id {
+                return Err(validation(
+                    "member_usernames",
+                    FieldErrorCode::InvalidFormat,
+                    "群主无需重复添加自己",
+                ));
+            }
+            if seen.insert(user.id.clone()) {
+                members.push(user);
+            }
+        }
+
+        let member_ids: Vec<String> = members.iter().map(|member| member.id.clone()).collect();
+        let total = 1 + member_ids.len() as i64;
+        if total < MIN_GROUP_MEMBERS {
+            return Err(validation(
+                "member_usernames",
+                FieldErrorCode::TooShort,
+                "群聊至少需要三位成员",
+            ));
+        }
+        if total > MAX_GROUP_MEMBERS {
+            return Err(validation(
+                "member_usernames",
+                FieldErrorCode::TooLong,
+                "群聊成员数量已达上限",
+            ));
+        }
+
+        let conversation = self
+            .repository
+            .create_group_with_members(&new_id(), &title, caller_id, &member_ids)
+            .await?;
+
+        tracing::info!(
+            conversation_id = %conversation.id,
+            members = total,
+            "group conversation created"
+        );
+
+        let caller_summary = group_summary_from(&conversation, Role::Owner, total, 0);
+        let mut notices = vec![ConversationNotice {
+            user_id: caller_id.to_owned(),
+            conversation: caller_summary.clone(),
+        }];
+        for member in &members {
+            notices.push(ConversationNotice {
+                user_id: member.id.clone(),
+                conversation: group_summary_from(&conversation, Role::Member, total, 0),
+            });
+        }
+
+        Ok(OpenedConversation {
+            summary: caller_summary,
+            notices,
+            created: true,
+        })
+    }
+
+    /// The info panel's data: the caller's Conversation view plus every Participant.
+    ///
+    /// Requires being a Participant; a non-member is refused with
+    /// [`ChatError::NotAParticipant`], and a Direct Conversation with
+    /// [`ChatError::NotAGroup`].
+    pub async fn group_info(
+        &self,
+        caller_id: &str,
+        conversation_id: &str,
+    ) -> Result<GroupInfo, ChatError> {
+        let (conversation, role) =
+            require_group_role(&self.repository, conversation_id, caller_id).await?;
+
+        let members = self.repository.list_members(conversation_id).await?;
+        let unread_count = self
+            .repository
+            .read_state(conversation_id, caller_id)
+            .await?
+            .map_or(0, |state| state.unread_count);
+
+        Ok(GroupInfo {
+            conversation: group_summary_from(
+                &conversation,
+                role,
+                members.len() as i64,
+                unread_count,
+            ),
+            members: members.iter().map(member_view).collect(),
+        })
+    }
+
+    /// Invite Users into a Group Conversation.
+    ///
+    /// Owner or admin only ([`Capability::InviteMembers`]). A handle that is
+    /// already a Participant is a conflict rather than a no-op, so the caller
+    /// always knows whether the invite actually added anyone. Every current
+    /// Participant (the new ones included) is told who joined; each new member
+    /// also gains the Conversation.
+    pub async fn add_group_members(
+        &self,
+        caller_id: &str,
+        conversation_id: &str,
+        request: AddGroupMembersRequest,
+    ) -> Result<MembershipUpdate, ChatError> {
+        let (conversation, actor_role) =
+            require_group_role(&self.repository, conversation_id, caller_id).await?;
+        permission::ensure(actor_role, Capability::InviteMembers)?;
+
+        let usernames = normalise_usernames(&request.member_usernames);
+        if usernames.is_empty() {
+            return Err(validation(
+                "member_usernames",
+                FieldErrorCode::Required,
+                "请至少选择一位成员",
+            ));
+        }
+
+        let current_count = self.repository.member_count(conversation_id).await?;
+        let mut invited: Vec<PeerRow> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        for username in &usernames {
+            let user = self
+                .repository
+                .find_user_by_username(username)
+                .await?
+                .ok_or(ChatError::UserNotFound)?;
+            if user.id == caller_id {
+                return Err(validation(
+                    "member_usernames",
+                    FieldErrorCode::InvalidFormat,
+                    "你已经在群聊中",
+                ));
+            }
+            if !seen.insert(user.id.clone()) {
+                continue;
+            }
+            if self
+                .repository
+                .member_role(conversation_id, &user.id)
+                .await?
+                .is_some()
+            {
+                return Err(ChatError::AlreadyMember);
+            }
+            invited.push(user);
+        }
+
+        if current_count + invited.len() as i64 > MAX_GROUP_MEMBERS {
+            return Err(validation(
+                "member_usernames",
+                FieldErrorCode::TooLong,
+                "群聊成员数量已达上限",
+            ));
+        }
+
+        for member in &invited {
+            self.repository
+                .add_member_with_role(conversation_id, &member.id, Role::Member.as_str())
+                .await?;
+        }
+
+        // Re-read so each `Joined` carries the database's own `joined_at` rather
+        // than a client-side approximation of it.
+        let members = self.repository.list_members(conversation_id).await?;
+        let everyone: Vec<String> = members.iter().map(|row| row.user_id.clone()).collect();
+        let new_count = members.len() as i64;
+
+        let mut notices = Vec::new();
+        for member in &invited {
+            notices.push(MembershipNotice::Conversation {
+                user_id: member.id.clone(),
+                conversation: group_summary_from(&conversation, Role::Member, new_count, 0),
+            });
+        }
+        for member in &invited {
+            let row = members
+                .iter()
+                .find(|row| row.user_id == member.id)
+                .ok_or(ChatError::Internal)?;
+            notices.push(MembershipNotice::Changed {
+                user_ids: everyone.clone(),
+                change: MembershipChange::Joined {
+                    member: member_view(row),
+                },
+            });
+        }
+
+        Ok(MembershipUpdate {
+            conversation_id: conversation_id.to_owned(),
+            actor_id: caller_id.to_owned(),
+            notices,
+        })
+    }
+
+    /// Remove a Participant from a Group Conversation.
+    ///
+    /// Owner or admin ([`Capability::RemoveMembers`]), refined by
+    /// [`permission::ensure_remove`]: an admin may remove an ordinary member but
+    /// not the owner and not another admin. The removed User is told about their
+    /// own removal (so their client drops the Conversation) and is no longer in
+    /// `participants`, which is what stops the Group's Messages reaching them.
+    pub async fn remove_group_member(
+        &self,
+        caller_id: &str,
+        conversation_id: &str,
+        member_id: &str,
+    ) -> Result<MembershipUpdate, ChatError> {
+        let (_, actor_role) =
+            require_group_role(&self.repository, conversation_id, caller_id).await?;
+        permission::ensure(actor_role, Capability::RemoveMembers)?;
+
+        if member_id == caller_id {
+            return Err(validation(
+                "user_id",
+                FieldErrorCode::InvalidFormat,
+                "不能移除自己，请使用退出群聊",
+            ));
+        }
+
+        let target_role = self
+            .repository
+            .member_role(conversation_id, member_id)
+            .await?
+            .ok_or(ChatError::MemberNotFound)?;
+        permission::ensure_remove(actor_role, Role::from_stored(&target_role))?;
+
+        if !self
+            .repository
+            .remove_member(conversation_id, member_id)
+            .await?
+        {
+            return Err(ChatError::MemberNotFound);
+        }
+
+        let remaining = self.repository.participants(conversation_id).await?;
+        let mut recipients = remaining;
+        recipients.push(member_id.to_owned());
+
+        Ok(MembershipUpdate {
+            conversation_id: conversation_id.to_owned(),
+            actor_id: caller_id.to_owned(),
+            notices: vec![MembershipNotice::Changed {
+                user_ids: recipients,
+                change: MembershipChange::Removed {
+                    user_id: member_id.to_owned(),
+                },
+            }],
+        })
+    }
+
+    /// Leave a Group Conversation of one's own accord.
+    ///
+    /// Anyone may leave, except that an owner must not leave Participants behind
+    /// ([`permission::ensure_leave`]) — the group would be left with no Role that
+    /// can administer it. An owner who is the last Participant simply ends the
+    /// group, which is the same dissolution as [dissolving](Self::dissolve_group).
+    pub async fn leave_group(
+        &self,
+        caller_id: &str,
+        conversation_id: &str,
+    ) -> Result<MembershipUpdate, ChatError> {
+        let (_, role) = require_group_role(&self.repository, conversation_id, caller_id).await?;
+
+        let count = self.repository.member_count(conversation_id).await?;
+        let others_remaining = count.saturating_sub(1);
+        permission::ensure_leave(role, others_remaining)?;
+
+        // The owner may only reach here as the last Participant; leaving then
+        // means the group has nobody left, so it is dissolved rather than left
+        // as an owner-less shell. Anyone else reaching here is also the last
+        // Participant — there is nobody left to administer or to notify.
+        if others_remaining <= 0 {
+            let participants = self.repository.participants(conversation_id).await?;
+            if !self.repository.dissolve(conversation_id).await? {
+                return Err(ChatError::ConversationNotFound);
+            }
+            return Ok(MembershipUpdate {
+                conversation_id: conversation_id.to_owned(),
+                actor_id: caller_id.to_owned(),
+                notices: vec![MembershipNotice::Changed {
+                    user_ids: participants,
+                    change: MembershipChange::Dissolved,
+                }],
+            });
+        }
+
+        if !self
+            .repository
+            .remove_member(conversation_id, caller_id)
+            .await?
+        {
+            return Err(ChatError::Internal);
+        }
+
+        let remaining = self.repository.participants(conversation_id).await?;
+        let mut recipients = remaining;
+        recipients.push(caller_id.to_owned());
+
+        Ok(MembershipUpdate {
+            conversation_id: conversation_id.to_owned(),
+            actor_id: caller_id.to_owned(),
+            notices: vec![MembershipNotice::Changed {
+                user_ids: recipients,
+                change: MembershipChange::Left {
+                    user_id: caller_id.to_owned(),
+                },
+            }],
+        })
+    }
+
+    /// Promote a member to admin, or demote an admin back to member.
+    ///
+    /// Owner only ([`Capability::ChangeRoles`]). [`Role::Owner`] is refused as a
+    /// target: ownership moves only through
+    /// [transfer](Self::transfer_group_ownership), which is a different action
+    /// with a different rule.
+    pub async fn change_member_role(
+        &self,
+        caller_id: &str,
+        conversation_id: &str,
+        member_id: &str,
+        request: ChangeMemberRoleRequest,
+    ) -> Result<MembershipUpdate, ChatError> {
+        let (_, actor_role) =
+            require_group_role(&self.repository, conversation_id, caller_id).await?;
+        permission::ensure(actor_role, Capability::ChangeRoles)?;
+
+        if request.role == Role::Owner {
+            return Err(validation(
+                "role",
+                FieldErrorCode::InvalidFormat,
+                "请使用转让群主来移交群聊",
+            ));
+        }
+
+        let target_role = self
+            .repository
+            .member_role(conversation_id, member_id)
+            .await?
+            .ok_or(ChatError::MemberNotFound)?;
+        if Role::from_stored(&target_role) == Role::Owner {
+            return Err(ChatError::NotPermitted {
+                action: Capability::ChangeRoles.describe(),
+            });
+        }
+
+        if !self
+            .repository
+            .set_member_role(conversation_id, member_id, request.role.as_str())
+            .await?
+        {
+            return Err(ChatError::MemberNotFound);
+        }
+
+        Ok(MembershipUpdate {
+            conversation_id: conversation_id.to_owned(),
+            actor_id: caller_id.to_owned(),
+            notices: vec![MembershipNotice::Changed {
+                user_ids: self.repository.participants(conversation_id).await?,
+                change: MembershipChange::RoleChanged {
+                    user_id: member_id.to_owned(),
+                    role: request.role,
+                },
+            }],
+        })
+    }
+
+    /// Hand ownership of a Group Conversation to another Participant.
+    ///
+    /// Owner only ([`Capability::TransferOwnership`]). The target must currently
+    /// be a Participant — transferring to someone who has already left is refused
+    /// with [`ChatError::MemberNotFound`]. The outgoing owner becomes an admin and
+    /// the target the owner in one transaction, so the permission checks that
+    /// follow see the new roles immediately.
+    pub async fn transfer_group_ownership(
+        &self,
+        caller_id: &str,
+        conversation_id: &str,
+        request: TransferOwnershipRequest,
+    ) -> Result<MembershipUpdate, ChatError> {
+        let (_, actor_role) =
+            require_group_role(&self.repository, conversation_id, caller_id).await?;
+        permission::ensure(actor_role, Capability::TransferOwnership)?;
+
+        let target_id = request.user_id;
+        if target_id == caller_id {
+            return Err(validation(
+                "user_id",
+                FieldErrorCode::InvalidFormat,
+                "不能把群主转让给自己",
+            ));
+        }
+
+        // A target who is a Participant can still lose the race to leave before
+        // the transfer commits; `transfer_ownership` performs the demote/promote
+        // pair atomically and is the check that actually matters. This read is
+        // what turns "they already left" into a precise [`ChatError::MemberNotFound`]
+        // instead of a database conflict.
+        self.repository
+            .member_role(conversation_id, &target_id)
+            .await?
+            .ok_or(ChatError::MemberNotFound)?;
+
+        if !self
+            .repository
+            .transfer_ownership(conversation_id, caller_id, &target_id)
+            .await?
+        {
+            return Err(ChatError::MemberNotFound);
+        }
+
+        tracing::info!(
+            conversation_id = %conversation_id,
+            "group ownership transferred"
+        );
+
+        Ok(MembershipUpdate {
+            conversation_id: conversation_id.to_owned(),
+            actor_id: caller_id.to_owned(),
+            notices: vec![MembershipNotice::Changed {
+                user_ids: self.repository.participants(conversation_id).await?,
+                change: MembershipChange::OwnershipTransferred {
+                    from_user_id: caller_id.to_owned(),
+                    to_user_id: target_id,
+                },
+            }],
+        })
+    }
+
+    /// Dissolve a Group Conversation for everyone.
+    ///
+    /// Owner only ([`Capability::Dissolve`]). The Conversation row is deleted and
+    /// its memberships and Messages go with it through `ON DELETE CASCADE`; every
+    /// former Participant is told, so a group disappears from every list rather
+    /// than lingering for the people who were in it.
+    pub async fn dissolve_group(
+        &self,
+        caller_id: &str,
+        conversation_id: &str,
+    ) -> Result<MembershipUpdate, ChatError> {
+        let (_, role) = require_group_role(&self.repository, conversation_id, caller_id).await?;
+        permission::ensure(role, Capability::Dissolve)?;
+
+        // Capture the audience before the delete: after it there are no rows left
+        // to ask, and the people who need to hear about the dissolution are
+        // exactly the ones who were in it.
+        let participants = self.repository.participants(conversation_id).await?;
+
+        if !self.repository.dissolve(conversation_id).await? {
+            return Err(ChatError::ConversationNotFound);
+        }
+
+        tracing::info!(
+            conversation_id = %conversation_id,
+            "group conversation dissolved"
+        );
+
+        Ok(MembershipUpdate {
+            conversation_id: conversation_id.to_owned(),
+            actor_id: caller_id.to_owned(),
+            notices: vec![MembershipNotice::Changed {
+                user_ids: participants,
+                change: MembershipChange::Dissolved,
+            }],
+        })
     }
 
     /// One page of a Conversation's history, oldest first.
@@ -653,9 +1235,98 @@ fn summary_from(
             display_name: peer.display_name.clone(),
             avatar_url: peer.avatar_url.clone(),
         }),
+        group: None,
         unread_count,
         created_at_ms: unix_millis(conversation.created_at),
     }
+}
+
+/// Project a stored Group Conversation onto the list shape.
+///
+/// `my_role` is the **viewer's** Role, which is why the same Conversation projects
+/// to a different summary for each Participant: the group is shared, the caller's
+/// standing in it is not.
+fn group_summary_from(
+    conversation: &ConversationRow,
+    my_role: Role,
+    member_count: i64,
+    unread_count: i64,
+) -> ConversationSummary {
+    ConversationSummary {
+        id: conversation.id.clone(),
+        kind: ConversationKind::Group,
+        peer: None,
+        group: Some(GroupSummary {
+            // A group row always has a title (the schema CHECK requires it); the
+            // empty fallback is unreachable, not a real state.
+            title: conversation.title.clone().unwrap_or_default(),
+            member_count,
+            my_role,
+        }),
+        unread_count,
+        created_at_ms: unix_millis(conversation.created_at),
+    }
+}
+
+/// Project a stored member row onto the wire shape.
+fn member_view(row: &MemberRow) -> MemberView {
+    MemberView {
+        user_id: row.user_id.clone(),
+        username: row.username.clone(),
+        display_name: row.display_name.clone(),
+        avatar_url: row.avatar_url.clone(),
+        role: Role::from_stored(&row.role),
+        joined_at_ms: unix_millis(row.joined_at),
+    }
+}
+
+/// Resolve a Conversation to the caller's Role, refusing non-groups and
+/// non-members.
+///
+/// Membership is checked **before** the kind, so a non-participant cannot use a
+/// `NotAGroup` answer to learn that a Conversation they are not in exists. The
+/// two failures stay distinct: [`ChatError::NotAParticipant`] for someone outside
+/// the Conversation, [`ChatError::NotAGroup`] for a Participant of a Direct one
+/// who asked a Group question.
+async fn require_group_role(
+    repository: &ChatRepository,
+    conversation_id: &str,
+    user_id: &str,
+) -> Result<(ConversationRow, Role), ChatError> {
+    if !is_ulid(conversation_id) {
+        return Err(ChatError::ConversationNotFound);
+    }
+
+    let conversation = repository
+        .conversation(conversation_id)
+        .await?
+        .ok_or(ChatError::ConversationNotFound)?;
+
+    let role = repository
+        .member_role(conversation_id, user_id)
+        .await?
+        .ok_or(ChatError::NotAParticipant)?;
+
+    if conversation.kind != "group" {
+        return Err(ChatError::NotAGroup);
+    }
+
+    Ok((conversation, Role::from_stored(&role)))
+}
+
+/// Trim, lowercase, drop blanks, and drop repeats — keeping first-seen order.
+///
+/// `@handle`s are stored lowercase, so normalising here means a caller can type
+/// `Bob` and still match. Repeats are dropped rather than refused: a client that
+/// sends the same handle twice asked for one invite, not an error.
+fn normalise_usernames(input: &[String]) -> Vec<String> {
+    let mut seen = HashSet::new();
+
+    input
+        .iter()
+        .map(|username| username.trim().to_lowercase())
+        .filter(|username| !username.is_empty() && seen.insert(username.clone()))
+        .collect()
 }
 
 /// Project a repository read-state row onto the service shape.

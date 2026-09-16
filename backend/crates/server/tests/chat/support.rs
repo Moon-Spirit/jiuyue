@@ -24,9 +24,10 @@ use futures_util::{SinkExt, StreamExt};
 use jiuyue_auth::{AuthConfig, AuthService};
 use jiuyue_chat::ChatService;
 use jiuyue_contract::{
-    AuthSession, ClientEnvelope, ClientEvent, ConversationSummary, MarkRead, MessageAck,
-    MessageList, MessageRejected, MessageView, NewMessage, ReadMarker, ReadReceipt, Resume, Resync,
-    SendMessage, ServerEnvelope, ServerEvent, SyncCursor, SyncState,
+    AuthSession, ClientEnvelope, ClientEvent, ConversationList, ConversationSummary, GroupInfo,
+    MarkRead, MembershipChanged, MessageAck, MessageList, MessageRejected, MessageView, NewMessage,
+    ReadMarker, ReadReceipt, Resume, Resync, Role, SendMessage, ServerEnvelope, ServerEvent,
+    SyncCursor, SyncState,
 };
 use jiuyue_realtime::{HEARTBEAT_INTERVAL, RealtimeHub};
 use jiuyue_server::{AppState, Config, Services, app};
@@ -225,6 +226,138 @@ pub async fn create_direct(app: &TestApp, token: &str, peer_username: &str) -> C
     );
 
     serde_json::from_value(body).expect("the response must match ConversationSummary")
+}
+
+/// `GET /conversations` — the caller's Conversation list.
+pub async fn list_conversations(app: &TestApp, token: &str) -> ConversationList {
+    let (status, body) = get_with_token(app, "/conversations", token).await;
+    assert_eq!(status, StatusCode::OK, "the list must load: {body}");
+
+    serde_json::from_value(body).expect("the response must match ConversationList")
+}
+
+/// Create a Group Conversation and return the creator's summary.
+pub async fn create_group(
+    app: &TestApp,
+    token: &str,
+    title: &str,
+    member_usernames: &[&str],
+) -> ConversationSummary {
+    let (status, body) = post_json_with_token(
+        app,
+        "/conversations/group",
+        &json!({ "title": title, "member_usernames": member_usernames }),
+        token,
+    )
+    .await;
+
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "creating a group must succeed: {body}"
+    );
+
+    serde_json::from_value(body).expect("the response must match ConversationSummary")
+}
+
+/// `GET /conversations/{id}` — the Group info panel's data.
+pub async fn group_info(app: &TestApp, token: &str, conversation_id: &str) -> GroupInfo {
+    let path = format!("/conversations/{conversation_id}");
+    let (status, body) = get_with_token(app, &path, token).await;
+    assert_eq!(status, StatusCode::OK, "the group info must load: {body}");
+
+    serde_json::from_value(body).expect("the response must match GroupInfo")
+}
+
+/// Invite members; expects success and returns the refreshed Group info.
+pub async fn add_group_members(
+    app: &TestApp,
+    token: &str,
+    conversation_id: &str,
+    member_usernames: &[&str],
+) -> GroupInfo {
+    let path = format!("/conversations/{conversation_id}/members");
+    let (status, body) = post_json_with_token(
+        app,
+        &path,
+        &json!({ "member_usernames": member_usernames }),
+        token,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "inviting must succeed: {body}");
+    serde_json::from_value(body).expect("the response must match GroupInfo")
+}
+
+/// Remove a Participant; expects success and returns the refreshed Group info.
+pub async fn remove_group_member(
+    app: &TestApp,
+    token: &str,
+    conversation_id: &str,
+    member_id: &str,
+) -> GroupInfo {
+    let path = format!("/conversations/{conversation_id}/members/{member_id}");
+    let (status, body) = request_json_with_token(app, Method::DELETE, &path, None, token).await;
+
+    assert_eq!(status, StatusCode::OK, "removing must succeed: {body}");
+    serde_json::from_value(body).expect("the response must match GroupInfo")
+}
+
+/// Set a Participant's Role; expects success and returns the refreshed Group info.
+pub async fn change_member_role(
+    app: &TestApp,
+    token: &str,
+    conversation_id: &str,
+    member_id: &str,
+    role: Role,
+) -> GroupInfo {
+    let path = format!("/conversations/{conversation_id}/members/{member_id}");
+    let (status, body) = request_json_with_token(
+        app,
+        Method::PATCH,
+        &path,
+        Some(&json!({ "role": role })),
+        token,
+    )
+    .await;
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "changing a role must succeed: {body}"
+    );
+    serde_json::from_value(body).expect("the response must match GroupInfo")
+}
+
+/// Leave a Group; returns the status (expected `204` at the call sites).
+pub async fn leave_group(app: &TestApp, token: &str, conversation_id: &str) -> (StatusCode, Value) {
+    let path = format!("/conversations/{conversation_id}/leave");
+    request_json_with_token(app, Method::POST, &path, None, token).await
+}
+
+/// Transfer ownership; expects success and returns the refreshed Group info.
+pub async fn transfer_ownership(
+    app: &TestApp,
+    token: &str,
+    conversation_id: &str,
+    target_id: &str,
+) -> GroupInfo {
+    let path = format!("/conversations/{conversation_id}/transfer");
+    let (status, body) =
+        post_json_with_token(app, &path, &json!({ "user_id": target_id }), token).await;
+
+    assert_eq!(status, StatusCode::OK, "transferring must succeed: {body}");
+    serde_json::from_value(body).expect("the response must match GroupInfo")
+}
+
+/// Dissolve a Group; returns the status (expected `204` at the call sites).
+pub async fn dissolve_group(
+    app: &TestApp,
+    token: &str,
+    conversation_id: &str,
+) -> (StatusCode, Value) {
+    let path = format!("/conversations/{conversation_id}");
+    request_json_with_token(app, Method::DELETE, &path, None, token).await
 }
 
 /// A `SendMessage` client event for the given conversation.
@@ -440,6 +573,18 @@ pub async fn expect_read_receipt(socket: &mut TestSocket) -> ReadReceipt {
     }
 }
 
+/// Read until the next membership change arrives, ignoring everything else.
+///
+/// A membership change is one of six shapes (join, leave, removal, role change,
+/// ownership transfer, dissolution); the caller matches on the shape.
+pub async fn expect_membership_changed(socket: &mut TestSocket) -> MembershipChanged {
+    loop {
+        if let ServerEvent::MembershipChanged(change) = next_event(socket).await {
+            return change;
+        }
+    }
+}
+
 /// Every non-heartbeat event a socket receives within `timeout`.
 ///
 /// Used to assert an **absence**: the privacy test drains a peer's socket for a
@@ -503,6 +648,36 @@ pub async fn get_with_token(app: &TestApp, path: &str, token: &str) -> (StatusCo
         .header("authorization", format!("Bearer {token}"))
         .body(Body::empty())
         .expect("the request must build");
+
+    send(app, request).await
+}
+
+/// Drive one authenticated request of any method, with an optional JSON body.
+///
+/// The group routes use DELETE and PATCH, which the POST/GET helpers cannot
+/// express, so this is the general form; the specific helpers above are written
+/// in terms of it.
+pub async fn request_json_with_token(
+    app: &TestApp,
+    method: Method,
+    path: &str,
+    body: Option<&Value>,
+    token: &str,
+) -> (StatusCode, Value) {
+    let builder = Request::builder()
+        .method(method)
+        .uri(path)
+        .header("authorization", format!("Bearer {token}"));
+
+    let request = match body {
+        Some(value) => builder
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(value).expect("a JSON value must serialise"),
+            ))
+            .expect("the request must build"),
+        None => builder.body(Body::empty()).expect("the request must build"),
+    };
 
     send(app, request).await
 }

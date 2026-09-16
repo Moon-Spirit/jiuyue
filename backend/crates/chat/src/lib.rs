@@ -38,16 +38,39 @@
 //! is UNIQUE, so replaying a send returns the original Message rather than writing
 //! a second one, and the acknowledgement the sender receives is the same both
 //! times. See [`ChatService::send_message`].
+//!
+//! # Groups and the fan-out seam
+//!
+//! A Group is the same Conversation aggregate with Roles on its Participants
+//! ([`permission`] is the one authority on who may do what). Two things keep the
+//! eventual read-fanout of ADR-0005 from rewriting this crate:
+//!
+//! - **The domain returns recipient sets, never delivery.** [`SentMessage`]
+//!   carries the Participants of the moment, and [`MembershipUpdate`] carries
+//!   per-recipient [`MembershipNotice`]s. `jiuyue-chat` never touches the realtime
+//!   registry, so "who" is a domain answer and "how" is the gateway's problem.
+//! - **The gateway has one delivery primitive.** `jiuyue-realtime`'s
+//!   `ConnectionRegistry::deliver` takes a list of User ids and fans out to their
+//!   Devices. Changing small-group write-fanout into large-group read-fanout is a
+//!   change to what that call is handed, not to the rules that produced the list.
+//!
+//! The recipient sets are also where membership rules become observable: a
+//! Participant who left or was removed is absent from the Group's
+//! [`SentMessage::participants`], so they stop receiving Group Messages — enforced
+//! by the fan-out, not by client-side politeness. They are told about their own
+//! exit through [`MembershipNotice`] so their client drops the Conversation.
 
 #![forbid(unsafe_code)]
 
 mod error;
+pub mod permission;
 mod repository;
 mod service;
 
 pub use error::ChatError;
+pub use permission::Capability;
 pub use repository::ChatRepository;
 pub use service::{
-    ChatService, ConversationNotice, MAX_SYNC_CURSORS, OpenedConversation, ReadState,
-    ReadStateUpdate, SentMessage,
+    ChatService, ConversationNotice, MAX_SYNC_CURSORS, MembershipNotice, MembershipUpdate,
+    OpenedConversation, ReadState, ReadStateUpdate, SentMessage,
 };

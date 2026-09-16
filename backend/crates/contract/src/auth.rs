@@ -176,6 +176,13 @@ pub enum ErrorCode {
     UserNotFound,
     /// The caller is authenticated but is not a Participant of the Conversation.
     NotAParticipant,
+    /// The caller is a Participant but their Role does not permit the action.
+    /// Distinct from [`Self::NotAParticipant`]: they can see the Conversation,
+    /// they just may not do this to it.
+    Forbidden,
+    /// The action conflicts with the current state (already a member, already the
+    /// owner, the last owner trying to leave, and so on).
+    Conflict,
 }
 
 /// Stable per-field validation codes.

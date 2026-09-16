@@ -11,11 +11,29 @@ const props = defineProps<{
 
 const emit = defineEmits<{ select: [id: string] }>();
 
-/** The name shown for a Conversation: the peer's, or a group placeholder. */
+/** The name shown for a Conversation: a group's title, or the peer's name. */
 function label(conversation: ConversationSummary): string {
+  const group = conversation.group;
+  if (group !== undefined) return group.title;
   const peer = conversation.peer;
   if (peer === null) return "群聊";
   return peer.display_name === "" ? peer.username : peer.display_name;
+}
+
+/** The second line: a group's Participant count, or the peer's `@handle`. */
+function subtitle(conversation: ConversationSummary): string {
+  const group = conversation.group;
+  if (group !== undefined) return `${group.member_count} 位成员`;
+  return `@${conversation.peer?.username ?? "group"}`;
+}
+
+/** A group's avatar letter, or the peer's. */
+function initial(conversation: ConversationSummary): string {
+  const group = conversation.group;
+  if (group !== undefined) return group.title.slice(0, 1).toUpperCase();
+  return (conversation.peer?.display_name ?? conversation.peer?.username ?? "?")
+    .slice(0, 1)
+    .toUpperCase();
 }
 
 /** This Conversation's badge, defaulting to zero for one never counted. */
@@ -31,7 +49,7 @@ function unreadFor(conversation: ConversationSummary): number {
       v-else-if="conversations.length === 0"
       class="p-4 text-sm leading-relaxed text-zinc-500"
     >
-      还没有会话。在上方输入对方用户名，开始一个新的单聊。
+      还没有会话。在左侧输入对方用户名开始单聊，或点击「建群」创建群聊。
     </p>
     <ul
       v-else
@@ -51,14 +69,14 @@ function unreadFor(conversation: ConversationSummary): number {
           <span
             class="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-zinc-900 text-xs font-medium text-white dark:bg-zinc-100 dark:text-zinc-900"
           >
-            {{ label(conversation).slice(0, 1).toUpperCase() }}
+            {{ initial(conversation) }}
           </span>
           <span class="min-w-0 flex-1">
             <span class="block truncate text-sm font-medium">
               {{ label(conversation) }}
             </span>
             <span class="block truncate text-xs text-zinc-500">
-              @{{ conversation.peer?.username ?? "group" }}
+              {{ subtitle(conversation) }}
             </span>
           </span>
           <span

@@ -21,6 +21,18 @@ function conversation(): ConversationSummary {
   };
 }
 
+/** A group Conversation summary as the backend returns it. */
+function groupConversation(): ConversationSummary {
+  return {
+    id: CONVERSATION_ID,
+    kind: "group",
+    peer: null,
+    group: { title: "九月小组", member_count: 3, my_role: "owner" },
+    unread_count: 0,
+    created_at_ms: 1_700_000_000_000,
+  };
+}
+
 function mountList(unreadCounts: Record<string, number>) {
   return mount(ConversationList, {
     props: {
@@ -55,5 +67,19 @@ describe("ConversationList", () => {
     const wrapper = mountList({});
 
     expect(wrapper.find('[data-test="unread-badge"]').exists()).toBe(false);
+  });
+
+  it("renders a group by its title and Participant count", () => {
+    const wrapper = mount(ConversationList, {
+      props: {
+        conversations: [groupConversation()],
+        activeId: null,
+        loading: false,
+        unreadCounts: {},
+      },
+    });
+
+    expect(wrapper.text()).toContain("九月小组");
+    expect(wrapper.text()).toContain("3 位成员");
   });
 });

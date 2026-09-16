@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
 use crate::chat::{ConversationCreated, MessageAck, MessageRejected, NewMessage, SendMessage};
+use crate::group::MembershipChanged;
 use crate::read::{MarkRead, ReadMarker, ReadReceipt};
 use crate::sync::{Resume, Resync, SyncCursor, SyncState};
 
@@ -33,6 +34,15 @@ pub enum ServerEvent {
     MessageRejected(MessageRejected),
     /// A Conversation this connection now participates in was created.
     ConversationCreated(ConversationCreated),
+    /// A Group Conversation's membership changed: someone joined, left or was
+    /// removed, a Role changed, ownership was transferred, or the group was
+    /// dissolved.
+    ///
+    /// Delivered to the Participants who should see the change, and **only** to
+    /// them. A Participant who left or was removed is not in the Group's message
+    /// fan-out any more, but is told about their own exit so their client can drop
+    /// the Conversation — see [`crate::group`].
+    MembershipChanged(MembershipChanged),
     /// The server's answer to [`ClientEvent::Resume`]: whether the connection's
     /// missed envelopes were replayed, or whether the client must repair
     /// Conversations from its cursors (ADR-0003).

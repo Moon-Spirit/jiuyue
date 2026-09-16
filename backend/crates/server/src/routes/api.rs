@@ -161,6 +161,25 @@ impl From<ChatError> for ApiError {
                 "你不是该会话的参与者",
                 Vec::new(),
             ),
+            ChatError::NotPermitted { .. } => Self::new(
+                StatusCode::FORBIDDEN,
+                ErrorCode::Forbidden,
+                "你的权限不允许此操作",
+                Vec::new(),
+            ),
+            // State conflicts: already a member, the target is not one, the owner
+            // trying to leave with Participants behind, or a Group action on a
+            // Direct Conversation. Each carries its own Chinese message, all share
+            // the machine code so a client can branch once.
+            conflict @ (ChatError::NotAGroup
+            | ChatError::AlreadyMember
+            | ChatError::MemberNotFound
+            | ChatError::OwnerCannotLeave) => Self::new(
+                StatusCode::CONFLICT,
+                ErrorCode::Conflict,
+                conflict.message(),
+                Vec::new(),
+            ),
             ChatError::Database(source) => {
                 tracing::error!(%source, "chat request failed");
                 Self::internal()

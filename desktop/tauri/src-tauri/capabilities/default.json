@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "main-window",
+  "description": "The main window: core window/event APIs and native notifications.",
+  "windows": ["main"],
+  "permissions": ["core:default", "notification:default"]
+}

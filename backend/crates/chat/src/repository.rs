@@ -14,7 +14,7 @@
 //!   send turns out to be a replay. That is what keeps `seq` gapless *and* keeps a
 //!   retry from writing twice.
 
-use jiuyue_contract::{ReadReceipt, SyncCursor};
+use jiuyue_contract::{ReadReceipt, Role, SyncCursor};
 use sqlx::postgres::PgRow;
 use sqlx::types::time::OffsetDateTime;
 use sqlx::{Executor, PgPool, Postgres, Row};
@@ -24,11 +24,24 @@ use crate::error::ChatError;
 const INSERT_DIRECT_CONVERSATION: &str = "\
     INSERT INTO conversations (id, kind, direct_key) VALUES ($1, 'direct', $2) \
     ON CONFLICT (direct_key) DO NOTHING \
-    RETURNING id::text AS id, kind, created_at";
+    RETURNING id::text AS id, kind, title, created_at";
 
 const SELECT_CONVERSATION_BY_DIRECT_KEY: &str = "\
-    SELECT id::text AS id, kind, created_at \
+    SELECT id::text AS id, kind, title, created_at \
     FROM conversations WHERE direct_key = $1";
+
+const SELECT_CONVERSATION: &str = "\
+    SELECT id::text AS id, kind, title, created_at \
+    FROM conversations WHERE id = $1";
+
+/// Create a Group Conversation.
+///
+/// A group has no `direct_key` (the schema CHECK refuses one), so two groups can
+/// never collide on the pair key and there is nothing to conflict on: the caller
+/// supplies a fresh ULID.
+const INSERT_GROUP_CONVERSATION: &str = "\
+    INSERT INTO conversations (id, kind, title) VALUES ($1, 'group', $2) \
+    RETURNING id::text AS id, kind, title, created_at";
 
 const INSERT_MEMBERS: &str = "\
     INSERT INTO conversation_members (conversation_id, user_id) \
@@ -44,7 +57,7 @@ const SELECT_USER_BY_ID: &str = "\
     FROM users WHERE id = $1";
 
 const SELECT_CONVERSATIONS_FOR_USER: &str = "\
-    SELECT c.id::text AS id, c.kind, c.created_at, me.unread_count, \
+    SELECT c.id::text AS id, c.kind, c.title, c.created_at, me.unread_count, \
            u.id::text AS peer_id, u.username AS peer_username, \
            u.display_name AS peer_display_name, u.avatar_url AS peer_avatar_url \
     FROM conversation_members AS me \
@@ -54,6 +67,84 @@ const SELECT_CONVERSATIONS_FOR_USER: &str = "\
     JOIN users AS u ON u.id = peer_member.user_id \
     WHERE me.user_id = $1 AND c.kind = 'direct' \
     ORDER BY c.created_at DESC";
+
+/// Every Group Conversation the User participates in, newest first.
+///
+/// The Group counterpart of [`SELECT_CONVERSATIONS_FOR_USER`]: it carries the
+/// group's title, the **caller's** Role and the current Participant count instead
+/// of a peer. Keeping the two statements separate (rather than one query with a
+/// nullable peer and a nullable group) keeps each projection exactly the columns
+/// its kind has, and the service merges the two lists.
+const SELECT_GROUP_CONVERSATIONS_FOR_USER: &str = "\
+    SELECT c.id::text AS id, c.kind, c.title, c.created_at, me.role, me.unread_count, \
+           (SELECT count(*) FROM conversation_members AS counted \
+            WHERE counted.conversation_id = c.id) AS member_count \
+    FROM conversation_members AS me \
+    JOIN conversations AS c ON c.id = me.conversation_id \
+    WHERE me.user_id = $1 AND c.kind = 'group' \
+    ORDER BY c.created_at DESC";
+
+/// Add one Participant with an explicit Role, for the Group path.
+///
+/// Deliberately not `ON CONFLICT DO NOTHING` like [`INSERT_MEMBERS`]: inviting
+/// someone already in the group is a state conflict the caller must report, and a
+/// silent no-op would let the caller believe the invite reached a new Participant.
+const INSERT_MEMBER_WITH_ROLE: &str = "\
+    INSERT INTO conversation_members (conversation_id, user_id, role) \
+    VALUES ($1, $2, $3)";
+
+/// One Participant's stored Role, or no row when they are not a Participant.
+const SELECT_MEMBER_ROLE: &str = "\
+    SELECT role FROM conversation_members \
+    WHERE conversation_id = $1 AND user_id = $2";
+
+/// Every Participant with their public profile and Role, in join order.
+const SELECT_MEMBERS: &str = "\
+    SELECT m.user_id::text AS user_id, u.username, u.display_name, u.avatar_url, \
+           m.role, m.joined_at \
+    FROM conversation_members AS m \
+    JOIN users AS u ON u.id = m.user_id \
+    WHERE m.conversation_id = $1 \
+    ORDER BY m.joined_at, m.user_id";
+
+const COUNT_MEMBERS: &str = "\
+    SELECT count(*) FROM conversation_members WHERE conversation_id = $1";
+
+/// Remove one Participant. Returns whether a row was actually deleted.
+///
+/// The `role <> 'owner'` guard is structural: an owner can never be removed by
+/// this statement, whatever the caller checked. The owner leaves by transferring
+/// or dissolving, never by removal.
+const DELETE_MEMBER: &str = "\
+    DELETE FROM conversation_members \
+    WHERE conversation_id = $1 AND user_id = $2 AND role <> 'owner'";
+
+/// Set one Participant's Role between `member` and `admin`.
+///
+/// The `role <> 'owner'` guard forbids promoting or demoting the owner here:
+/// ownership only moves through [`ChatRepository::transfer_ownership`], which
+/// demotes and promotes in one transaction. Returns whether a row changed.
+const SET_MEMBER_ROLE: &str = "\
+    UPDATE conversation_members SET role = $3 \
+    WHERE conversation_id = $1 AND user_id = $2 AND role <> 'owner'";
+
+/// Demote the outgoing owner before promoting the incoming one.
+///
+/// Order matters: `conversation_members_single_owner` is a partial UNIQUE index,
+/// so a promote-then-demote would be a transient violation. In a single
+/// transaction this pair leaves exactly one owner at every instant.
+const DEMOTE_OWNER: &str = "\
+    UPDATE conversation_members SET role = 'admin' \
+    WHERE conversation_id = $1 AND user_id = $2 AND role = 'owner'";
+
+const PROMOTE_OWNER: &str = "\
+    UPDATE conversation_members SET role = 'owner' \
+    WHERE conversation_id = $1 AND user_id = $2";
+
+/// Delete a Conversation. The `conversation_members` and `messages` foreign keys
+/// are `ON DELETE CASCADE`, so this is the whole dissolution.
+const DELETE_CONVERSATION: &str = "\
+    DELETE FROM conversations WHERE id = $1";
 
 const SELECT_MEMBERSHIP: &str = "\
     SELECT EXISTS ( \
@@ -241,8 +332,41 @@ pub struct ConversationRow {
     pub id: String,
     /// `direct` or `group`.
     pub kind: String,
+    /// The group's display name; `None` for a Direct Conversation.
+    pub title: Option<String>,
     /// Creation time.
     pub created_at: OffsetDateTime,
+}
+
+/// A Participant with their public profile and Role.
+#[derive(Debug, Clone)]
+pub struct MemberRow {
+    /// ULID of the User.
+    pub user_id: String,
+    /// `@handle`.
+    pub username: String,
+    /// Display name.
+    pub display_name: String,
+    /// Avatar URL, when set.
+    pub avatar_url: Option<String>,
+    /// Stored Role (`owner` | `admin` | `member`).
+    pub role: String,
+    /// When they became a Participant.
+    pub joined_at: OffsetDateTime,
+}
+
+/// A Group Conversation as its list renders it: the Conversation, the caller's
+/// Role, their Unread Count, and how many Participants there are.
+#[derive(Debug, Clone)]
+pub struct GroupConversationRow {
+    /// The Conversation itself.
+    pub conversation: ConversationRow,
+    /// The **caller's** stored Role.
+    pub role: String,
+    /// The caller's Unread Count.
+    pub unread_count: i64,
+    /// Current Participant count.
+    pub member_count: i64,
 }
 
 /// The public columns of another User, for rendering a Direct Conversation.
@@ -358,6 +482,235 @@ impl ChatRepository {
             .execute(&self.pool)
             .await
             .map(|_| ())
+            .map_err(ChatError::Database)
+    }
+
+    /// Create a Group Conversation with its owner and initial members, atomically.
+    ///
+    /// One transaction, so a group can never exist half-populated: either it has
+    /// its owner and every invited member, or nothing was written.
+    pub async fn create_group_with_members(
+        &self,
+        id: &str,
+        title: &str,
+        owner_id: &str,
+        member_ids: &[String],
+    ) -> Result<ConversationRow, ChatError> {
+        let mut transaction = self.pool.begin().await.map_err(ChatError::Database)?;
+
+        let conversation = sqlx::query(INSERT_GROUP_CONVERSATION)
+            .bind(id)
+            .bind(title)
+            .fetch_one(&mut *transaction)
+            .await
+            .map(|row| conversation_from_row(&row))
+            .map_err(ChatError::Database)?;
+
+        sqlx::query(INSERT_MEMBER_WITH_ROLE)
+            .bind(id)
+            .bind(owner_id)
+            .bind(Role::Owner.as_str())
+            .execute(&mut *transaction)
+            .await
+            .map_err(ChatError::Database)?;
+
+        for member_id in member_ids {
+            sqlx::query(INSERT_MEMBER_WITH_ROLE)
+                .bind(id)
+                .bind(member_id)
+                .bind(Role::Member.as_str())
+                .execute(&mut *transaction)
+                .await
+                .map_err(ChatError::Database)?;
+        }
+
+        transaction.commit().await.map_err(ChatError::Database)?;
+        Ok(conversation)
+    }
+
+    /// Read one Conversation by id, whatever its kind.
+    pub async fn conversation(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<ConversationRow>, ChatError> {
+        sqlx::query(SELECT_CONVERSATION)
+            .bind(conversation_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map(|row| row.map(|row| conversation_from_row(&row)))
+            .map_err(ChatError::Database)
+    }
+
+    /// Add one Participant with an explicit Role.
+    ///
+    /// A duplicate is a database error rather than a silent no-op; the service
+    /// checks membership first and reports [`ChatError::AlreadyMember`], so this
+    /// error path is the backstop for a concurrent invite, not the normal one.
+    pub async fn add_member_with_role(
+        &self,
+        conversation_id: &str,
+        user_id: &str,
+        role: &str,
+    ) -> Result<(), ChatError> {
+        sqlx::query(INSERT_MEMBER_WITH_ROLE)
+            .bind(conversation_id)
+            .bind(user_id)
+            .bind(role)
+            .execute(&self.pool)
+            .await
+            .map(|_| ())
+            .map_err(ChatError::Database)
+    }
+
+    /// One Participant's stored Role, or `None` when they are not a Participant.
+    pub async fn member_role(
+        &self,
+        conversation_id: &str,
+        user_id: &str,
+    ) -> Result<Option<String>, ChatError> {
+        sqlx::query(SELECT_MEMBER_ROLE)
+            .bind(conversation_id)
+            .bind(user_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map(|row| row.map(|row| row.get("role")))
+            .map_err(ChatError::Database)
+    }
+
+    /// Every Participant with their profile and Role, in join order.
+    pub async fn list_members(&self, conversation_id: &str) -> Result<Vec<MemberRow>, ChatError> {
+        sqlx::query(SELECT_MEMBERS)
+            .bind(conversation_id)
+            .fetch_all(&self.pool)
+            .await
+            .map(|rows| rows.iter().map(member_from_row).collect())
+            .map_err(ChatError::Database)
+    }
+
+    /// How many Participants a Conversation has.
+    pub async fn member_count(&self, conversation_id: &str) -> Result<i64, ChatError> {
+        sqlx::query(COUNT_MEMBERS)
+            .bind(conversation_id)
+            .fetch_one(&self.pool)
+            .await
+            .map(|row| row.get("count"))
+            .map_err(ChatError::Database)
+    }
+
+    /// Remove one Participant. Returns whether a row was deleted.
+    ///
+    /// An owner is never deleted by this statement (the SQL carries the guard),
+    /// so a caller that skipped the permission check still cannot decapitate a
+    /// group.
+    pub async fn remove_member(
+        &self,
+        conversation_id: &str,
+        user_id: &str,
+    ) -> Result<bool, ChatError> {
+        sqlx::query(DELETE_MEMBER)
+            .bind(conversation_id)
+            .bind(user_id)
+            .execute(&self.pool)
+            .await
+            .map(|result| result.rows_affected() > 0)
+            .map_err(ChatError::Database)
+    }
+
+    /// Set a Participant's Role between member and admin. Returns whether a row
+    /// changed; the owner is never touched.
+    pub async fn set_member_role(
+        &self,
+        conversation_id: &str,
+        user_id: &str,
+        role: &str,
+    ) -> Result<bool, ChatError> {
+        sqlx::query(SET_MEMBER_ROLE)
+            .bind(conversation_id)
+            .bind(user_id)
+            .bind(role)
+            .execute(&self.pool)
+            .await
+            .map(|result| result.rows_affected() > 0)
+            .map_err(ChatError::Database)
+    }
+
+    /// Move ownership from `from_user_id` to `to_user_id` atomically.
+    ///
+    /// Both statements run in one transaction and in the order the partial UNIQUE
+    /// index requires (demote, then promote), so no reader can observe two owners
+    /// or none. Returns `false` when `from_user_id` was not the owner or
+    /// `to_user_id` is not a Participant; the transaction rolls back either way,
+    /// leaving the roles untouched.
+    pub async fn transfer_ownership(
+        &self,
+        conversation_id: &str,
+        from_user_id: &str,
+        to_user_id: &str,
+    ) -> Result<bool, ChatError> {
+        let mut transaction = self.pool.begin().await.map_err(ChatError::Database)?;
+
+        let demoted = sqlx::query(DEMOTE_OWNER)
+            .bind(conversation_id)
+            .bind(from_user_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(ChatError::Database)?
+            .rows_affected();
+
+        if demoted == 0 {
+            transaction.rollback().await.map_err(ChatError::Database)?;
+            return Ok(false);
+        }
+
+        let promoted = sqlx::query(PROMOTE_OWNER)
+            .bind(conversation_id)
+            .bind(to_user_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(ChatError::Database)?
+            .rows_affected();
+
+        if promoted == 0 {
+            transaction.rollback().await.map_err(ChatError::Database)?;
+            return Ok(false);
+        }
+
+        transaction.commit().await.map_err(ChatError::Database)?;
+        Ok(true)
+    }
+
+    /// Every Group Conversation the User participates in, newest first.
+    pub async fn list_group_conversations(
+        &self,
+        user_id: &str,
+    ) -> Result<Vec<GroupConversationRow>, ChatError> {
+        sqlx::query(SELECT_GROUP_CONVERSATIONS_FOR_USER)
+            .bind(user_id)
+            .fetch_all(&self.pool)
+            .await
+            .map(|rows| {
+                rows.iter()
+                    .map(|row| GroupConversationRow {
+                        conversation: conversation_from_row(row),
+                        role: row.get("role"),
+                        unread_count: row.get("unread_count"),
+                        member_count: row.get("member_count"),
+                    })
+                    .collect()
+            })
+            .map_err(ChatError::Database)
+    }
+
+    /// Delete a Conversation. Returns whether a row was deleted.
+    ///
+    /// The memberships and Messages go with it through the foreign keys'
+    /// `ON DELETE CASCADE`, so this one statement is the whole dissolution.
+    pub async fn dissolve(&self, conversation_id: &str) -> Result<bool, ChatError> {
+        sqlx::query(DELETE_CONVERSATION)
+            .bind(conversation_id)
+            .execute(&self.pool)
+            .await
+            .map(|result| result.rows_affected() > 0)
             .map_err(ChatError::Database)
     }
 
@@ -745,7 +1098,19 @@ fn conversation_from_row(row: &PgRow) -> ConversationRow {
     ConversationRow {
         id: row.get("id"),
         kind: row.get("kind"),
+        title: row.get("title"),
         created_at: row.get("created_at"),
+    }
+}
+
+fn member_from_row(row: &PgRow) -> MemberRow {
+    MemberRow {
+        user_id: row.get("user_id"),
+        username: row.get("username"),
+        display_name: row.get("display_name"),
+        avatar_url: row.get("avatar_url"),
+        role: row.get("role"),
+        joined_at: row.get("joined_at"),
     }
 }
 

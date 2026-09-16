@@ -7,4 +7,4 @@
  * envelope — identity today, chat alongside it. Codes are additive: a client
  * branches on the ones it knows and treats the rest as a generic failure.
  */
-export type ErrorCode = "VALIDATION_FAILED" | "EMAIL_TAKEN" | "USERNAME_TAKEN" | "INVALID_CREDENTIALS" | "UNAUTHENTICATED" | "INTERNAL" | "UNAVAILABLE" | "NOT_FOUND" | "USER_NOT_FOUND" | "NOT_A_PARTICIPANT";
+export type ErrorCode = "VALIDATION_FAILED" | "EMAIL_TAKEN" | "USERNAME_TAKEN" | "INVALID_CREDENTIALS" | "UNAUTHENTICATED" | "INTERNAL" | "UNAVAILABLE" | "NOT_FOUND" | "USER_NOT_FOUND" | "NOT_A_PARTICIPANT" | "FORBIDDEN" | "CONFLICT";

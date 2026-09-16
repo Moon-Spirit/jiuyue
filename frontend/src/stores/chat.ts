@@ -1,14 +1,28 @@
 import { defineStore } from "pinia";
 import { computed, ref } from "vue";
-import { ApiError, apiGetAuthed, apiPost } from "../api/client";
+import {
+  ApiError,
+  apiDeleteAuthed,
+  apiDeleteAuthedNoContent,
+  apiGetAuthed,
+  apiPatchAuthed,
+  apiPost,
+  apiPostAuthed,
+  apiPostAuthedNoContent,
+} from "../api/client";
 import type { ConversationList } from "../generated/ConversationList";
 import type { ConversationSummary } from "../generated/ConversationSummary";
+import type { GroupInfo } from "../generated/GroupInfo";
+import type { GroupSummary } from "../generated/GroupSummary";
+import type { MemberView } from "../generated/MemberView";
+import type { MembershipChanged } from "../generated/MembershipChanged";
 import type { MessageAck } from "../generated/MessageAck";
 import type { MessageList } from "../generated/MessageList";
 import type { MessageRejected } from "../generated/MessageRejected";
 import type { NewMessage } from "../generated/NewMessage";
 import type { ReadMarker } from "../generated/ReadMarker";
 import type { ReadReceipt } from "../generated/ReadReceipt";
+import type { Role } from "../generated/Role";
 import type { ServerEvent } from "../generated/ServerEvent";
 import type { SyncState } from "../generated/SyncState";
 import { useAuthStore } from "./auth";
@@ -104,6 +118,19 @@ export const useChatStore = defineStore("chat", () => {
    * and which this store does not read from any peer-facing shape.
    */
   const peerReceipts = ref<Record<string, number>>({});
+
+  /**
+   * The member list of each Group Conversation, keyed by Conversation id.
+   *
+   * Seeded from `GET /conversations/{id}` when a group is opened and kept current
+   * by `MembershipChanged` events, so the info panel reflects a join, a leave, a
+   * removal or a Role change without a refetch. A Direct Conversation has no entry
+   * here — it has no member list to show.
+   */
+  const groupMembers = ref<Record<string, MemberView[]>>({});
+
+  /** Whether a Group's member list is being loaded. */
+  const loadingGroupInfo = ref(false);
 
   /** The highest read position this client has already reported per Conversation. */
   const reportedReadSeq = new Map<string, number>();
@@ -232,11 +259,359 @@ export const useChatStore = defineStore("chat", () => {
     }
   }
 
+  /**
+   * Create a Group Conversation with the caller as owner, then focus it.
+   *
+   * Members are named by `@handle`; the server resolves them, enforces the
+   * three-Participant minimum and returns the owner's view of the new group.
+   */
+  async function createGroup(
+    title: string,
+    memberUsernames: readonly string[],
+  ): Promise<boolean> {
+    const token = accessToken();
+    if (token === null) return false;
+
+    const name = title.trim();
+    if (name === "") {
+      errorMessage.value = "请输入群名称";
+      return false;
+    }
+    const members = memberUsernames
+      .map((username) => username.trim())
+      .filter((username) => username !== "");
+    if (members.length < 2) {
+      errorMessage.value = "群聊至少需要邀请两位成员";
+      return false;
+    }
+
+    errorMessage.value = null;
+    try {
+      const conversation = await apiPostAuthed<ConversationSummary>(
+        "/conversations/group",
+        { title: name, member_usernames: members },
+        token,
+      );
+      upsertConversation(conversation);
+      activeConversationId.value = conversation.id;
+      await loadGroupInfo(conversation.id);
+      markConversationRead(conversation.id);
+      return true;
+    } catch (cause) {
+      applyError(cause);
+      return false;
+    }
+  }
+
+  /**
+   * Load (or refresh) a Group's member list, and adopt the summary it carries.
+   *
+   * The summary adopted is the server's, so the caller's own Role is never
+   * guessed locally: a transfer or a demotion shows up here without a refetch.
+   */
+  async function loadGroupInfo(conversationId: string): Promise<void> {
+    const token = accessToken();
+    if (token === null) return;
+
+    loadingGroupInfo.value = true;
+    errorMessage.value = null;
+    try {
+      const info = await apiGetAuthed<GroupInfo>(
+        `/conversations/${conversationId}`,
+        token,
+      );
+      applyGroupInfo(info);
+    } catch (cause) {
+      applyError(cause);
+    } finally {
+      loadingGroupInfo.value = false;
+    }
+  }
+
+  /** Invite Users into a Group, then adopt the refreshed member list. */
+  async function inviteMembers(
+    conversationId: string,
+    memberUsernames: readonly string[],
+  ): Promise<boolean> {
+    const token = accessToken();
+    if (token === null) return false;
+
+    const members = memberUsernames
+      .map((username) => username.trim())
+      .filter((username) => username !== "");
+    if (members.length === 0) {
+      errorMessage.value = "请输入要邀请的用户名";
+      return false;
+    }
+
+    errorMessage.value = null;
+    try {
+      const info = await apiPostAuthed<GroupInfo>(
+        `/conversations/${conversationId}/members`,
+        { member_usernames: members },
+        token,
+      );
+      applyGroupInfo(info);
+      return true;
+    } catch (cause) {
+      applyError(cause);
+      return false;
+    }
+  }
+
+  /** Remove a Participant from a Group. */
+  async function removeMember(
+    conversationId: string,
+    userId: string,
+  ): Promise<boolean> {
+    const token = accessToken();
+    if (token === null) return false;
+
+    errorMessage.value = null;
+    try {
+      const info = await apiDeleteAuthed<GroupInfo>(
+        `/conversations/${conversationId}/members/${userId}`,
+        token,
+      );
+      applyGroupInfo(info);
+      return true;
+    } catch (cause) {
+      applyError(cause);
+      return false;
+    }
+  }
+
+  /** Promote a member to admin, or demote an admin back to member. */
+  async function setMemberRole(
+    conversationId: string,
+    userId: string,
+    role: Exclude<Role, "owner">,
+  ): Promise<boolean> {
+    const token = accessToken();
+    if (token === null) return false;
+
+    errorMessage.value = null;
+    try {
+      const info = await apiPatchAuthed<GroupInfo>(
+        `/conversations/${conversationId}/members/${userId}`,
+        { role },
+        token,
+      );
+      applyGroupInfo(info);
+      return true;
+    } catch (cause) {
+      applyError(cause);
+      return false;
+    }
+  }
+
+  /** Hand ownership of a Group to another Participant. */
+  async function transferOwnership(
+    conversationId: string,
+    userId: string,
+  ): Promise<boolean> {
+    const token = accessToken();
+    if (token === null) return false;
+
+    errorMessage.value = null;
+    try {
+      const info = await apiPostAuthed<GroupInfo>(
+        `/conversations/${conversationId}/transfer`,
+        { user_id: userId },
+        token,
+      );
+      applyGroupInfo(info);
+      return true;
+    } catch (cause) {
+      applyError(cause);
+      return false;
+    }
+  }
+
+  /** Leave a Group. The caller's own list drops it immediately. */
+  async function leaveGroup(conversationId: string): Promise<boolean> {
+    const token = accessToken();
+    if (token === null) return false;
+
+    errorMessage.value = null;
+    try {
+      await apiPostAuthedNoContent(
+        `/conversations/${conversationId}/leave`,
+        token,
+      );
+      dropConversation(conversationId);
+      return true;
+    } catch (cause) {
+      applyError(cause);
+      return false;
+    }
+  }
+
+  /** Dissolve a Group the caller owns; it disappears for everyone. */
+  async function dissolveGroup(conversationId: string): Promise<boolean> {
+    const token = accessToken();
+    if (token === null) return false;
+
+    errorMessage.value = null;
+    try {
+      await apiDeleteAuthedNoContent(`/conversations/${conversationId}`, token);
+      dropConversation(conversationId);
+      return true;
+    } catch (cause) {
+      applyError(cause);
+      return false;
+    }
+  }
+
+  /** Adopt a Group's authoritative member list and summary. */
+  function applyGroupInfo(info: GroupInfo): void {
+    groupMembers.value[info.conversation.id] = info.members;
+    upsertConversation(info.conversation);
+  }
+
+  /**
+   * Forget a Conversation entirely: it is no longer visible to the caller.
+   *
+   * Used when the caller leaves, is removed, or the group is dissolved — and on
+   * the `MembershipChanged` events that tell a client about those. The Message
+   * bucket goes too: keeping it would leave a chat the user cannot open, and the
+   * server would refuse to serve history for it anyway.
+   */
+  function dropConversation(conversationId: string): void {
+    conversations.value = conversations.value.filter(
+      (conversation) => conversation.id !== conversationId,
+    );
+    delete messagesByConversation.value[conversationId];
+    delete groupMembers.value[conversationId];
+    delete unreadCounts.value[conversationId];
+    delete peerReceipts.value[conversationId];
+
+    if (activeConversationId.value === conversationId) {
+      activeConversationId.value = null;
+    }
+  }
+
+  /** Insert or replace one member in a Conversation's member list. */
+  function upsertMember(conversationId: string, member: MemberView): void {
+    const members = groupMembers.value[conversationId];
+    if (members === undefined) {
+      groupMembers.value[conversationId] = [member];
+      return;
+    }
+
+    const index = members.findIndex(
+      (entry) => entry.user_id === member.user_id,
+    );
+    if (index >= 0) members.splice(index, 1, member);
+    else members.push(member);
+  }
+
+  /** Mutate the Group part of a Conversation's summary, when it has one. */
+  function withGroupSummary(
+    conversationId: string,
+    mutate: (group: GroupSummary) => void,
+  ): void {
+    const conversation = conversations.value.find(
+      (entry) => entry.id === conversationId,
+    );
+    if (conversation === undefined || conversation.group === undefined) return;
+    mutate(conversation.group);
+  }
+
+  /** Keep the summary's Participant count in step with a membership change. */
+  function adjustMemberCount(conversationId: string, delta: number): void {
+    withGroupSummary(conversationId, (group) => {
+      group.member_count = Math.max(0, group.member_count + delta);
+    });
+  }
+
+  /** Update the caller's own Role in a Conversation's summary. */
+  function setMyRole(conversationId: string, role: Role): void {
+    withGroupSummary(conversationId, (group) => {
+      group.my_role = role;
+    });
+  }
+
+  /**
+   * Apply one membership change.
+   *
+   * This is the single reducer for all six shapes, and it keeps three things
+   * coherent in one place: the member list, the Conversation summary (count and
+   * the caller's own Role), and the caller's Conversation list (a group the caller
+   * left, was removed from, or that was dissolved leaves it).
+   *
+   * The server decides **who** receives the event; this only decides how it lands.
+   */
+  function applyMembershipChanged(payload: MembershipChanged): void {
+    const conversationId = payload.conversation_id;
+    const change = payload.change;
+    const selfId = useAuthStore().user?.id ?? "";
+
+    switch (change.type) {
+      case "joined":
+        upsertMember(conversationId, change.member);
+        adjustMemberCount(conversationId, 1);
+        break;
+      case "left":
+      case "removed": {
+        const members = groupMembers.value[conversationId];
+        if (members !== undefined) {
+          groupMembers.value[conversationId] = members.filter(
+            (member) => member.user_id !== change.user_id,
+          );
+        }
+        adjustMemberCount(conversationId, -1);
+        if (change.user_id === selfId) dropConversation(conversationId);
+        break;
+      }
+      case "role_changed": {
+        const members = groupMembers.value[conversationId];
+        const member = members?.find(
+          (entry) => entry.user_id === change.user_id,
+        );
+        if (member !== undefined) member.role = change.role;
+        if (change.user_id === selfId) setMyRole(conversationId, change.role);
+        break;
+      }
+      case "ownership_transferred": {
+        const members = groupMembers.value[conversationId];
+        const from = members?.find(
+          (member) => member.user_id === change.from_user_id,
+        );
+        const to = members?.find(
+          (member) => member.user_id === change.to_user_id,
+        );
+        // The outgoing owner is demoted to admin; the incoming one owns the group.
+        if (from !== undefined) from.role = "admin";
+        if (to !== undefined) to.role = "owner";
+        if (change.from_user_id === selfId) setMyRole(conversationId, "admin");
+        if (change.to_user_id === selfId) setMyRole(conversationId, "owner");
+        break;
+      }
+      case "dissolved":
+        dropConversation(conversationId);
+        break;
+      default:
+        assertExhaustive(change);
+    }
+  }
+
   /** Focus a Conversation, loading its history the first time it is opened. */
   async function openConversation(conversationId: string): Promise<void> {
     activeConversationId.value = conversationId;
     if (messagesByConversation.value[conversationId] === undefined) {
       await loadMessages(conversationId);
+    }
+    // A Group's member list is only fetched when its info panel could be shown,
+    // and only once: `MembershipChanged` keeps it current afterwards.
+    const conversation = conversations.value.find(
+      (entry) => entry.id === conversationId,
+    );
+    if (
+      conversation?.kind === "group" &&
+      groupMembers.value[conversationId] === undefined
+    ) {
+      await loadGroupInfo(conversationId);
     }
     // Entering a Conversation is the first read of it; the scroll-to-bottom
     // trigger in `MessageList` keeps it current as new Messages arrive.
@@ -739,6 +1114,9 @@ export const useChatStore = defineStore("chat", () => {
       case "ConversationCreated":
         applyConversationCreated(event.d.conversation);
         break;
+      case "MembershipChanged":
+        applyMembershipChanged(event.d);
+        break;
       case "SyncState":
         adoptSyncState(event.d);
         break;
@@ -776,6 +1154,8 @@ export const useChatStore = defineStore("chat", () => {
     syncCursors,
     unreadCounts,
     peerReceipts,
+    groupMembers,
+    loadingGroupInfo,
     hasMoreHistory,
     loadingConversations,
     loadingMessages,
@@ -784,6 +1164,14 @@ export const useChatStore = defineStore("chat", () => {
     notice,
     loadConversations,
     startDirect,
+    createGroup,
+    loadGroupInfo,
+    inviteMembers,
+    removeMember,
+    setMemberRole,
+    transferOwnership,
+    leaveGroup,
+    dissolveGroup,
     openConversation,
     loadOlder,
     sendMessage,

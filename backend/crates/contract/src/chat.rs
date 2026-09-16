@@ -23,6 +23,7 @@ use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
 use crate::auth::ErrorCode;
+use crate::group::GroupSummary;
 use crate::read::ReadReceipt;
 
 /// Hard cap on a Message body, in Unicode scalar values.
@@ -84,9 +85,18 @@ pub struct ConversationSummary {
     pub id: String,
     /// Direct or Group.
     pub kind: ConversationKind,
-    /// The other Participant of a Direct Conversation; absent for a Group (whose
-    /// summary is a later ticket).
+    /// The other Participant of a Direct Conversation; absent for a Group, which
+    /// names no single peer.
     pub peer: Option<PeerSummary>,
+    /// The Group-specific part of the summary (title, member count and the
+    /// caller's own Role); absent for a Direct Conversation.
+    ///
+    /// Optional on the wire as well as in Rust so a Group field can be added
+    /// without rejecting a Direct-shaped payload from an older peer.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub group: Option<GroupSummary>,
     /// The caller's Unread Count (CONTEXT.md: 未读数) in this Conversation.
     ///
     /// Computed server-side from the caller's private Read Marker and maintained

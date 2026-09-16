@@ -4,6 +4,8 @@ import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { RouterLink, useRouter } from "vue-router";
 import type { SocketStatus } from "../api/ws";
 import ConversationList from "../components/chat/ConversationList.vue";
+import CreateGroupForm from "../components/chat/CreateGroupForm.vue";
+import GroupInfoPanel from "../components/chat/GroupInfoPanel.vue";
 import MessageComposer from "../components/chat/MessageComposer.vue";
 import MessageList from "../components/chat/MessageList.vue";
 import { useAuthStore } from "../stores/auth";
@@ -21,6 +23,8 @@ const {
   activeConversation,
   activeConversationId,
   messages,
+  groupMembers,
+  loadingGroupInfo,
   hasMoreHistory,
   loadingConversations,
   loadingMessages,
@@ -34,10 +38,43 @@ const { status } = storeToRefs(realtime);
 
 const newPeer = ref("");
 const starting = ref(false);
+const creatingGroup = ref(false);
+/** Whether the Group info panel is showing instead of the message list. */
+const showGroupInfo = ref(false);
 
 const currentUserId = computed(() => user.value?.id ?? "");
 const connected = computed(() => status.value === "open");
 const socketLabel = computed(() => SOCKET_LABELS[status.value]);
+
+/** Whether the focused Conversation is a Group (and therefore has an info panel). */
+const isGroup = computed(() => activeConversation.value?.group !== undefined);
+
+/** The focused Conversation's title: a group's name, or the peer's. */
+const conversationTitle = computed(() => {
+  const conversation = activeConversation.value;
+  if (conversation === null) return "";
+  if (conversation.group !== undefined) return conversation.group.title;
+  return (
+    conversation.peer?.display_name || conversation.peer?.username || "群聊"
+  );
+});
+
+/** The focused Conversation's second line: member count, or the peer's handle. */
+const conversationSubtitle = computed(() => {
+  const conversation = activeConversation.value;
+  if (conversation === null) return "";
+  if (conversation.group !== undefined) {
+    return `${conversation.group.member_count} 位成员`;
+  }
+  return `@${conversation.peer?.username ?? "group"}`;
+});
+
+/** The focused Group's member list, or an empty list for a Direct Conversation. */
+const activeGroupMembers = computed(() => {
+  const id = activeConversationId.value;
+  if (id === null) return [];
+  return groupMembers.value[id] ?? [];
+});
 
 /**
  * The focused Conversation's peer receipt, or `0`.
@@ -75,6 +112,12 @@ onUnmounted(() => {
   realtime.disconnect();
 });
 
+// Switching Conversations leaves the info panel behind: it belongs to the chat
+// that was open, not to the one now focused.
+watch(activeConversationId, () => {
+  showGroupInfo.value = false;
+});
+
 async function startChat(): Promise<void> {
   if (starting.value) return;
 
@@ -85,6 +128,57 @@ async function startChat(): Promise<void> {
   } finally {
     starting.value = false;
   }
+}
+
+/** Create a Group and open its info panel, so the new group is inspectable. */
+async function createGroup(title: string, members: string[]): Promise<void> {
+  if (creatingGroup.value) return;
+
+  creatingGroup.value = true;
+  try {
+    const created = await chat.createGroup(title, members);
+    if (created) showGroupInfo.value = true;
+  } finally {
+    creatingGroup.value = false;
+  }
+}
+
+function inviteMembers(usernames: string[]): void {
+  const id = activeConversationId.value;
+  if (id === null) return;
+  void chat.inviteMembers(id, usernames);
+}
+
+function removeMember(userId: string): void {
+  const id = activeConversationId.value;
+  if (id === null) return;
+  void chat.removeMember(id, userId);
+}
+
+function setMemberRole(userId: string, role: "admin" | "member"): void {
+  const id = activeConversationId.value;
+  if (id === null) return;
+  void chat.setMemberRole(id, userId, role);
+}
+
+function transferOwnership(userId: string): void {
+  const id = activeConversationId.value;
+  if (id === null) return;
+  void chat.transferOwnership(id, userId);
+}
+
+async function leaveGroup(): Promise<void> {
+  const id = activeConversationId.value;
+  if (id === null) return;
+  await chat.leaveGroup(id);
+  showGroupInfo.value = false;
+}
+
+async function dissolveGroup(): Promise<void> {
+  const id = activeConversationId.value;
+  if (id === null) return;
+  await chat.dissolveGroup(id);
+  showGroupInfo.value = false;
 }
 
 async function signOut(): Promise<void> {
@@ -141,6 +235,8 @@ async function signOut(): Promise<void> {
         </button>
       </form>
 
+      <CreateGroupForm :busy="creatingGroup" @create="createGroup" />
+
       <ConversationList
         :conversations="conversations"
         :active-id="activeConversationId"
@@ -177,18 +273,28 @@ async function signOut(): Promise<void> {
     <section class="flex min-w-0 flex-1 flex-col">
       <template v-if="activeConversation !== null">
         <header
-          class="border-b border-zinc-200 bg-white px-4 py-3 dark:border-zinc-800 dark:bg-zinc-900"
+          class="flex items-center justify-between gap-3 border-b border-zinc-200 bg-white px-4 py-3 dark:border-zinc-800 dark:bg-zinc-900"
         >
-          <h2 class="text-sm font-semibold" data-test="conversation-title">
-            {{
-              activeConversation.peer?.display_name ||
-              activeConversation.peer?.username ||
-              "群聊"
-            }}
-          </h2>
-          <p class="text-xs text-zinc-500">
-            @{{ activeConversation.peer?.username ?? "group" }}
-          </p>
+          <div class="min-w-0">
+            <h2
+              class="truncate text-sm font-semibold"
+              data-test="conversation-title"
+            >
+              {{ conversationTitle }}
+            </h2>
+            <p class="truncate text-xs text-zinc-500">
+              {{ conversationSubtitle }}
+            </p>
+          </div>
+          <button
+            v-if="isGroup"
+            type="button"
+            class="shrink-0 rounded-lg border border-zinc-300 px-3 py-1.5 text-xs font-medium transition-colors hover:bg-zinc-100 dark:border-zinc-700 dark:hover:bg-zinc-800"
+            data-test="toggle-group-info"
+            @click="showGroupInfo = !showGroupInfo"
+          >
+            {{ showGroupInfo ? "返回消息" : "群资料" }}
+          </button>
         </header>
 
         <p
@@ -201,7 +307,21 @@ async function signOut(): Promise<void> {
         </p>
 
         <div class="min-h-0 flex-1">
+          <GroupInfoPanel
+            v-if="isGroup && showGroupInfo"
+            :conversation="activeConversation"
+            :members="activeGroupMembers"
+            :current-user-id="currentUserId"
+            :loading="loadingGroupInfo"
+            @invite="inviteMembers"
+            @remove="removeMember"
+            @set-role="setMemberRole"
+            @transfer="transferOwnership"
+            @leave="leaveGroup"
+            @dissolve="dissolveGroup"
+          />
           <MessageList
+            v-else
             :messages="messages"
             :current-user-id="currentUserId"
             :loading="loadingMessages"
@@ -223,6 +343,7 @@ async function signOut(): Promise<void> {
         </p>
 
         <MessageComposer
+          v-if="!(isGroup && showGroupInfo)"
           :disabled="!connected"
           @send="chat.sendMessage($event)"
         />
@@ -237,7 +358,7 @@ async function signOut(): Promise<void> {
           选择一个会话
         </p>
         <p class="mt-1 leading-relaxed">
-          或者在左侧输入对方用户名，开始一个新的单聊。
+          在左侧输入对方用户名开始单聊，或使用「建群」创建群聊。
         </p>
       </div>
     </section>

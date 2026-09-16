@@ -1,0 +1,35 @@
+[package]
+name = "jiuyue-desktop"
+version = "0.1.0"
+description = "jiuyue desktop shell for Windows and macOS (Tauri v2)"
+edition = "2021"
+rust-version = "1.85"
+license = "LGPL-3.0"
+repository = "https://github.com/Moon-Spirit/jiuyue"
+
+# A library target so the tray/window logic is unit-testable, plus the thin
+# binary `main.rs` that only starts the runtime.
+[lib]
+name = "jiuyue_desktop"
+crate-type = ["rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# `tray-icon` is the feature that brings the system tray in; without it the
+# close-to-tray behaviour this ticket requires cannot be built at all.
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-notification = "2"
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+# Round-trips the wire shape of the commands' payloads in unit tests.
+serde_json = "1"
+
+# Mirrors the workspace profile on the backend: smaller binary, and this crate
+# is built in CI rather than on the 2 vCPU / 2 GB box itself (AGENTS.md).
+[profile.release]
+codegen-units = 1
+lto = "thin"
+strip = true

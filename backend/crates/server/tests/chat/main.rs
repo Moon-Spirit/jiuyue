@@ -15,6 +15,7 @@
 //! without cleanup.
 
 mod conversations;
+mod groups;
 mod messaging;
 mod pagination;
 mod read_state;

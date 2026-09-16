@@ -25,6 +25,7 @@ pub mod auth;
 pub mod chat;
 pub mod envelope;
 pub mod events;
+pub mod group;
 pub mod read;
 pub mod sync;
 
@@ -40,5 +41,10 @@ pub use chat::{
 };
 pub use envelope::{ClientEnvelope, PROTOCOL_VERSION, ServerEnvelope};
 pub use events::{ClientEvent, Ping, ServerEvent};
+pub use group::{
+    AddGroupMembersRequest, ChangeMemberRoleRequest, CreateGroupConversationRequest, GroupInfo,
+    GroupSummary, MAX_GROUP_MEMBERS, MAX_GROUP_TITLE_CHARS, MIN_GROUP_MEMBERS, MemberView,
+    MembershipChange, MembershipChanged, Role, TransferOwnershipRequest,
+};
 pub use read::{MarkRead, ReadMarker, ReadReceipt};
 pub use sync::{Resume, Resync, ResyncReason, SyncCursor, SyncState};

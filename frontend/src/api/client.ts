@@ -125,3 +125,84 @@ export async function apiPostAuthedNoContent(
     throw new ApiError(response.status, await readErrorBody(response));
   }
 }
+
+/** `POST /api<path>` with a bearer token and a JSON body. */
+export async function apiPostAuthed<T>(
+  path: string,
+  body: unknown,
+  token: string,
+): Promise<T> {
+  const response = await fetch(`/api${path}`, {
+    method: "POST",
+    headers: {
+      Accept: "application/json",
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify(body),
+  });
+
+  if (!response.ok) {
+    throw new ApiError(response.status, await readErrorBody(response));
+  }
+
+  const payload: unknown = await response.json();
+  return payload as T;
+}
+
+/** `PATCH /api<path>` with a bearer token and a JSON body. */
+export async function apiPatchAuthed<T>(
+  path: string,
+  body: unknown,
+  token: string,
+): Promise<T> {
+  const response = await fetch(`/api${path}`, {
+    method: "PATCH",
+    headers: {
+      Accept: "application/json",
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify(body),
+  });
+
+  if (!response.ok) {
+    throw new ApiError(response.status, await readErrorBody(response));
+  }
+
+  const payload: unknown = await response.json();
+  return payload as T;
+}
+
+/** `DELETE /api<path>` with a bearer token, expecting a JSON body back. */
+export async function apiDeleteAuthed<T>(
+  path: string,
+  token: string,
+): Promise<T> {
+  const response = await fetch(`/api${path}`, {
+    method: "DELETE",
+    headers: { Accept: "application/json", Authorization: `Bearer ${token}` },
+  });
+
+  if (!response.ok) {
+    throw new ApiError(response.status, await readErrorBody(response));
+  }
+
+  const payload: unknown = await response.json();
+  return payload as T;
+}
+
+/** `DELETE /api<path>` with a bearer token and no content expected back. */
+export async function apiDeleteAuthedNoContent(
+  path: string,
+  token: string,
+): Promise<void> {
+  const response = await fetch(`/api${path}`, {
+    method: "DELETE",
+    headers: { Accept: "application/json", Authorization: `Bearer ${token}` },
+  });
+
+  if (!response.ok) {
+    throw new ApiError(response.status, await readErrorBody(response));
+  }
+}
