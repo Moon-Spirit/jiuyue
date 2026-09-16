@@ -4,6 +4,8 @@ import type { MessageAck } from "./MessageAck";
 import type { MessageRejected } from "./MessageRejected";
 import type { NewMessage } from "./NewMessage";
 import type { Ping } from "./Ping";
+import type { ReadMarker } from "./ReadMarker";
+import type { ReadReceipt } from "./ReadReceipt";
 import type { Resync } from "./Resync";
 import type { SyncState } from "./SyncState";
 
@@ -14,4 +16,4 @@ import type { SyncState } from "./SyncState";
  * rather than failing, which is what lets the server grow the vocabulary without
  * a protocol version bump (ADR-0003).
  */
-export type ServerEvent = { "t": "Ping", "d": Ping } | { "t": "MessageAck", "d": MessageAck } | { "t": "NewMessage", "d": NewMessage } | { "t": "MessageRejected", "d": MessageRejected } | { "t": "ConversationCreated", "d": ConversationCreated } | { "t": "Resync", "d": Resync } | { "t": "SyncState", "d": SyncState };
+export type ServerEvent = { "t": "Ping", "d": Ping } | { "t": "MessageAck", "d": MessageAck } | { "t": "NewMessage", "d": NewMessage } | { "t": "MessageRejected", "d": MessageRejected } | { "t": "ConversationCreated", "d": ConversationCreated } | { "t": "Resync", "d": Resync } | { "t": "SyncState", "d": SyncState } | { "t": "ReadMarker", "d": ReadMarker } | { "t": "ReadReceipt", "d": ReadReceipt };

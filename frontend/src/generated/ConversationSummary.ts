@@ -20,6 +20,15 @@ kind: ConversationKind,
  */
 peer: PeerSummary | null, 
 /**
+ * The caller's Unread Count (CONTEXT.md: 未读数) in this Conversation.
+ *
+ * Computed server-side from the caller's private Read Marker and maintained
+ * incrementally, never by scanning `messages` here: the Conversation list is
+ * the hottest read path. It is the **caller's own** count — another
+ * Participant's is never exposed.
+ */
+unread_count: number, 
+/**
  * Creation time, milliseconds since the Unix epoch.
  */
 created_at_ms: number, };
