@@ -1,0 +1,27 @@
+# jiuyue backup timer — the daily job. No containers anywhere (ADR-0010).
+#
+# Installed to /etc/systemd/system/jiuyue-backup.timer by deploy/provision.sh.
+#
+# OnCalendar is UTC. Hong Kong is UTC+8, so 18:30 UTC is 02:30 the next day
+# there — the quietest hour, when a dump costs the least in I/O. Persistent=true
+# catches up a run missed while the box was down.
+#
+# The timer is only half the alerting story: if this fires and backup.sh fails,
+# the heartbeat in backup.sh raises it. If the timer itself is disabled or the
+# box is gone, the MISSING heartbeat raises it (see docs/backup.md §Alerting).
+
+[Unit]
+Description=Run the jiuyue backup daily
+Documentation=https://github.com/Moon-Spirit/jiuyue/blob/main/docs/backup.md
+
+[Timer]
+OnCalendar=*-*-* 18:30:00
+# Spread the load a little; nothing else runs at this hour.
+RandomizedDelaySec=300
+AccuracySec=1min
+# A run missed because the machine was off runs once at the next boot.
+Persistent=true
+Unit=jiuyue-backup.service
+
+[Install]
+WantedBy=timers.target

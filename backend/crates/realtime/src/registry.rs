@@ -11,7 +11,9 @@
 //! `try_send`s into it. A slow or wedged client therefore applies backpressure to
 //! itself — its events are dropped and logged — instead of growing an unbounded
 //! buffer on a 2 GB box. Recovery for a dropped event is the reconnect/gap-repair
-//! path of ticket #11, which is why dropping is safe here and blocking is not.
+//! path of ticket #12 (`ConnectionWriter`'s bounded replay buffer, then the
+//! client's per-Conversation cursor repair), which is why dropping is safe here
+//! and blocking is not.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -22,6 +24,17 @@ use tokio::sync::{RwLock, mpsc};
 /// Identifies one live connection. Unique for the lifetime of the process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ConnectionId(u64);
+
+impl ConnectionId {
+    /// The raw id, as carried on the wire in a heartbeat's `connection_id`.
+    ///
+    /// A client echoes this back in its resume handshake, so the value must be
+    /// stable and serialisable; the newtype stays private to keep it opaque to
+    /// callers that only need a handle.
+    pub fn value(self) -> u64 {
+        self.0
+    }
+}
 
 /// Every live connection, keyed by the authenticated User.
 #[derive(Debug, Default)]

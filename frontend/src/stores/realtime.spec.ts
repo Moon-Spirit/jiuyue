@@ -1,6 +1,7 @@
 import { createPinia, setActivePinia } from "pinia";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { FakeWebSocket } from "../testing/fake-websocket";
+import type { ResyncReason } from "../generated/ResyncReason";
 import { useRealtimeStore } from "./realtime";
 
 /** A server envelope as it appears on the wire, produced from the contract. */
@@ -11,6 +12,61 @@ function pingEnvelope(seq: number, timeMs: number): string {
     ts: timeMs,
     e: { t: "Ping", d: { seq, time_ms: timeMs } },
   });
+}
+
+/** A heartbeat that names the connection it belongs to, as the server sends it. */
+function connectionPing(
+  seq: number,
+  timeMs: number,
+  connectionId: number,
+): string {
+  return JSON.stringify({
+    v: 1,
+    s: seq,
+    ts: timeMs,
+    e: {
+      t: "Ping",
+      d: { seq, time_ms: timeMs, connection_id: connectionId },
+    },
+  });
+}
+
+/** The server's explicit answer to a resume handshake. */
+function resyncEnvelope(seq: number, reason: ResyncReason): string {
+  return JSON.stringify({
+    v: 1,
+    s: seq,
+    ts: 2_000,
+    e: { t: "Resync", d: { reason, replayed: 0 } },
+  });
+}
+
+/** A `NewMessage` at an arbitrary connection sequence, to poke holes in `s`. */
+function newMessageAt(seq: number, messageSeq: number): string {
+  return JSON.stringify({
+    v: 1,
+    s: seq,
+    ts: 3_000,
+    e: {
+      t: "NewMessage",
+      d: {
+        message: {
+          id: `M${messageSeq}`,
+          conversation_id: "01JABC1234567890ABCDEFGHJ2",
+          seq: messageSeq,
+          sender_id: "01JABC1234567890ABCDEFGHJ3",
+          client_msg_id: `k${messageSeq}`,
+          body: "hello",
+          created_at_ms: 3_000,
+        },
+      },
+    },
+  });
+}
+
+/** The parsed client frames a fake socket sent, in order. */
+function sentFrames(socket: FakeWebSocket): Record<string, unknown>[] {
+  return socket.sent.map((text) => JSON.parse(text) as Record<string, unknown>);
 }
 
 const ACCESS_KEY = "jiuyue.auth.access_token";
@@ -195,5 +251,102 @@ describe("useRealtimeStore", () => {
     expect(received).toEqual(["NewMessage"]);
     expect(store.serverTimeMs).toBe(1_000);
     expect(store.sequence).toBe(2);
+  });
+
+  it("answers the first heartbeat with the wake-up handshake", () => {
+    const store = useRealtimeStore();
+    store.connect();
+    const socket = FakeWebSocket.latest();
+    socket.emitOpen();
+
+    // Nothing is sent until the heartbeat names the connection.
+    expect(socket.sent).toHaveLength(0);
+
+    socket.emitMessage(connectionPing(1, 1_000, 7));
+
+    expect(store.connectionId).toBe(7);
+    expect(sentFrames(socket)).toEqual([
+      { v: 1, e: { t: "Resume", d: { last_seq: 0, connection_id: null } } },
+    ]);
+  });
+
+  it("detects a hole in the connection sequence and asks to resume", () => {
+    const store = useRealtimeStore();
+    const resyncs: ResyncReason[] = [];
+    store.onResync((reason) => resyncs.push(reason));
+
+    store.connect();
+    const socket = FakeWebSocket.latest();
+    socket.emitOpen();
+    socket.emitMessage(connectionPing(1, 1_000, 7));
+
+    // s=2 is skipped: the wire dropped an envelope.
+    socket.emitMessage(newMessageAt(3, 1));
+
+    expect(store.sequence).toBe(3);
+    expect(resyncs).toEqual(["unavailable"]);
+    expect(sentFrames(socket)[1]).toEqual({
+      v: 1,
+      e: { t: "Resume", d: { last_seq: 1, connection_id: 7 } },
+    });
+  });
+
+  it("does not mistake a new connection's sequence for a gap", () => {
+    const store = useRealtimeStore();
+    const resyncs: ResyncReason[] = [];
+    store.onResync((reason) => resyncs.push(reason));
+
+    store.connect();
+    const first = FakeWebSocket.latest();
+    first.emitOpen();
+    first.emitMessage(connectionPing(1, 1_000, 7));
+    expect(store.sequence).toBe(1);
+
+    // Reconnect: the sequence restarts at 1, which is not a hole.
+    store.disconnect();
+    store.connect();
+    const second = FakeWebSocket.latest();
+    second.emitOpen();
+    second.emitMessage(connectionPing(1, 2_000, 8));
+
+    expect(store.connectionId).toBe(8);
+    expect(store.sequence).toBe(1);
+    expect(resyncs).toEqual([]);
+    // The handshake names the position consumed on the dead connection so the
+    // server can answer `unavailable` (it does) rather than assume continuity.
+    expect(sentFrames(second)).toEqual([
+      { v: 1, e: { t: "Resume", d: { last_seq: 1, connection_id: null } } },
+    ]);
+  });
+
+  it("repairs when the server says the resume position is unavailable", () => {
+    const store = useRealtimeStore();
+    const resyncs: ResyncReason[] = [];
+    store.onResync((reason) => resyncs.push(reason));
+
+    store.connect();
+    const socket = FakeWebSocket.latest();
+    socket.emitOpen();
+    socket.emitMessage(connectionPing(1, 1_000, 7));
+    expect(resyncs).toEqual([]);
+
+    socket.emitMessage(resyncEnvelope(2, "unavailable"));
+
+    expect(resyncs).toEqual(["unavailable"]);
+  });
+
+  it("keeps a replayed resume quiet", () => {
+    const store = useRealtimeStore();
+    const resyncs: ResyncReason[] = [];
+    store.onResync((reason) => resyncs.push(reason));
+
+    store.connect();
+    const socket = FakeWebSocket.latest();
+    socket.emitOpen();
+    socket.emitMessage(connectionPing(1, 1_000, 7));
+
+    socket.emitMessage(resyncEnvelope(2, "replayed"));
+
+    expect(resyncs).toEqual([]);
   });
 });

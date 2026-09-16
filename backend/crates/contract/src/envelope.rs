@@ -125,6 +125,7 @@ mod tests {
             ServerEvent::Ping(Ping {
                 seq: 7,
                 time_ms: 1_750_000_000_000,
+                connection_id: Some(42),
             }),
         );
 
@@ -146,6 +147,7 @@ mod tests {
             ServerEvent::Ping(Ping {
                 seq: 1,
                 time_ms: 42,
+                connection_id: Some(1),
             }),
         );
 
@@ -162,6 +164,7 @@ mod tests {
         let envelope = ClientEnvelope::new(ClientEvent::Ping(Ping {
             seq: 3,
             time_ms: 99,
+            connection_id: None,
         }));
 
         let wire = serde_json::to_value(&envelope).expect("envelope must serialise");

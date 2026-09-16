@@ -291,3 +291,117 @@ async fn a_non_participant_cannot_page_history_with_a_cursor() {
 
     app.cleanup().await;
 }
+
+#[tokio::test]
+async fn a_forward_cursor_returns_everything_newer_in_order() {
+    let app = TestApp::start().await;
+    let alice = register(&app, "alice", "alice@example.com", "secret123").await;
+    register(&app, "bob", "bob@example.com", "secret123").await;
+    let conversation = create_direct(&app, &alice.tokens.access_token, "bob").await;
+    seed_messages(&app, &conversation.id, &alice.user.id, 25).await;
+
+    let token = alice.tokens.access_token.clone();
+
+    // The repair direction: the *oldest* Messages after the cursor, ascending.
+    let first = fetch_page(&app, &conversation.id, "after=10&limit=10", &token).await;
+    assert_eq!(seqs(&first), (11..=20).collect::<Vec<_>>());
+    assert_eq!(first.next_after, Some(20), "the forward cursor advances");
+    assert_eq!(
+        first.next_before, None,
+        "a forward page has no backward cursor"
+    );
+    assert!(first.has_more, "has_more means newer Messages exist");
+
+    let second = fetch_page(&app, &conversation.id, "after=20&limit=10", &token).await;
+    assert_eq!(seqs(&second), (21..=25).collect::<Vec<_>>());
+    assert_eq!(
+        second.next_after, None,
+        "the newest page has no continuation"
+    );
+    assert!(!second.has_more);
+
+    // A cursor at the newest Message: nothing newer, and that is not an error.
+    let caught_up = fetch_page(&app, &conversation.id, "after=25&limit=10", &token).await;
+    assert!(caught_up.messages.is_empty());
+    assert!(!caught_up.has_more);
+    assert_eq!(caught_up.next_after, None);
+
+    // Walking the forward cursor reconstructs 11..=25 with no duplicate and no gap.
+    let mut union = seqs(&first);
+    union.extend(seqs(&second));
+    assert_eq!(union, (11..=25).collect::<Vec<_>>());
+
+    app.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_forward_walk_repairs_a_gap_to_the_exact_missed_set() {
+    let app = TestApp::start().await;
+    let alice = register(&app, "alice", "alice@example.com", "secret123").await;
+    register(&app, "bob", "bob@example.com", "secret123").await;
+    let conversation = create_direct(&app, &alice.tokens.access_token, "bob").await;
+    seed_messages(&app, &conversation.id, &alice.user.id, 10).await;
+
+    let token = alice.tokens.access_token.clone();
+
+    // A client that holds seq 1..=4 and missed 5..=10 repairs three at a time.
+    let mut cursor = 4_i64;
+    let mut missed: Vec<i64> = Vec::new();
+
+    loop {
+        let page = fetch_page(
+            &app,
+            &conversation.id,
+            &format!("after={cursor}&limit=3"),
+            &token,
+        )
+        .await;
+        // Every forward page is ascending, so the repair appends in order.
+        let mut ascending = seqs(&page);
+        let before_sort = ascending.clone();
+        ascending.sort_unstable();
+        assert_eq!(ascending, before_sort, "a forward page must be ascending");
+
+        missed.extend(seqs(&page));
+        match (page.has_more, page.next_after) {
+            (true, Some(next)) => cursor = next,
+            _ => break,
+        }
+    }
+
+    assert_eq!(
+        missed,
+        (5..=10).collect::<Vec<_>>(),
+        "the repair must yield exactly the missed Messages, once each, in order"
+    );
+
+    app.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_backward_and_a_forward_cursor_cannot_be_combined() {
+    let app = TestApp::start().await;
+    let alice = register(&app, "alice", "alice@example.com", "secret123").await;
+    register(&app, "bob", "bob@example.com", "secret123").await;
+    let conversation = create_direct(&app, &alice.tokens.access_token, "bob").await;
+    seed_messages(&app, &conversation.id, &alice.user.id, 5).await;
+
+    let (status, body) = get_with_token(
+        &app,
+        &format!(
+            "/conversations/{}/messages?before=5&after=2",
+            conversation.id
+        ),
+        &alice.tokens.access_token,
+    )
+    .await;
+
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "naming both ends of a page is ambiguous and must be refused: {body}"
+    );
+    assert_eq!(error_code(&body), "VALIDATION_FAILED");
+
+    app.cleanup().await;
+}

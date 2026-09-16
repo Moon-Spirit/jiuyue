@@ -7,6 +7,14 @@
  * can detect staleness, estimate clock skew and verify ordering from the event
  * alone, without consulting transport metadata. This mirrors the Mattermost
  * reliable-WebSocket ping event referenced by ADR-0003.
+ *
+ * A **server** heartbeat also carries `connection_id`, the process-unique
+ * identity of the connection that sent it. The client echoes that id back in its
+ * [`crate::sync::Resume`] handshake, which is what lets the server tell "resume
+ * within this connection" (replayable) apart from "resume a position from a
+ * previous connection" (unprovable — repair Conversations). A **client**
+ * heartbeat leaves it `null`, because a client does not name a connection the
+ * server did not assign.
  */
 export type Ping = { 
 /**
@@ -16,4 +24,9 @@ seq: number,
 /**
  * Originator wall-clock time, milliseconds since the Unix epoch.
  */
-time_ms: number, };
+time_ms: number, 
+/**
+ * Identity of the connection this server heartbeat belongs to; `null` on a
+ * client heartbeat.
+ */
+connection_id: number | null, };

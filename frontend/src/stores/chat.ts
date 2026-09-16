@@ -6,42 +6,24 @@ import type { ConversationSummary } from "../generated/ConversationSummary";
 import type { MessageAck } from "../generated/MessageAck";
 import type { MessageList } from "../generated/MessageList";
 import type { MessageRejected } from "../generated/MessageRejected";
-import type { MessageView } from "../generated/MessageView";
 import type { NewMessage } from "../generated/NewMessage";
 import type { ServerEvent } from "../generated/ServerEvent";
 import { useAuthStore } from "./auth";
+import {
+  compareMessages,
+  fromView,
+  maxSeq,
+  newClientMsgId,
+  repairStartSeq,
+  upsert,
+  type ChatMessage,
+} from "./chat-messages";
 import { useRealtimeStore } from "./realtime";
 
-/** Longest body the server accepts, mirrored so the limit is felt locally. */
-export const MESSAGE_MAX_CHARS = 4000;
-
-/** Where a Message sits in its delivery lifecycle. */
-export type DeliveryState = "sending" | "sent" | "failed";
-
-/**
- * One Message as the UI holds it.
- *
- * A Message exists before the server has seen it: an optimistic entry has a local
- * `id`, no `seq` and state `sending`. The `clientMsgId` is assigned once, at the
- * moment of the first send, and is **reused by every retry** — that is what lets
- * the server de-duplicate a resend instead of writing a second Message.
- */
-export interface ChatMessage {
-  /** Server ULID once stored; a local placeholder while sending. */
-  id: string;
-  /** The idempotency key (CONTEXT.md: Client Message ID). Stable across retries. */
-  clientMsgId: string;
-  conversationId: string;
-  senderId: string;
-  body: string;
-  /** Server Sequence Number; `null` until acknowledged. */
-  seq: number | null;
-  /** Server-assigned time; `null` until acknowledged. */
-  createdAtMs: number | null;
-  state: DeliveryState;
-  /** Why the send failed, when it did. */
-  failure: string | null;
-}
+// The Message shape and its pure helpers live in `chat-messages`; re-exported here
+// so existing importers (`MessageList.vue`, `MessageComposer.vue`) keep one path.
+export { MESSAGE_MAX_CHARS } from "./chat-messages";
+export type { ChatMessage, DeliveryState } from "./chat-messages";
 
 /**
  * Compile-time exhaustiveness check for the event switch.
@@ -50,59 +32,6 @@ export interface ChatMessage {
  * makes additive server events backward compatible.
  */
 function assertExhaustive(_variant: never): void {}
-
-/** Order Messages by Sequence Number, keeping not-yet-sent ones last. */
-function compareMessages(left: ChatMessage, right: ChatMessage): number {
-  if (left.seq === null && right.seq === null) return 0;
-  if (left.seq === null) return 1;
-  if (right.seq === null) return -1;
-  return left.seq - right.seq;
-}
-
-/** A fresh idempotency key. */
-function newClientMsgId(): string {
-  if (
-    typeof crypto !== "undefined" &&
-    typeof crypto.randomUUID === "function"
-  ) {
-    return crypto.randomUUID();
-  }
-  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
-}
-
-/** Project a stored Message onto the UI shape. */
-function fromView(view: MessageView, state: DeliveryState): ChatMessage {
-  return {
-    id: view.id,
-    clientMsgId: view.client_msg_id,
-    conversationId: view.conversation_id,
-    senderId: view.sender_id,
-    body: view.body,
-    seq: view.seq,
-    createdAtMs: view.created_at_ms,
-    state,
-    failure: null,
-  };
-}
-
-/** Replace the matching entry (by idempotency key, then by server id) or append. */
-function upsert(list: ChatMessage[], message: ChatMessage): void {
-  const byClientId = list.findIndex(
-    (entry) => entry.clientMsgId === message.clientMsgId,
-  );
-  if (byClientId >= 0) {
-    list.splice(byClientId, 1, message);
-    return;
-  }
-
-  const byServerId = list.findIndex((entry) => entry.id === message.id);
-  if (byServerId >= 0) {
-    list.splice(byServerId, 1, message);
-    return;
-  }
-
-  list.push(message);
-}
 
 /**
  * Conversations, Messages, and the send state machine.
@@ -138,6 +67,9 @@ export const useChatStore = defineStore("chat", () => {
   const nextBeforeByConversation = ref<Record<string, number | null>>({});
   /** Whether a Conversation has history older than what is loaded. */
   const hasMoreByConversation = ref<Record<string, boolean>>({});
+
+  /** The in-flight repair walk, so concurrent repair triggers can coalesce. */
+  let repairInFlight: Promise<void> | null = null;
 
   const activeConversation = computed<ConversationSummary | null>(
     () =>
@@ -333,6 +265,80 @@ export const useChatStore = defineStore("chat", () => {
     }
   }
 
+  /**
+   * Pull one Conversation forward from the last Sequence Number it holds.
+   *
+   * This is the Conversation-layer half of ADR-0003's repair: everything with a
+   * `seq` greater than the client's cursor, oldest first, page by page. Every
+   * merge goes through {@link upsert}, so re-delivered Messages are absorbed by
+   * Message ID and applying a duplicate is a no-op.
+   */
+  async function repairConversation(
+    conversationId: string,
+    token: string,
+  ): Promise<void> {
+    const list = messagesByConversation.value[conversationId];
+    if (list === undefined) return;
+
+    // Nothing held means there is no cursor to walk from; the newest page is the
+    // only sensible starting point.
+    if (list.length === 0) {
+      await loadMessages(conversationId);
+      return;
+    }
+
+    const start = repairStartSeq(list);
+    if (start === null) return;
+    let cursor = start;
+
+    for (;;) {
+      const payload: MessageList = await apiGetAuthed<MessageList>(
+        `/conversations/${conversationId}/messages?after=${cursor}&limit=100`,
+        token,
+      );
+      for (const view of payload.messages) upsert(list, fromView(view, "sent"));
+
+      if (payload.has_more !== true) break;
+      const next: number | null = payload.next_after ?? null;
+      // A cursor that does not advance would loop forever; the server guarantees
+      // one, but a defensive break costs nothing and cannot hide a real page.
+      if (next === null || next <= cursor) break;
+      cursor = next;
+    }
+  }
+
+  /**
+   * Repair every Conversation the client has loaded, refreshing the list first.
+   *
+   * Coalesced: several triggers (a reconnect, a connection-level gap, a
+   * Conversation-level gap) can request a repair at the same instant, and one
+   * walk is enough for all of them.
+   */
+  function repairConversations(): Promise<void> {
+    if (repairInFlight !== null) return repairInFlight;
+
+    repairInFlight = runRepairs().finally(() => {
+      repairInFlight = null;
+    });
+    return repairInFlight;
+  }
+
+  async function runRepairs(): Promise<void> {
+    const token = accessToken();
+    if (token === null) return;
+
+    await loadConversations();
+
+    for (const conversationId of Object.keys(messagesByConversation.value)) {
+      try {
+        await repairConversation(conversationId, token);
+      } catch (cause) {
+        applyError(cause);
+        return;
+      }
+    }
+  }
+
   /** Mark a Message failed, wherever it lives. */
   function markFailed(clientMsgId: string, reason: string | null): void {
     for (const list of Object.values(messagesByConversation.value)) {
@@ -422,7 +428,16 @@ export const useChatStore = defineStore("chat", () => {
    */
   function applyNewMessage(payload: NewMessage): void {
     const view = payload.message;
-    upsert(bucket(view.conversation_id), fromView(view, "sent"));
+    const list = bucket(view.conversation_id);
+    const before = maxSeq(list);
+    upsert(list, fromView(view, "sent"));
+
+    // A Message more than one Sequence Number beyond the high-water mark means the
+    // Conversation stream has a hole; pull the missing range forward. The
+    // connection layer may have filled its own gap, but this is the exact repair.
+    if (before !== null && view.seq > before + 1) {
+      void repairConversations();
+    }
 
     const known = conversations.value.some(
       (conversation) => conversation.id === view.conversation_id,
@@ -456,6 +471,9 @@ export const useChatStore = defineStore("chat", () => {
     switch (event.t) {
       case "Ping":
         break;
+      case "Resync":
+        // Handled by the realtime store, which owns the connection sequence.
+        break;
       case "MessageAck":
         applyAck(event.d);
         break;
@@ -476,6 +494,13 @@ export const useChatStore = defineStore("chat", () => {
   // Subscribe once: the realtime store forwards only the chat events, and this
   // store is the thing that knows what to do with them.
   useRealtimeStore().onChatEvent(handleChatEvent);
+
+  // A reconnect the server cannot resume, a connection-level gap, or an
+  // unavailable replay position all mean the same thing here: repair forward from
+  // each Conversation's own cursor. Coalesced, so several triggers are one walk.
+  useRealtimeStore().onResync(() => {
+    void repairConversations();
+  });
 
   function clearNotice(): void {
     notice.value = null;
@@ -498,6 +523,7 @@ export const useChatStore = defineStore("chat", () => {
     loadOlder,
     sendMessage,
     retry,
+    repairConversations,
     clearNotice,
   };
 });

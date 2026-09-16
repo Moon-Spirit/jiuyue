@@ -23,10 +23,11 @@ use futures_util::{SinkExt, StreamExt};
 use jiuyue_auth::{AuthConfig, AuthService};
 use jiuyue_chat::ChatService;
 use jiuyue_contract::{
-    AuthSession, ClientEnvelope, ClientEvent, ConversationSummary, MessageAck, MessageRejected,
-    NewMessage, SendMessage, ServerEnvelope, ServerEvent,
+    AuthSession, ClientEnvelope, ClientEvent, ConversationSummary, MessageAck, MessageList,
+    MessageRejected, MessageView, NewMessage, Resume, Resync, SendMessage, ServerEnvelope,
+    ServerEvent,
 };
-use jiuyue_realtime::RealtimeHub;
+use jiuyue_realtime::{HEARTBEAT_INTERVAL, RealtimeHub};
 use jiuyue_server::{AppState, Config, Services, app};
 use jiuyue_store::Store;
 use serde_json::{Value, json};
@@ -58,6 +59,15 @@ pub struct TestApp {
 impl TestApp {
     /// Create a uniquely named schema, migrate it, and build the real router.
     pub async fn start() -> Self {
+        Self::start_with_heartbeat(HEARTBEAT_INTERVAL).await
+    }
+
+    /// Same, with an explicit heartbeat period.
+    ///
+    /// The heartbeat tests cannot wait the production 30 seconds, so they build
+    /// the same app with a millisecond period. Nothing else differs: the real
+    /// registry, the real replay buffer and the real database are all still used.
+    pub async fn start_with_heartbeat(heartbeat: Duration) -> Self {
         // Surface the server's own error logs when a test fails; the first
         // initialisation wins and a second is a no-op.
         let _ = tracing_subscriber::fmt()
@@ -87,7 +97,11 @@ impl TestApp {
             .await
             .expect("the identity service must build with a valid secret");
         let chat = Arc::new(ChatService::new(pool));
-        let realtime = Arc::new(RealtimeHub::new(Arc::clone(&chat)));
+        let realtime = Arc::new(RealtimeHub::with_settings(
+            Arc::clone(&chat),
+            heartbeat,
+            jiuyue_realtime::DEFAULT_REPLAY_CAPACITY,
+        ));
 
         let state = AppState::with_services(
             Config::default(),
@@ -189,6 +203,53 @@ pub fn send_message(conversation_id: &str, client_msg_id: &str, body: &str) -> C
     })
 }
 
+/// A `Resume` wake-up handshake naming the highest connection sequence consumed.
+///
+/// `0` means "this is a first connection, I consumed nothing"; `connection_id` is
+/// the id from a heartbeat of the connection the position belongs to, or `None`
+/// when the client cannot name it (a first connect, or right after a reconnect).
+pub fn resume(last_seq: u64, connection_id: Option<u64>) -> ClientEvent {
+    ClientEvent::Resume(Resume {
+        last_seq,
+        connection_id,
+    })
+}
+
+/// Read the REST repair loop: every Message strictly after `cursor`, oldest first.
+///
+/// This is what the client does after a reconnect: pull forward pages until the
+/// server reports no more, concatenating them. It returns the Messages in order,
+/// exactly as a repaired client would hold them.
+pub async fn repair_after(
+    app: &TestApp,
+    conversation_id: &str,
+    mut cursor: i64,
+    token: &str,
+) -> Vec<MessageView> {
+    let mut repaired = Vec::new();
+
+    loop {
+        let path = format!("/conversations/{conversation_id}/messages?after={cursor}&limit=100");
+        let (status, body) = get_with_token(app, &path, token).await;
+        assert_eq!(status, StatusCode::OK, "the repair page must load: {body}");
+
+        let page: MessageList =
+            serde_json::from_value(body).expect("the response must be MessageList");
+        let has_more = page.has_more;
+        let next_after = page.next_after;
+        repaired.extend(page.messages);
+
+        // Continue only when the server proved there is more *and* the cursor
+        // actually advanced; a non-advancing cursor would loop forever.
+        match (has_more, next_after) {
+            (true, Some(next)) if next > cursor => cursor = next,
+            _ => break,
+        }
+    }
+
+    repaired
+}
+
 /// Connect a real WebSocket as the given access token.
 pub async fn connect_socket(ws_url: &str, token: &str) -> TestSocket {
     let url = format!("{ws_url}?token={token}");
@@ -277,6 +338,15 @@ pub async fn expect_rejection(socket: &mut TestSocket) -> MessageRejected {
     loop {
         if let ServerEvent::MessageRejected(rejection) = next_event(socket).await {
             return rejection;
+        }
+    }
+}
+
+/// Read until the next resync answer arrives, ignoring chat events and heartbeats.
+pub async fn expect_resync(socket: &mut TestSocket) -> Resync {
+    loop {
+        if let ServerEvent::Resync(resync) = next_event(socket).await {
+            return resync;
         }
     }
 }

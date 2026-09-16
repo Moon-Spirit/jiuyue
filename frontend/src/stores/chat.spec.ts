@@ -454,4 +454,122 @@ describe("useChatStore", () => {
       peer_username: "Bob",
     });
   });
+
+  it("repairs forward from its cursor when the server asks for a resync", async () => {
+    const route = messagesRoute();
+    stubFetch({
+      "/api/conversations/direct": [() => jsonResponse(conversationPayload())],
+      [route]: [
+        () =>
+          jsonResponse({
+            messages: [
+              messagePayload({ id: "M1", client_msg_id: "k1", seq: 1 }),
+            ],
+            next_before: null,
+            next_after: null,
+            has_more: false,
+          }),
+      ],
+      "/api/conversations": [
+        () => jsonResponse({ conversations: [conversationPayload()] }),
+      ],
+      [`${route}?after=1&limit=100`]: [
+        () =>
+          jsonResponse({
+            messages: [
+              messagePayload({ id: "M2", client_msg_id: "k2", seq: 2 }),
+              messagePayload({ id: "M3", client_msg_id: "k3", seq: 3 }),
+            ],
+            next_before: null,
+            next_after: null,
+            has_more: false,
+          }),
+      ],
+    });
+
+    const store = useChatStore();
+    await store.startDirect("bob");
+    expect(store.messages.map((message) => message.seq)).toEqual([1]);
+
+    const socket = openSocket();
+    // The server says the position is unavailable: repair each Conversation.
+    socket.emitMessage(
+      envelope(1, { t: "Resync", d: { reason: "unavailable", replayed: 0 } }),
+    );
+
+    await vi.waitFor(() => {
+      expect(store.messages.map((message) => message.seq)).toEqual([1, 2, 3]);
+    });
+    expect(store.messages.every((message) => message.state === "sent")).toBe(
+      true,
+    );
+  });
+
+  it("applies a duplicate delivery by Message ID without duplicating the bubble", async () => {
+    const store = await openedStore();
+    const socket = openSocket();
+
+    const payload = messagePayload({ id: "M2", client_msg_id: "k2", seq: 2 });
+    // At-least-once delivery: the same Message may arrive twice.
+    socket.emitMessage(newMessageEnvelope(payload));
+    socket.emitMessage(newMessageEnvelope(payload));
+
+    expect(store.messages.map((message) => message.seq)).toEqual([2]);
+    expect(store.messages).toHaveLength(1);
+  });
+
+  it("detects a conversation-level gap and repairs it to an exact set", async () => {
+    const route = messagesRoute();
+    stubFetch({
+      "/api/conversations/direct": [() => jsonResponse(conversationPayload())],
+      [route]: [
+        () =>
+          jsonResponse({
+            messages: [
+              messagePayload({ id: "M1", client_msg_id: "k1", seq: 1 }),
+            ],
+            next_before: null,
+            next_after: null,
+            has_more: false,
+          }),
+      ],
+      "/api/conversations": [
+        () => jsonResponse({ conversations: [conversationPayload()] }),
+      ],
+      [`${route}?after=1&limit=100`]: [
+        () =>
+          jsonResponse({
+            messages: [
+              messagePayload({ id: "M2", client_msg_id: "k2", seq: 2 }),
+              messagePayload({ id: "M3", client_msg_id: "k3", seq: 3 }),
+              messagePayload({ id: "M4", client_msg_id: "k4", seq: 4 }),
+            ],
+            next_before: null,
+            next_after: null,
+            has_more: false,
+          }),
+      ],
+    });
+
+    const store = useChatStore();
+    await store.startDirect("bob");
+    const socket = openSocket();
+
+    // seq 4 arrives while 2 and 3 are missing: the store must pull them forward.
+    socket.emitMessage(
+      envelope(2, {
+        t: "NewMessage",
+        d: {
+          message: messagePayload({ id: "M4", client_msg_id: "k4", seq: 4 }),
+        },
+      }),
+    );
+
+    await vi.waitFor(() => {
+      expect(store.messages.map((message) => message.seq)).toEqual([
+        1, 2, 3, 4,
+      ]);
+    });
+    expect(store.messages).toHaveLength(4);
+  });
 });

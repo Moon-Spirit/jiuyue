@@ -1,14 +1,21 @@
 //! jiuyue realtime gateway.
 //!
 //! This crate owns the WebSocket transport: the upgrade handshake configuration,
-//! framing limits, per-connection sequence assignment, a bounded send path, and
-//! the [`ConnectionRegistry`] that fans an event out to every live Device of a
-//! User. It is mounted by `jiuyue-server` as one route and stays free of HTTP
-//! routing.
+//! framing limits, per-connection sequence assignment, a bounded send path, the
+//! connection-level replay buffer, and the [`ConnectionRegistry`] that fans an
+//! event out to every live Device of a User. It is mounted by `jiuyue-server` as
+//! one route and stays free of HTTP routing.
 //!
 //! Keeping realtime out of `jiuyue-server` (rather than a `ws.rs` module inside
-//! it) matches the module split in the product spec 鈥?the realtime gateway is its
-//! own domain 鈥?and lets the transport evolve independently of HTTP routing.
+//! it) matches the module split in the product spec — the realtime gateway is its
+//! own domain — and lets the transport evolve independently of HTTP routing.
+//!
+//! # Module layout
+//!
+//! - `registry` — user to live connections, and the bounded fan-out path.
+//! - `replay` — the bounded per-connection replay buffer.
+//! - `connection` — one socket's lifecycle, sequencing and resume handshake.
+//! - this module — the hub, the framing limits and the shared error vocabulary.
 //!
 //! # Authentication
 //!
@@ -30,25 +37,44 @@
 //! `s` on the envelope is the **connection** sequence (gap detection and replay,
 //! ADR-0003). A Message's `seq` is the **conversation** sequence, allocated by
 //! `jiuyue-chat`. This module owns the former and merely transports the latter.
+//!
+//! # Reconnection and repair (the "wake up and re-sync" handshake)
+//!
+//! A half-open TCP connection looks identical to a healthy one without periodic
+//! traffic, so the connection emits a `ServerEvent::Ping` every
+//! [`RealtimeHub::heartbeat_interval`] and the client reconnects when one is
+//! overdue. When a client (re)connects, or notices a hole in `s`, it sends
+//! `ClientEvent::Resume` naming the highest `s` it consumed. The server answers
+//! with `ServerEvent::Resync`, and the reason is one of:
+//!
+//! - `ResyncReason::Fresh` — a brand-new connection; nothing was missed here.
+//! - `ResyncReason::Replayed` — the missed envelopes were still in this
+//!   connection's bounded [`ReplayBuffer`] and were re-sent before the answer.
+//! - `ResyncReason::Unavailable` — the buffer cannot fill the hole (a new
+//!   connection, or an evicted position). The client repairs each Conversation it
+//!   holds by pulling everything after its own **conversation** cursor over REST.
+//!
+//! Delivery is therefore **at-least-once**: a replay may re-send an envelope, so
+//! clients must key on Message ID and apply duplicates harmlessly. That is
+//! deliberate — exactly-once is not attempted, and duplicates are the price of
+//! never losing a Message.
 
 #![forbid(unsafe_code)]
 
+mod connection;
 mod registry;
+mod replay;
+mod session;
 
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
-use axum::extract::ws::{Message, WebSocket};
-use futures_util::{SinkExt, StreamExt};
 use jiuyue_chat::ChatService;
-use jiuyue_contract::{
-    ClientEnvelope, ClientEvent, MessageAck, MessageRejected, NewMessage, Ping, ServerEnvelope,
-    ServerEvent,
-};
 use thiserror::Error;
-use tokio::sync::mpsc;
 
+pub use connection::serve_connection;
 pub use registry::{ConnectionId, ConnectionRegistry};
+pub use replay::{DEFAULT_REPLAY_CAPACITY, ReplayBuffer};
 
 /// Hard cap on a single WebSocket frame (64 KiB).
 ///
@@ -71,10 +97,15 @@ pub const SEND_QUEUE_CAPACITY: usize = 64;
 /// Bound on the per-connection control queue, in events.
 ///
 /// The registry fans out through this queue with `try_send` only, so its size is
-/// the per-client memory ceiling for undelivered fan-out.
+/// the per-client memory ceiling for undelivered fan-out. A full queue drops the
+/// event, which is safe because the connection-level replay buffer and the
+/// Conversation cursor repair both exist to recover it.
 pub const CONTROL_QUEUE_CAPACITY: usize = 64;
 
-/// Interval between server-initiated heartbeats.
+/// Default interval between server-initiated heartbeats.
+///
+/// The opening heartbeat fires on connect; this is the period of the ones after
+/// it. It is the wall-clock evidence a client uses to notice a half-open socket.
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Failures raised while serving a realtime connection.
@@ -97,18 +128,41 @@ pub enum RealtimeError {
 ///
 /// One hub per process: it owns the connection registry and the chat service, so a
 /// connection can persist a Message and fan it out without reaching into either
-/// domain's internals.
+/// domain's internals. It also carries the two tunables the socket loop reads —
+/// the heartbeat period and the replay-buffer capacity — so tests can pin them
+/// without touching global state.
 pub struct RealtimeHub {
     registry: ConnectionRegistry,
     chat: Arc<ChatService>,
+    heartbeat_interval: Duration,
+    replay_capacity: usize,
 }
 
 impl RealtimeHub {
-    /// Build a hub over the chat service.
+    /// Build a hub over the chat service, with the production defaults.
     pub fn new(chat: Arc<ChatService>) -> Self {
         Self {
             registry: ConnectionRegistry::new(),
             chat,
+            heartbeat_interval: HEARTBEAT_INTERVAL,
+            replay_capacity: DEFAULT_REPLAY_CAPACITY,
+        }
+    }
+
+    /// Build a hub with an explicit heartbeat period and replay capacity.
+    ///
+    /// Exists so tests can exercise the heartbeat and buffer eviction with
+    /// milliseconds instead of seconds, without weakening the production values.
+    pub fn with_settings(
+        chat: Arc<ChatService>,
+        heartbeat_interval: Duration,
+        replay_capacity: usize,
+    ) -> Self {
+        Self {
+            registry: ConnectionRegistry::new(),
+            chat,
+            heartbeat_interval,
+            replay_capacity,
         }
     }
 
@@ -121,218 +175,14 @@ impl RealtimeHub {
     pub fn chat(&self) -> &ChatService {
         &self.chat
     }
-}
 
-/// Serve one authenticated connection, logging (not panicking) on failure.
-///
-/// `user_id` must come from a verified access token; this function never sees the
-/// token itself.
-pub async fn serve_connection(socket: WebSocket, user_id: String, hub: Arc<RealtimeHub>) {
-    if let Err(error) = run_connection(socket, user_id, hub).await {
-        tracing::debug!(%error, "realtime connection ended");
-    }
-}
-
-/// Assign the connection sequence, push the opening heartbeat, then pump frames
-/// and fanned-out events until the socket closes.
-async fn run_connection(
-    socket: WebSocket,
-    user_id: String,
-    hub: Arc<RealtimeHub>,
-) -> Result<(), RealtimeError> {
-    let (mut sink, mut stream) = socket.split();
-    let (envelope_tx, mut envelope_rx) = mpsc::channel::<ServerEnvelope>(SEND_QUEUE_CAPACITY);
-
-    // Writer task: drains the bounded queue onto the socket and closes the sink
-    // when the connection ends. Holding the sink here leaves the read side free.
-    let writer = tokio::spawn(async move {
-        while let Some(envelope) = envelope_rx.recv().await {
-            let text = match serde_json::to_string(&envelope) {
-                Ok(text) => text,
-                Err(error) => {
-                    tracing::error!(%error, "failed to encode a server envelope");
-                    continue;
-                }
-            };
-            if sink.send(Message::Text(text.into())).await.is_err() {
-                break;
-            }
-        }
-        let _ = sink.close().await;
-    });
-
-    // The registry holds the only control sender: fan-out reaches this connection
-    // through the same bounded queue as any other Device of this User.
-    let (control_tx, mut control_rx) = mpsc::channel::<ServerEvent>(CONTROL_QUEUE_CAPACITY);
-    let connection_id = hub.registry.register(user_id.clone(), control_tx).await;
-
-    let mut sequence = 0_u64;
-    enqueue_ping(&envelope_tx, &mut sequence).await?;
-
-    let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
-    // The first interval tick is immediate; the opening heartbeat already fired.
-    heartbeat.tick().await;
-
-    loop {
-        tokio::select! {
-            _ = heartbeat.tick() => {
-                if enqueue_ping(&envelope_tx, &mut sequence).await.is_err() {
-                    break;
-                }
-            }
-            incoming = control_rx.recv() => match incoming {
-                Some(event) => {
-                    if enqueue(&envelope_tx, &mut sequence, event).await.is_err() {
-                        break;
-                    }
-                }
-                // The registry dropped the sender: this connection is over.
-                None => break,
-            },
-            frame = stream.next() => match frame {
-                Some(Ok(Message::Text(text))) => {
-                    if handle_client_frame(
-                        text.as_str(),
-                        &user_id,
-                        &hub,
-                        &envelope_tx,
-                        &mut sequence,
-                    )
-                    .await
-                    .is_err()
-                    {
-                        break;
-                    }
-                }
-                Some(Ok(Message::Close(_))) | None => break,
-                Some(Ok(_)) => {}
-                Some(Err(error)) => {
-                    tracing::debug!(%error, "realtime receive error");
-                    break;
-                }
-            },
-        }
+    /// Period between server-initiated heartbeats.
+    pub fn heartbeat_interval(&self) -> Duration {
+        self.heartbeat_interval
     }
 
-    hub.registry.unregister(&user_id, connection_id).await;
-
-    // Dropping the sender ends the writer task; awaiting it lets the close frame
-    // flush before the connection is torn down.
-    drop(envelope_tx);
-    let _ = writer.await;
-
-    Ok(())
-}
-
-/// Handle one decoded client frame.
-///
-/// An unparseable frame is logged and ignored rather than dropping the connection
-/// 鈥?a client bug must not cost the user their session. A `SendMessage` is
-/// persisted inline: a connection processes its own sends in order, and the
-/// database call is bounded by the pool's acquire timeout, so one user's send
-/// cannot stall another's.
-async fn handle_client_frame(
-    text: &str,
-    user_id: &str,
-    hub: &RealtimeHub,
-    envelope_tx: &mpsc::Sender<ServerEnvelope>,
-    sequence: &mut u64,
-) -> Result<(), RealtimeError> {
-    let envelope = match serde_json::from_str::<ClientEnvelope>(text) {
-        Ok(envelope) => envelope,
-        Err(error) => {
-            tracing::debug!(%error, "ignoring an undecodable client frame");
-            return Ok(());
-        }
-    };
-
-    match envelope.event() {
-        ClientEvent::Ping(ping) => {
-            tracing::trace!(seq = ping.seq, time_ms = ping.time_ms, "client heartbeat");
-        }
-        ClientEvent::SendMessage(send) => {
-            let reply = match hub.chat.send_message(user_id, send.clone()).await {
-                Ok(sent) => {
-                    // Fan out only when this call actually wrote the Message. A
-                    // replayed Client Message ID (or the loser of a race between
-                    // two identical sends) must be a no-op on the wire: everyone
-                    // still gets exactly one NewMessage for the Message, and the
-                    // sender alone still gets its ack 鈥?which may be the only
-                    // reason it retried in the first place.
-                    if sent.created {
-                        hub.registry
-                            .deliver(
-                                &sent.participants,
-                                &ServerEvent::NewMessage(NewMessage {
-                                    message: sent.message.clone(),
-                                }),
-                            )
-                            .await;
-                    }
-
-                    ServerEvent::MessageAck(MessageAck {
-                        client_msg_id: send.client_msg_id.clone(),
-                        message: sent.message,
-                    })
-                }
-                Err(error) => {
-                    tracing::debug!(%error, "rejected a message send");
-                    ServerEvent::MessageRejected(MessageRejected {
-                        client_msg_id: send.client_msg_id.clone(),
-                        code: error.code(),
-                        message: error.message().to_owned(),
-                    })
-                }
-            };
-
-            enqueue(envelope_tx, sequence, reply).await?;
-        }
+    /// How many recent envelopes each connection retains for replay.
+    pub fn replay_capacity(&self) -> usize {
+        self.replay_capacity
     }
-
-    Ok(())
-}
-
-/// Increment the per-connection sequence and enqueue an event as an envelope.
-async fn enqueue(
-    envelope_tx: &mpsc::Sender<ServerEnvelope>,
-    sequence: &mut u64,
-    event: ServerEvent,
-) -> Result<(), RealtimeError> {
-    *sequence += 1;
-
-    let envelope = ServerEnvelope::new(*sequence, now_ms()?, event);
-    envelope_tx
-        .send(envelope)
-        .await
-        .map_err(|_| RealtimeError::Closed)
-}
-
-/// Increment the per-connection sequence and enqueue a heartbeat envelope whose
-/// payload carries the same sequence the envelope does.
-async fn enqueue_ping(
-    envelope_tx: &mpsc::Sender<ServerEnvelope>,
-    sequence: &mut u64,
-) -> Result<(), RealtimeError> {
-    *sequence += 1;
-
-    let time_ms = now_ms()?;
-    let envelope = ServerEnvelope::new(
-        *sequence,
-        time_ms,
-        ServerEvent::Ping(Ping {
-            seq: *sequence,
-            time_ms,
-        }),
-    );
-
-    envelope_tx
-        .send(envelope)
-        .await
-        .map_err(|_| RealtimeError::Closed)
-}
-
-/// Current wall-clock time as milliseconds since the Unix epoch.
-fn now_ms() -> Result<i64, RealtimeError> {
-    let elapsed = SystemTime::now().duration_since(UNIX_EPOCH)?;
-    i64::try_from(elapsed.as_millis()).map_err(|_| RealtimeError::ClockRange)
 }

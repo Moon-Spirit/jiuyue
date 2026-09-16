@@ -14,7 +14,19 @@
  *
  * Reconnection is built in, not bolted on: reloading a reverse proxy (Caddy)
  * forcibly drops every WebSocket, so the client must re-establish the connection
- * on its own.
+ * on its own. Three things make that robust rather than naive:
+ *
+ * - **Exponential backoff with jitter.** A Caddy reload drops every socket at
+ *   once, so a fixed delay would produce a thundering herd. Each attempt waits
+ *   `initial * factor ** attempt`, capped at `maxDelayMs`, minus a random slice
+ *   bounded by {@link ReconnectPolicy.jitter}.
+ * - **Immediate retry on `online` / visibility change.** When the platform says
+ *   the network is back or the tab is visible again, the backoff is abandoned and
+ *   a connection is attempted at once.
+ * - **A staleness watchdog.** A half-open TCP connection looks healthy, so if no
+ *   envelope arrives within {@link RealtimeOptions.staleAfterMs} the socket is
+ *   closed and the reconnect path takes over. The server's periodic heartbeat is
+ *   what keeps a healthy connection from tripping it.
  */
 
 import type { ClientEnvelope } from "../generated/ClientEnvelope";
@@ -42,6 +54,13 @@ export interface ReconnectPolicy {
   readonly initialDelayMs: number;
   readonly maxDelayMs: number;
   readonly factor: number;
+  /**
+   * Fraction of each delay that jitter may remove, in `[0, 1]`.
+   *
+   * `0.5` (the default) shortens a delay by up to half, so a synchronized herd
+   * spreads out instead of reconnecting in lockstep.
+   */
+  readonly jitter: number;
 }
 
 /** Callbacks the socket drives. */
@@ -59,13 +78,46 @@ export interface RealtimeOptions {
   readonly token: TokenProvider;
   /** Backoff overrides, mainly for tests. */
   readonly policy?: Partial<ReconnectPolicy>;
+  /**
+   * Reconnect when no envelope arrives within this many milliseconds. `0`
+   * disables the watchdog. Defaults to two-and-a-half server heartbeat periods.
+   */
+  readonly staleAfterMs?: number;
+  /** Randomness source for jitter, so tests can pin the bounds deterministically. */
+  readonly random?: () => number;
 }
 
-const DEFAULT_POLICY: ReconnectPolicy = {
+/** Production backoff: 0.5 s doubling to a 30 s ceiling, half of it jittered away. */
+export const DEFAULT_RECONNECT_POLICY: ReconnectPolicy = {
   initialDelayMs: 500,
   maxDelayMs: 30_000,
   factor: 2,
+  jitter: 0.5,
 };
+
+/** Server heartbeat is every 30 s; two missed beats plus slack is a dead link. */
+export const DEFAULT_STALE_AFTER_MS = 75_000;
+
+/**
+ * The backoff delay before reconnect attempt number `attempt` (zero-based).
+ *
+ * Pure and injectable, so the bounds are a unit-testable property rather than a
+ * behaviour inferred from timers: `delay ∈ [raw * (1 - jitter), raw]`, where
+ * `raw = min(maxDelayMs, initialDelayMs * factor ** attempt)`. Jitter is
+ * *subtractive*, so the ceiling is never exceeded and the delay is never negative.
+ */
+export function reconnectDelay(
+  policy: ReconnectPolicy,
+  attempt: number,
+  random: () => number,
+): number {
+  const exponential = Math.min(
+    policy.maxDelayMs,
+    policy.initialDelayMs * policy.factor ** attempt,
+  );
+  const jittered = exponential * (1 - policy.jitter * random());
+  return Math.round(Math.max(0, jittered));
+}
 
 /** Same-origin URL of the realtime endpoint, carrying the access token. */
 export function realtimeUrl(token: string | null): string {
@@ -118,16 +170,33 @@ function isServerEnvelope(value: unknown): value is ServerEnvelope {
 export class RealtimeSocket {
   private socket: WebSocket | null = null;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private staleTimer: ReturnType<typeof setTimeout> | null = null;
   private attempt = 0;
   private closedByUser = false;
+  private lifecycleAttached = false;
   private readonly policy: ReconnectPolicy;
+  private readonly staleAfterMs: number;
+  private readonly random: () => number;
   private readonly handlers: SocketHandlers;
   private readonly options: RealtimeOptions;
+
+  /** Bound so it can be added to and removed from `window` / `document`. */
+  private readonly onOnline = (): void => {
+    this.retryNow();
+  };
+
+  /** Bound so it can be added to and removed from `window` / `document`. */
+  private readonly onVisibilityChange = (): void => {
+    if (typeof document !== "undefined" && document.hidden) return;
+    this.retryNow();
+  };
 
   constructor(handlers: SocketHandlers, options: RealtimeOptions) {
     this.handlers = handlers;
     this.options = options;
-    this.policy = { ...DEFAULT_POLICY, ...options.policy };
+    this.policy = { ...DEFAULT_RECONNECT_POLICY, ...options.policy };
+    this.staleAfterMs = options.staleAfterMs ?? DEFAULT_STALE_AFTER_MS;
+    this.random = options.random ?? Math.random;
   }
 
   /** Open the socket, or the first reconnect attempt. Idempotent. */
@@ -149,8 +218,13 @@ export class RealtimeSocket {
   close(): void {
     this.closedByUser = true;
     this.clearReconnect();
-    this.socket?.close();
+    this.clearStaleness();
+    this.detachLifecycle();
+
+    const socket = this.socket;
     this.socket = null;
+    socket?.close();
+
     this.handlers.onStatus("closed");
   }
 
@@ -182,42 +256,55 @@ export class RealtimeSocket {
       return;
     }
 
+    this.attachLifecycle();
     this.handlers.onStatus(this.attempt === 0 ? "connecting" : "reconnecting");
 
     const socket = new WebSocket(realtimeUrl(token));
     this.socket = socket;
 
     socket.onopen = () => {
+      // Only this socket may reset the attempt counter; a late event from a
+      // superseded socket must not corrupt the backoff of the live one.
+      if (this.socket !== socket) return;
       this.attempt = 0;
       this.handlers.onStatus("open");
+      this.armStaleness();
     };
 
     socket.onmessage = (event: MessageEvent) => {
+      if (this.socket !== socket) return;
+      // Any frame proves the link is alive, so the watchdog is re-armed before
+      // parsing: a malformed frame still means the transport works.
+      this.armStaleness();
+
       if (typeof event.data !== "string") return;
       const envelope = parseServerEnvelope(event.data);
       if (envelope !== null) this.handlers.onEnvelope(envelope);
     };
 
     // A failing socket always emits `onclose` afterwards, which schedules the
-    // reconnect, so no separate `onerror` handling is needed.
+    // reconnect, so no separate `onerror` handling is needed. A superseded socket
+    // closing late is ignored outright: otherwise it would schedule a reconnect on
+    // top of the healthy socket that replaced it.
     socket.onclose = () => {
+      if (this.socket !== socket) return;
       this.socket = null;
+      this.clearStaleness();
       if (this.closedByUser) return;
       this.scheduleReconnect();
     };
   }
 
   private scheduleReconnect(): void {
+    this.clearReconnect();
     this.handlers.onStatus("reconnecting");
 
-    const delay = Math.min(
-      this.policy.maxDelayMs,
-      this.policy.initialDelayMs * this.policy.factor ** this.attempt,
-    );
+    const delay = this.nextDelay();
     this.attempt += 1;
 
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;
+      if (this.closedByUser) return;
       if (this.token() === null) {
         this.handlers.onStatus("idle");
         return;
@@ -226,9 +313,98 @@ export class RealtimeSocket {
     }, delay);
   }
 
+  /** The next backoff delay for the current attempt. */
+  private nextDelay(): number {
+    return reconnectDelay(this.policy, this.attempt, this.random);
+  }
+
+  /**
+   * Retry at once, abandoning the backoff.
+   *
+   * Driven by `online` and by the tab becoming visible: the platform has told us
+   * the reason we were waiting is gone, so waiting longer only delays recovery.
+   */
+  private retryNow(): void {
+    if (this.closedByUser) return;
+    if (this.socket !== null) return; // a connection is already live or in flight
+
+    this.clearReconnect();
+    this.attempt = 0;
+
+    if (this.token() === null) {
+      this.handlers.onStatus("idle");
+      return;
+    }
+
+    this.open();
+  }
+
+  /** Start (or restart) the staleness watchdog for the live socket. */
+  private armStaleness(): void {
+    this.clearStaleness();
+    if (this.staleAfterMs <= 0) return;
+
+    this.staleTimer = setTimeout(() => {
+      this.staleTimer = null;
+      this.reconnectAfterStall();
+    }, this.staleAfterMs);
+  }
+
+  /** A half-open link: tear the socket down and let the reconnect path run. */
+  private reconnectAfterStall(): void {
+    const socket = this.socket;
+    if (socket === null) return;
+    // Closing triggers `onclose`, which schedules the reconnect with backoff.
+    socket.close();
+  }
+
   private clearReconnect(): void {
     if (this.reconnectTimer === null) return;
     clearTimeout(this.reconnectTimer);
     this.reconnectTimer = null;
+  }
+
+  private clearStaleness(): void {
+    if (this.staleTimer === null) return;
+    clearTimeout(this.staleTimer);
+    this.staleTimer = null;
+  }
+
+  private attachLifecycle(): void {
+    if (this.lifecycleAttached) return;
+
+    if (
+      typeof window !== "undefined" &&
+      typeof window.addEventListener === "function"
+    ) {
+      window.addEventListener("online", this.onOnline);
+    }
+    if (
+      typeof document !== "undefined" &&
+      typeof document.addEventListener === "function"
+    ) {
+      document.addEventListener("visibilitychange", this.onVisibilityChange);
+    }
+
+    this.lifecycleAttached = true;
+  }
+
+  private detachLifecycle(): void {
+    if (!this.lifecycleAttached) return;
+
+    if (
+      typeof window !== "undefined" &&
+      typeof window.removeEventListener === "function"
+    ) {
+      window.removeEventListener("online", this.onOnline);
+    }
+    if (
+      typeof document !== "undefined" &&
+      typeof document.removeEventListener === "function"
+    ) {
+      document.removeEventListener("visibilitychange", this.onVisibilityChange);
+    }
+
+    this.lifecycleAttached = false;
   }
 }

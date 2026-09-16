@@ -1,0 +1,46 @@
+# jiuyue backup — native systemd oneshot. No containers anywhere (ADR-0010).
+#
+# Installed to /etc/systemd/system/jiuyue-backup.service by deploy/provision.sh,
+# which also installs the scripts to /usr/local/lib/jiuyue/.
+#
+# The job produces one encrypted, verified backup set (PostgreSQL + the file
+# store, see ADR-0006) and uploads it. It is deliberately NOT `Restart=always`:
+# a failing backup must stay failed and visible (`systemctl --failed`,
+# `journalctl -u jiuyue-backup`) rather than silently loop. The heartbeat ping in
+# backup.sh is the primary alert; a failed unit is the second signal.
+#
+# Configuration and the heartbeat URL come from /etc/jiuyue/backup.env.
+#
+# This unit is validated on every push by .github/workflows/backup-restore.yml
+# (`systemd-analyze verify`).
+
+[Unit]
+Description=jiuyue backup (PostgreSQL dump + file store, encrypted, uploaded)
+Documentation=https://github.com/Moon-Spirit/jiuyue/blob/main/docs/backup.md
+Wants=network-online.target postgresql.service
+After=network-online.target postgresql.service
+
+[Service]
+Type=oneshot
+# Root is required: /etc/jiuyue/backup_gpg_pass is 0600 root-only, and pg_dump
+# reads the production DSN. The job writes only under /var/backups.
+EnvironmentFile=/etc/jiuyue/backup.env
+ExecStart=/usr/local/lib/jiuyue/backup.sh
+
+# A backup must not compete with live traffic for CPU or disk. It may run long;
+# TimeoutStartSec is a backstop against a wedged network mount, not a target.
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=1800
+
+# --- hardening --------------------------------------------------------------
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=read-only
+# /usr, /boot, /efi and /etc become read-only; /var stays writable so the backup
+# directory works and /var/lib/jiuyue (the file store) can be read.
+ProtectSystem=full
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes

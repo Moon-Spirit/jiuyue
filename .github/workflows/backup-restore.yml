@@ -1,0 +1,334 @@
+# Backup and restore —— CI 证明备份真的能恢复（无容器，ADR-0010）
+#
+# 这个工作流接管 issue #42 的验收标准。它的存在只有一个理由：让
+# "restorable" 这个词有证据。备份脚本写完了但不恢复一次，那只是假设。
+#
+# 三个任务：
+#   lint          —— CRLF / bash -n / shellcheck / systemd-analyze / env 模板齐全
+#   restore-drill —— 造真数据 → 备份 → 销毁数据库和文件目录 → 从"远端"副本恢复
+#                    → 逐表逐字节比对。不通过就红。
+#   alerting      —— 让备份在坏 DATABASE_URL 下失败，断言心跳收到 status=down
+#
+# 不使用任何容器：PostgreSQL、gpg、python 都直接装在 runner 上，`services: {}`
+# 明确拒绝 service container。上传目标是一个本地目录（CI 没有 rclone 凭据）；
+# 真实对象存储的 rclone 路径因此是"未验证"的，见 docs/backup.md §未验证清单。
+#
+# 关键反-skip 设计：演练任务会断言日志里出现具体证据串（DESTROY / IDENTICAL /
+# OpenPGP / DRILL PASSED），并对心跳文件断言 status=up。任何一步被跳过、被注释、
+# 被 `if: false` 掉，这个任务都会失败——不允许"静默通过"。
+
+name: Backup and restore
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # 与 CI / Release 相同的原生 PostgreSQL 约定，不另造一套。
+  DRILL_DSN: postgres://jiuyue:jiuyue_dev_password@127.0.0.1:5432/jiuyue_drill
+  HEARTBEAT_PORT: "8099"
+
+jobs:
+  lint:
+    name: lint / CRLF / systemd / env 模板
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    services: {} # 不使用 service container（ADR-0010）
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: No CRLF line endings in the backup artifacts
+        run: |
+          set -euo pipefail
+          offenders="$(grep -rlI $'\r' deploy .github/workflows docs || true)"
+          if [ -n "$offenders" ]; then
+            echo "::error::CRLF line endings found (bash/systemd require LF):"
+            echo "$offenders"
+            exit 1
+          fi
+          echo "LF-only: OK"
+
+      - name: Install pinned shellcheck
+        run: |
+          set -euo pipefail
+          version=v0.11.0
+          curl -fsSL -o /tmp/shellcheck.tar.gz \
+            "https://github.com/koalaman/shellcheck/releases/download/${version}/shellcheck-${version}.linux.x86_64.tar.gz"
+          tar -xzf /tmp/shellcheck.tar.gz -C "$RUNNER_TEMP"
+          "$RUNNER_TEMP/shellcheck-${version}/shellcheck" --version
+
+      - name: Lint the backup and restore scripts
+        run: |
+          set -euo pipefail
+          bash -n deploy/backup.sh deploy/restore.sh deploy/restore-drill.sh deploy/provision.sh
+          "$RUNNER_TEMP/shellcheck-v0.11.0/shellcheck" --severity=warning \
+            deploy/backup.sh deploy/restore.sh deploy/restore-drill.sh deploy/provision.sh
+          echo "shell syntax and lint: OK"
+
+      - name: Verify the backup systemd units
+        run: |
+          set -euo pipefail
+          # `systemd-analyze verify` resolves ExecStart and EnvironmentFile, so
+          # stage them first — the same trick deploy-validate.yml uses.
+          sudo mkdir -p /usr/local/lib/jiuyue /etc/jiuyue
+          printf '#!/bin/sh\nexit 0\n' | sudo tee /usr/local/lib/jiuyue/backup.sh >/dev/null
+          sudo chmod 0755 /usr/local/lib/jiuyue/backup.sh
+          sudo touch /etc/jiuyue/backup.env
+          # The timer names the service, so both must be installed for `verify`
+          # to resolve the reference.
+          sudo cp deploy/systemd/jiuyue-backup.service /etc/systemd/system/jiuyue-backup.service
+          sudo cp deploy/systemd/jiuyue-backup.timer   /etc/systemd/system/jiuyue-backup.timer
+          sudo systemd-analyze verify /etc/systemd/system/jiuyue-backup.service
+          sudo systemd-analyze verify /etc/systemd/system/jiuyue-backup.timer
+          echo "systemd units verify: OK"
+
+      - name: Backup env template covers every variable the scripts read
+        run: |
+          set -euo pipefail
+          missing=0
+          for var in BACKUP_DIR BACKUP_REMOTE DATA_DIR ENV_FILE GPG_PASSPHRASE_FILE \
+                     BACKUP_KEEP_LOCAL_DAYS BACKUP_KEEP_REMOTE_DAYS HEARTBEAT_URL; do
+            if ! grep -qE "^${var}=" deploy/env/backup.env.example; then
+              echo "::error::deploy/env/backup.env.example is missing ${var}"
+              missing=1
+            fi
+          done
+          [ "$missing" -eq 0 ] || exit 1
+          if grep -qE '^[^#]*-----BEGIN' deploy/env/backup.env.example; then
+            echo "::error::deploy/env/backup.env.example looks like it contains a real key"
+            exit 1
+          fi
+          echo "backup env template: OK (placeholders only)"
+
+  restore-drill:
+    name: 恢复演练（备份 → 销毁 → 恢复 → 比对）
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    needs: lint
+    services: {} # 不使用 service container（ADR-0010）
+    env:
+      DRILL_DSN: postgres://jiuyue:jiuyue_dev_password@127.0.0.1:5432/jiuyue_drill
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: 安装 PostgreSQL 16（原生，非容器）
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y postgresql-16 postgresql-client-16
+          sudo systemctl start postgresql
+          sudo -u postgres psql -c "CREATE ROLE jiuyue LOGIN PASSWORD 'jiuyue_dev_password' SUPERUSER;"
+          sudo -u postgres psql -c "CREATE DATABASE jiuyue_drill OWNER jiuyue;"
+          pg_isready -h 127.0.0.1 -p 5432
+
+      - name: 施加迁移（后端二进制内嵌的同一批 SQL）
+        run: |
+          set -euo pipefail
+          # 直接跑迁移文件而不是编译后端：这个工作流只关心备份/恢复，
+          # 二进制内嵌迁移器由 CI 的 backend 任务负责。
+          for f in backend/migrations/*.sql; do
+            echo "applying ${f}"
+            psql "$DRILL_DSN" -v ON_ERROR_STOP=1 -q -f "$f"
+          done
+          psql "$DRILL_DSN" -c "\dt"
+
+      - name: 造真数据（用户 / 会话 / 会话参与者 / 消息）
+        run: |
+          set -euo pipefail
+          psql "$DRILL_DSN" -v ON_ERROR_STOP=1 -q <<'SQL'
+          INSERT INTO users (id, username, email, password_hash, display_name, email_verified_at) VALUES
+            ('01J8ZQ7K2M4N6P8R0T2V4X6Y8A','alice','alice@example.com','$argon2id$v=19$m=19456,t=2,p=1$FAKE$FAKE','Alice', now()),
+            ('01J8ZQ7K2M4N6P8R0T2V4X6Y8B','bob',  'bob@example.com',  '$argon2id$v=19$m=19456,t=2,p=1$FAKE$FAKE','Bob',   now()),
+            ('01J8ZQ7K2M4N6P8R0T2V4X6Y8C','carol','carol@example.com', NULL, 'Carol', NULL);
+
+          INSERT INTO sessions (id, user_id, refresh_token_hash, device_label, user_agent, expires_at, revoked_at) VALUES
+            ('01J8ZQ7K2M4N6P8R0T2V4X6Y8D','01J8ZQ7K2M4N6P8R0T2V4X6Y8A','1111111111111111111111111111111111111111111111111111111111111111','Chrome on Windows','Mozilla/5.0', now() + interval '30 days', NULL),
+            ('01J8ZQ7K2M4N6P8R0T2V4X6Y8E','01J8ZQ7K2M4N6P8R0T2V4X6Y8B','2222222222222222222222222222222222222222222222222222222222222222','Firefox on Linux','Mozilla/5.0', now() + interval '30 days', NULL),
+            ('01J8ZQ7K2M4N6P8R0T2V4X6Y8F','01J8ZQ7K2M4N6P8R0T2V4X6Y8C','3333333333333333333333333333333333333333333333333333333333333333','Safari on macOS',NULL, now() + interval '5 days', now());
+
+          INSERT INTO conversations (id, kind, direct_key, next_seq) VALUES
+            ('01J8ZQ7K2M4N6P8R0T2V4X6Y8G','direct','01J8ZQ7K2M4N6P8R0T2V4X6Y8A:01J8ZQ7K2M4N6P8R0T2V4X6Y8B',3),
+            ('01J8ZQ7K2M4N6P8R0T2V4X6Y8H','group', NULL, 2);
+
+          INSERT INTO conversation_members (conversation_id, user_id) VALUES
+            ('01J8ZQ7K2M4N6P8R0T2V4X6Y8G','01J8ZQ7K2M4N6P8R0T2V4X6Y8A'),
+            ('01J8ZQ7K2M4N6P8R0T2V4X6Y8G','01J8ZQ7K2M4N6P8R0T2V4X6Y8B'),
+            ('01J8ZQ7K2M4N6P8R0T2V4X6Y8H','01J8ZQ7K2M4N6P8R0T2V4X6Y8A'),
+            ('01J8ZQ7K2M4N6P8R0T2V4X6Y8H','01J8ZQ7K2M4N6P8R0T2V4X6Y8B'),
+            ('01J8ZQ7K2M4N6P8R0T2V4X6Y8H','01J8ZQ7K2M4N6P8R0T2V4X6Y8C');
+
+          INSERT INTO messages (id, conversation_id, seq, sender_id, client_msg_id, body) VALUES
+            ('01J8ZQ7K2M4N6P8R0T2V4X6Y8J','01J8ZQ7K2M4N6P8R0T2V4X6Y8G',1,'01J8ZQ7K2M4N6P8R0T2V4X6Y8A','cmid-1','drill message 1'),
+            ('01J8ZQ7K2M4N6P8R0T2V4X6Y8K','01J8ZQ7K2M4N6P8R0T2V4X6Y8G',2,'01J8ZQ7K2M4N6P8R0T2V4X6Y8B','cmid-2','drill message 2 — with a dash'),
+            ('01J8ZQ7K2M4N6P8R0T2V4X6Y8M','01J8ZQ7K2M4N6P8R0T2V4X6Y8G',3,'01J8ZQ7K2M4N6P8R0T2V4X6Y8A','cmid-3','你好，九月 🎉 drill message 3 (UTF-8 round-trip)'),
+            ('01J8ZQ7K2M4N6P8R0T2V4X6Y8N','01J8ZQ7K2M4N6P8R0T2V4X6Y8H',1,'01J8ZQ7K2M4N6P8R0T2V4X6Y8C','cmid-4','group drill message 1'),
+            ('01J8ZQ7K2M4N6P8R0T2V4X6Y8P','01J8ZQ7K2M4N6P8R0T2V4X6Y8H',2,'01J8ZQ7K2M4N6P8R0T2V4X6Y8B','cmid-5','group drill message 2');
+          SQL
+          echo "--- seeded row counts ---"
+          psql "$DRILL_DSN" -tA -c "SELECT 'users='||count(*) FROM users UNION ALL SELECT 'sessions='||count(*) FROM sessions UNION ALL SELECT 'conversations='||count(*) FROM conversations UNION ALL SELECT 'members='||count(*) FROM conversation_members UNION ALL SELECT 'messages='||count(*) FROM messages"
+
+      - name: 造真文件（文件存储，ADR-0006）
+        run: |
+          set -euo pipefail
+          root="${RUNNER_TEMP}/drill"
+          files="${root}/files"
+          mkdir -p "${files}/attachments/ab/cd" "${files}/avatars" "${files}/secret"
+          head -c 8192 /dev/urandom > "${files}/attachments/ab/cd/blob-1.bin"
+          head -c 4096 /dev/urandom > "${files}/attachments/ab/cd/blob-2.bin"
+          head -c 1024 /dev/urandom > "${files}/secret/opaque.key"
+          printf 'avatar-bytes\n' > "${files}/avatars/u1.png"
+          : > "${files}/avatars/empty.bin"                       # zero-byte file must survive
+          printf 'space in name\n' > "${files}/attachments/blob with spaces.bin"
+          echo "--- seeded file store ---"
+          find "${files}" -type f | sort
+          head -c 32 /dev/urandom | base64 > "${root}/pass"      # throwaway passphrase
+          chmod 600 "${root}/pass"
+
+      - name: 启动心跳捕获服务（代替 Uptime Kuma）
+        run: |
+          set -euo pipefail
+          root="${RUNNER_TEMP}/drill"
+          cat > "${root}/capture.py" <<'PY'
+          import http.server, socketserver, sys
+          port, out = int(sys.argv[1]), sys.argv[2]
+          class H(http.server.BaseHTTPRequestHandler):
+              def do_GET(self):
+                  with open(out, "a") as fh:
+                      fh.write(self.path + "\n")
+                  self.send_response(200); self.end_headers(); self.wfile.write(b"ok")
+              def log_message(self, *a):
+                  pass
+          socketserver.TCPServer.allow_reuse_address = True
+          with socketserver.TCPServer(("127.0.0.1", port), H) as httpd:
+              httpd.serve_forever()
+          PY
+          : > "${root}/heartbeat.txt"
+          nohup python3 "${root}/capture.py" "$HEARTBEAT_PORT" "${root}/heartbeat.txt" \
+            > "${root}/capture.log" 2>&1 &
+          for _ in $(seq 1 30); do
+            if curl -fsS --max-time 1 "http://127.0.0.1:${HEARTBEAT_PORT}/ready" >/dev/null 2>&1; then break; fi
+            sleep 0.5
+          done
+          : > "${root}/heartbeat.txt"   # discard the readiness probe
+          echo "heartbeat capture server is up on :${HEARTBEAT_PORT}"
+
+      - name: 演练：备份 → 销毁 → 从远端副本恢复 → 逐字节比对
+        env:
+          HEARTBEAT_URL: http://127.0.0.1:8099/api/push/drill
+        run: |
+          set -euo pipefail
+          root="${RUNNER_TEMP}/drill"
+          bash deploy/restore-drill.sh \
+            --dsn "$DRILL_DSN" \
+            --backup-dir "${root}/backups" \
+            --files-dir  "${root}/files" \
+            --remote     "${root}/backups/remote" \
+            --passphrase-file "${root}/pass" \
+            --work-dir   "${root}/work" \
+            --keep 2>&1 | tee "${root}/drill.log"
+
+      - name: 断言演练真的做了它声称的事（反静默跳过）
+        run: |
+          set -euo pipefail
+          root="${RUNNER_TEMP}/drill"
+          log="${root}/drill.log"
+          fail=0
+          check() { if grep -qF "$1" "$log"; then echo "  ok: $2"; else echo "::error::missing evidence: $2"; fail=1; fi; }
+          check "DESTROYING the database"              "the drill actually destroyed the data"
+          check "only ${root}/backups/remote remains"  "the local copies were purged before restore"
+          check "OpenPGP-encrypted"                    "artifacts are encrypted before upload"
+          check "database: IDENTICAL"                  "the restored database matches the original"
+          check "file store: IDENTICAL"                "the restored file store matches the original"
+          check "DRILL PASSED"                         "the drill reported success"
+          [ "$fail" -eq 0 ] || exit 1
+          echo "--- heartbeat after the drill (must be status=up) ---"
+          cat "${root}/heartbeat.txt"
+          grep -q 'status=up' "${root}/heartbeat.txt" \
+            || { echo "::error::no successful heartbeat was captured"; exit 1; }
+          echo "restore drill assertions: OK"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: restore-drill-log
+          path: ${{ runner.temp }}/drill/drill.log
+          if-no-files-found: warn
+
+  alerting:
+    name: 备份失败会告警（status=down）
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    needs: lint
+    services: {} # 不使用 service container（ADR-0010）
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: 安装客户端（真连线失败，而不是命令缺失）
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client-16
+
+      - name: 启动心跳捕获服务
+        run: |
+          set -euo pipefail
+          root="${RUNNER_TEMP}/alert"
+          mkdir -p "$root"
+          cat > "${root}/capture.py" <<'PY'
+          import http.server, socketserver, sys
+          port, out = int(sys.argv[1]), sys.argv[2]
+          class H(http.server.BaseHTTPRequestHandler):
+              def do_GET(self):
+                  with open(out, "a") as fh:
+                      fh.write(self.path + "\n")
+                  self.send_response(200); self.end_headers(); self.wfile.write(b"ok")
+              def log_message(self, *a):
+                  pass
+          socketserver.TCPServer.allow_reuse_address = True
+          with socketserver.TCPServer(("127.0.0.1", port), H) as httpd:
+              httpd.serve_forever()
+          PY
+          : > "${root}/heartbeat.txt"
+          nohup python3 "${root}/capture.py" 8098 "${root}/heartbeat.txt" > "${root}/capture.log" 2>&1 &
+          for _ in $(seq 1 30); do
+            if curl -fsS --max-time 1 "http://127.0.0.1:8098/ready" >/dev/null 2>&1; then break; fi
+            sleep 0.5
+          done
+          : > "${root}/heartbeat.txt"
+          echo "capture server up on :8098"
+
+      - name: 断言坏 DSN 导致非零退出，且心跳收到 status=down
+        env:
+          HEARTBEAT_URL: http://127.0.0.1:8098/api/push/alert
+        run: |
+          set -euo pipefail
+          root="${RUNNER_TEMP}/alert"
+          mkdir -p "${root}/backups" "${root}/remote" "${root}/files"
+          printf 'throwaway-pass\n' > "${root}/pass"
+          export BACKUP_DIR="${root}/backups"
+          export DATA_DIR="${root}/files"
+          export BACKUP_REMOTE="${root}/remote"
+          export GPG_PASSPHRASE_FILE="${root}/pass"
+          export ENV_FILE="${root}/no-such.env"
+          export BACKUP_LOCK=""
+          # A DSN that connects nowhere: pg_dump fails, backup.sh must fail, the
+          # EXIT trap must fire a down heartbeat.
+          export DATABASE_URL="postgres://nobody:nope@127.0.0.1:5999/nope"
+          if bash deploy/backup.sh; then
+            echo "::error::backup.sh exited 0 despite a broken DATABASE_URL"
+            exit 1
+          fi
+          echo "backup.sh failed as expected"
+          echo "--- captured heartbeats ---"
+          cat "${root}/heartbeat.txt"
+          grep -q 'status=down' "${root}/heartbeat.txt" \
+            || { echo "::error::a failed backup did not raise a down heartbeat"; exit 1; }
+          echo "failure alerting: OK"

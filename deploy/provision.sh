@@ -32,6 +32,8 @@ DATA_DIR="${DATA_DIR:-/var/lib/jiuyue}"
 APP_ROOT="${APP_ROOT:-/opt/jiuyue}"
 ENV_FILE="${ENV_FILE:-/etc/jiuyue/jiuyue.env}"
 CADDY_ENV_FILE="${CADDY_ENV_FILE:-/etc/jiuyue/caddy.env}"
+BACKUP_ENV_FILE="${BACKUP_ENV_FILE:-/etc/jiuyue/backup.env}"
+GPG_PASSPHRASE_FILE="${GPG_PASSPHRASE_FILE:-/etc/jiuyue/backup_gpg_pass}"
 SWAP_FILE="${SWAP_FILE:-/swapfile}"
 SWAP_SIZE_GB="${SWAP_SIZE_GB:-1}"
 
@@ -79,6 +81,12 @@ require_repo_assets() {
     "${SCRIPT_DIR}/env/jiuyue.env.example"
     "${SCRIPT_DIR}/Caddyfile"
     "${SCRIPT_DIR}/deploy.sh"
+    "${SCRIPT_DIR}/backup.sh"
+    "${SCRIPT_DIR}/restore.sh"
+    "${SCRIPT_DIR}/restore-drill.sh"
+    "${SCRIPT_DIR}/env/backup.env.example"
+    "${SCRIPT_DIR}/systemd/jiuyue-backup.service"
+    "${SCRIPT_DIR}/systemd/jiuyue-backup.timer"
   )
   local f
   for f in "${required[@]}"; do
@@ -108,7 +116,8 @@ install_packages() {
   apt-get update
   apt-get install -y \
     "postgresql-${PG_VERSION}" "postgresql-client-${PG_VERSION}" \
-    caddy curl ca-certificates openssl util-linux
+    caddy curl ca-certificates openssl util-linux \
+    gnupg rclone
 }
 
 ensure_user_and_dirs() {
@@ -225,6 +234,53 @@ install_systemd_units() {
   systemctl daemon-reload
 }
 
+# Backup configuration and the encryption passphrase. Neither is a secret that
+# belongs in git, and neither is ever echoed to the terminal.
+ensure_backup_config() {
+  install -d -m 0700 /var/backups/jiuyue
+  install -d -m 0755 /usr/local/lib/jiuyue
+
+  if [ -f "$BACKUP_ENV_FILE" ]; then
+    log "${BACKUP_ENV_FILE} exists; keeping it"
+  else
+    log "writing ${BACKUP_ENV_FILE} from the template"
+    install -m 0640 -o root -g root "${SCRIPT_DIR}/env/backup.env.example" "$BACKUP_ENV_FILE"
+  fi
+
+  if [ -f "$GPG_PASSPHRASE_FILE" ]; then
+    log "${GPG_PASSPHRASE_FILE} exists; keeping the existing passphrase"
+  else
+    log "generating the backup encryption passphrase at ${GPG_PASSPHRASE_FILE}"
+    ( umask 077; openssl rand -base64 48 > "$GPG_PASSPHRASE_FILE" )
+    chmod 0600 "$GPG_PASSPHRASE_FILE"
+    chown root:root "$GPG_PASSPHRASE_FILE"
+    log "ACTION REQUIRED: copy ${GPG_PASSPHRASE_FILE} into your password manager now."
+    log "It is the only way to read these backups; losing it loses the history."
+  fi
+
+  if grep -q 'REPLACE_WITH_PUSH_TOKEN' "$BACKUP_ENV_FILE"; then
+    log "NOTE: ${BACKUP_ENV_FILE} still has the HEARTBEAT_URL placeholder —"
+    log "      a failed backup will alert nobody until a push monitor URL is set."
+  fi
+}
+
+# The daily job: scripts to a stable path, units installed, timer enabled.
+install_backup_job() {
+  log "installing backup scripts and the daily timer"
+  install -m 0755 "${SCRIPT_DIR}/backup.sh" \
+                  "${SCRIPT_DIR}/restore.sh" \
+                  "${SCRIPT_DIR}/restore-drill.sh" /usr/local/lib/jiuyue/
+  install -m 0644 "${SCRIPT_DIR}/systemd/jiuyue-backup.service" \
+                  /etc/systemd/system/jiuyue-backup.service
+  install -m 0644 "${SCRIPT_DIR}/systemd/jiuyue-backup.timer" \
+                  /etc/systemd/system/jiuyue-backup.timer
+  systemctl daemon-reload
+  systemctl enable --now jiuyue-backup.timer
+  log "daily backup scheduled (OnCalendar=18:30 UTC = 02:30 Hong Kong)"
+  log "run one now, after filling in BACKUP_REMOTE and HEARTBEAT_URL in ${BACKUP_ENV_FILE}:"
+  log "  sudo systemctl start jiuyue-backup.service"
+}
+
 install_caddyfile() {
   install -d -m 0755 /etc/caddy
   install -m 0644 "${SCRIPT_DIR}/Caddyfile" /etc/caddy/Caddyfile
@@ -271,6 +327,8 @@ main() {
   write_env_file
   ensure_database
   install_systemd_units
+  ensure_backup_config
+  install_backup_job
   write_caddy_env
   install_caddyfile
   enable_services

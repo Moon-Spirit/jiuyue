@@ -101,6 +101,20 @@ const SELECT_MESSAGE_PAGE_LATEST: &str = "\
         ORDER BY seq DESC LIMIT $2 \
     ) AS page ORDER BY seq ASC";
 
+/// One page of history, walking forwards from an exclusive `seq` cursor.
+///
+/// This is the repair direction (ADR-0003): the **oldest** Messages with
+/// `seq > after`, ascending, so a client that holds everything up to a cursor can
+/// pull exactly what it missed. The same `(conversation_id, seq)` index serves it
+/// as an ascending range scan, and the `limit + 1` probe row answers "is there
+/// anything newer?" without a second query.
+const SELECT_MESSAGE_PAGE_AFTER: &str = "\
+    SELECT {columns} FROM ( \
+        SELECT {columns} FROM messages \
+        WHERE conversation_id = $1 AND seq > $2 \
+        ORDER BY seq ASC LIMIT $3 \
+    ) AS page ORDER BY seq ASC";
+
 /// Fill a page query's column list in, so the projection is stated once.
 fn page_query(template: &str) -> String {
     template.replace("{columns}", MESSAGE_COLUMNS)
@@ -410,6 +424,42 @@ impl ChatRepository {
         let has_more = messages.len() as i64 > limit;
         if has_more {
             messages.remove(0);
+        }
+
+        Ok((messages, has_more))
+    }
+
+    /// One forward page of a Conversation's history, oldest first.
+    ///
+    /// `after` is an exclusive Sequence Number cursor; this returns the oldest
+    /// `limit` Messages newer than it. Returns `(rows, has_more)` where `has_more`
+    /// means "newer Messages exist beyond this page" — the probe row is the newest
+    /// of the batch and is dropped, mirroring [`Self::list_message_page`].
+    ///
+    /// A cursor at or above the newest Message yields an empty page with
+    /// `has_more == false`: a client that is already caught up learns there is
+    /// nothing to repair, which is a normal answer rather than an error.
+    pub async fn list_message_page_after(
+        &self,
+        conversation_id: &str,
+        after: i64,
+        limit: i64,
+    ) -> Result<(Vec<MessageRow>, bool), ChatError> {
+        let probe = limit.saturating_add(1);
+
+        let rows = sqlx::query(&page_query(SELECT_MESSAGE_PAGE_AFTER))
+            .bind(conversation_id)
+            .bind(after)
+            .bind(probe)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(ChatError::Database)?;
+
+        let mut messages: Vec<MessageRow> = rows.iter().map(message_from_row).collect();
+        let has_more = messages.len() as i64 > limit;
+        if has_more {
+            // The probe row is the newest; drop it so the page is exactly `limit`.
+            messages.pop();
         }
 
         Ok((messages, has_more))

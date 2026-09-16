@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
 use crate::chat::{ConversationCreated, MessageAck, MessageRejected, NewMessage, SendMessage};
+use crate::sync::{Resume, Resync};
 
 /// Events the server pushes to a client.
 ///
@@ -31,6 +32,10 @@ pub enum ServerEvent {
     MessageRejected(MessageRejected),
     /// A Conversation this connection now participates in was created.
     ConversationCreated(ConversationCreated),
+    /// The server's answer to [`ClientEvent::Resume`]: whether the connection's
+    /// missed envelopes were replayed, or whether the client must repair
+    /// Conversations from its cursors (ADR-0003).
+    Resync(Resync),
 }
 
 /// Events a client sends to the server.
@@ -42,6 +47,8 @@ pub enum ClientEvent {
     Ping(Ping),
     /// Post a text Message into a Conversation.
     SendMessage(SendMessage),
+    /// Wake-up handshake after (re)connecting or noticing a gap in `s`.
+    Resume(Resume),
 }
 
 /// Heartbeat payload shared by both directions.
@@ -50,6 +57,14 @@ pub enum ClientEvent {
 /// can detect staleness, estimate clock skew and verify ordering from the event
 /// alone, without consulting transport metadata. This mirrors the Mattermost
 /// reliable-WebSocket ping event referenced by ADR-0003.
+///
+/// A **server** heartbeat also carries `connection_id`, the process-unique
+/// identity of the connection that sent it. The client echoes that id back in its
+/// [`crate::sync::Resume`] handshake, which is what lets the server tell "resume
+/// within this connection" (replayable) apart from "resume a position from a
+/// previous connection" (unprovable — repair Conversations). A **client**
+/// heartbeat leaves it `null`, because a client does not name a connection the
+/// server did not assign.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct Ping {
@@ -59,4 +74,9 @@ pub struct Ping {
     /// Originator wall-clock time, milliseconds since the Unix epoch.
     #[ts(type = "number")]
     pub time_ms: i64,
+    /// Identity of the connection this server heartbeat belongs to; `null` on a
+    /// client heartbeat.
+    #[serde(default)]
+    #[ts(type = "number | null")]
+    pub connection_id: Option<u64>,
 }

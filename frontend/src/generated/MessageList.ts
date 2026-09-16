@@ -5,22 +5,32 @@ import type { MessageView } from "./MessageView";
  * `GET /conversations/{id}/messages` response: one page of history.
  *
  * Ordering is explicit and deterministic: `messages` is always ascending by
- * `seq` (oldest first), whatever page was requested. Concatenating page N+1
- * (fetched with `before = next_before`) in front of page N reconstructs the
- * whole history with no duplicates and no gaps.
+ * `seq` (oldest first), whatever page was requested. Walked backwards,
+ * concatenating page N+1 (fetched with `before = next_before`) in front of page N
+ * reconstructs the whole history with no duplicates and no gaps. Walked forwards,
+ * concatenating each next page (fetched with `after = next_after`) does the same
+ * in the repair direction.
+ *
+ * `has_more` means "another page exists **in the direction that was asked for**":
+ * older Messages for a `before` page, newer Messages for an `after` page.
  */
 export type MessageList = { 
 /**
  * The page's Messages, oldest first (ascending `seq`), so the list renders
- * top-to-bottom. Empty when `before` points before the first Message.
+ * top-to-bottom. Empty when the cursor points past the end in that direction.
  */
 messages: Array<MessageView>, 
 /**
  * The cursor for the next older page: pass this as `before` to fetch it.
- * `null` when there is nothing older.
+ * `null` when there is nothing older, or when this was a forward page.
  */
 next_before: number | null, 
 /**
- * Whether older Messages exist beyond this page.
+ * The cursor for the next newer page: pass this as `after` to fetch it.
+ * `null` when there is nothing newer, or when this was a backward page.
+ */
+next_after: number | null, 
+/**
+ * Whether another page exists beyond this one, in the requested direction.
  */
 has_more: boolean, };

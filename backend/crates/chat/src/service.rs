@@ -183,10 +183,21 @@ impl ChatService {
 
     /// One page of a Conversation's history, oldest first.
     ///
-    /// The page is a cursor walk on the Sequence Number (ADR-0003): no cursor
-    /// reads the newest page, and the response's `next_before` reads the page
-    /// before it. `limit` is advisory — it is clamped by [`page_size`] so a client
-    /// cannot pull the whole Conversation in one request.
+    /// The page is a cursor walk on the Sequence Number (ADR-0003), in one of two
+    /// directions:
+    ///
+    /// - **Backwards** (`before`): no cursor reads the newest page, and the
+    ///   response's `next_before` reads the page before it. This is the history
+    ///   browse.
+    /// - **Forwards** (`after`): the oldest Messages newer than the cursor, so a
+    ///   client that reconnected can pull exactly what it missed and continue with
+    ///   `next_after`. This is the repair path (ADR-0003's reconnect requirement).
+    ///
+    /// `before` and `after` together is a validation failure: they name opposite
+    /// ends of a page and the intent would be ambiguous.
+    ///
+    /// `limit` is advisory — it is clamped by [`page_size`] so a client cannot pull
+    /// the whole Conversation in one request.
     ///
     /// Reading history requires being a Participant: a non-member is refused with
     /// [`ChatError::NotAParticipant`], and a Conversation that does not exist with
@@ -201,28 +212,63 @@ impl ChatService {
             return Err(ChatError::ConversationNotFound);
         }
 
+        if page.before.is_some() && page.after.is_some() {
+            return Err(validation(
+                "after",
+                FieldErrorCode::InvalidFormat,
+                "before 与 after 不能同时使用",
+            ));
+        }
+
         require_participant(&self.repository, conversation_id, caller_id).await?;
 
         let limit = page_size(page.limit);
-        let (rows, has_more) = self
-            .repository
-            .list_message_page(conversation_id, page.before, limit)
-            .await?;
 
-        // The cursor for the next older page is the Sequence Number of this
-        // page's oldest Message. It is only meaningful when a probe row proved an
-        // older page exists, so `has_more` gates it.
-        let next_before = if has_more {
-            rows.first().map(|row| row.seq)
-        } else {
-            None
-        };
+        match page.after {
+            Some(after) => {
+                let (rows, has_more) = self
+                    .repository
+                    .list_message_page_after(conversation_id, after, limit)
+                    .await?;
 
-        Ok(MessageList {
-            messages: rows.into_iter().map(message_view).collect(),
-            next_before,
-            has_more,
-        })
+                // The continuation cursor is this page's newest Message. It is only
+                // meaningful when a probe row proved a newer page exists.
+                let next_after = if has_more {
+                    rows.last().map(|row| row.seq)
+                } else {
+                    None
+                };
+
+                Ok(MessageList {
+                    messages: rows.into_iter().map(message_view).collect(),
+                    next_before: None,
+                    next_after,
+                    has_more,
+                })
+            }
+            None => {
+                let (rows, has_more) = self
+                    .repository
+                    .list_message_page(conversation_id, page.before, limit)
+                    .await?;
+
+                // The cursor for the next older page is the Sequence Number of this
+                // page's oldest Message. It is only meaningful when a probe row
+                // proved an older page exists, so `has_more` gates it.
+                let next_before = if has_more {
+                    rows.first().map(|row| row.seq)
+                } else {
+                    None
+                };
+
+                Ok(MessageList {
+                    messages: rows.into_iter().map(message_view).collect(),
+                    next_before,
+                    next_after: None,
+                    has_more,
+                })
+            }
+        }
     }
 
     /// Store a text Message, or return the one this idempotency key already wrote.

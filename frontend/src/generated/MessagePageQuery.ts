@@ -4,9 +4,16 @@
  * Query parameters of `GET /conversations/{id}/messages`.
  *
  * The cursor is the Conversation's Sequence Number, the ordering authority
- * (ADR-0003). A page is "the `limit` Messages with the highest `seq` strictly
- * below `before`", walked **backwards**: omit `before` for the newest page, then
- * pass the response's `next_before` to load the page before it.
+ * (ADR-0003). Two directions share this one contract:
+ *
+ * - **Backwards** (`before`, exclusive): the `limit` Messages with the highest
+ *   `seq` strictly below `before`. Omit it for the newest page, then pass the
+ *   response's `next_before` to load the page before it.
+ * - **Forwards** (`after`, exclusive): the `limit` oldest Messages with
+ *   `seq > after`, used to repair a Conversation after a reconnect or a detected
+ *   gap. Pass the response's `next_after` to continue.
+ *
+ * `before` and `after` are mutually exclusive; supplying both is rejected.
  *
  * Cursor-on-`seq` is what makes page boundaries correct under concurrent sends.
  * `LIMIT/OFFSET` shifts by one every time an older row appears, so a client
@@ -15,13 +22,21 @@
  */
 export type MessagePageQuery = { 
 /**
- * Exclusive cursor: return Messages with `seq < before`.
+ * Exclusive backward cursor: return Messages with `seq < before`.
  *
  * Omit to read the most recent page. A `before` outside the Conversation's
  * range (below `1`, or above its newest Message) is not an error: it yields
  * an empty page or the most recent one.
  */
 before: number | null, 
+/**
+ * Exclusive forward cursor: return the oldest Messages with `seq > after`.
+ *
+ * This is the repair direction (ADR-0003 / the reconnect ticket): a client
+ * that holds everything up to `after` pulls exactly the Messages it missed,
+ * oldest first, until `has_more` is false.
+ */
+after: number | null, 
 /**
  * Page size, clamped to `[1, MAX_MESSAGE_PAGE_SIZE]`; defaults to
  * `DEFAULT_MESSAGE_PAGE_SIZE` when omitted.

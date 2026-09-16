@@ -135,9 +135,16 @@ pub struct ConversationList {
 /// Query parameters of `GET /conversations/{id}/messages`.
 ///
 /// The cursor is the Conversation's Sequence Number, the ordering authority
-/// (ADR-0003). A page is "the `limit` Messages with the highest `seq` strictly
-/// below `before`", walked **backwards**: omit `before` for the newest page, then
-/// pass the response's `next_before` to load the page before it.
+/// (ADR-0003). Two directions share this one contract:
+///
+/// - **Backwards** (`before`, exclusive): the `limit` Messages with the highest
+///   `seq` strictly below `before`. Omit it for the newest page, then pass the
+///   response's `next_before` to load the page before it.
+/// - **Forwards** (`after`, exclusive): the `limit` oldest Messages with
+///   `seq > after`, used to repair a Conversation after a reconnect or a detected
+///   gap. Pass the response's `next_after` to continue.
+///
+/// `before` and `after` are mutually exclusive; supplying both is rejected.
 ///
 /// Cursor-on-`seq` is what makes page boundaries correct under concurrent sends.
 /// `LIMIT/OFFSET` shifts by one every time an older row appears, so a client
@@ -146,13 +153,20 @@ pub struct ConversationList {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct MessagePageQuery {
-    /// Exclusive cursor: return Messages with `seq < before`.
+    /// Exclusive backward cursor: return Messages with `seq < before`.
     ///
     /// Omit to read the most recent page. A `before` outside the Conversation's
     /// range (below `1`, or above its newest Message) is not an error: it yields
     /// an empty page or the most recent one.
     #[ts(type = "number | null")]
     pub before: Option<i64>,
+    /// Exclusive forward cursor: return the oldest Messages with `seq > after`.
+    ///
+    /// This is the repair direction (ADR-0003 / the reconnect ticket): a client
+    /// that holds everything up to `after` pulls exactly the Messages it missed,
+    /// oldest first, until `has_more` is false.
+    #[ts(type = "number | null")]
+    pub after: Option<i64>,
     /// Page size, clamped to `[1, MAX_MESSAGE_PAGE_SIZE]`; defaults to
     /// `DEFAULT_MESSAGE_PAGE_SIZE` when omitted.
     #[ts(type = "number | null")]
@@ -162,20 +176,29 @@ pub struct MessagePageQuery {
 /// `GET /conversations/{id}/messages` response: one page of history.
 ///
 /// Ordering is explicit and deterministic: `messages` is always ascending by
-/// `seq` (oldest first), whatever page was requested. Concatenating page N+1
-/// (fetched with `before = next_before`) in front of page N reconstructs the
-/// whole history with no duplicates and no gaps.
+/// `seq` (oldest first), whatever page was requested. Walked backwards,
+/// concatenating page N+1 (fetched with `before = next_before`) in front of page N
+/// reconstructs the whole history with no duplicates and no gaps. Walked forwards,
+/// concatenating each next page (fetched with `after = next_after`) does the same
+/// in the repair direction.
+///
+/// `has_more` means "another page exists **in the direction that was asked for**":
+/// older Messages for a `before` page, newer Messages for an `after` page.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct MessageList {
     /// The page's Messages, oldest first (ascending `seq`), so the list renders
-    /// top-to-bottom. Empty when `before` points before the first Message.
+    /// top-to-bottom. Empty when the cursor points past the end in that direction.
     pub messages: Vec<MessageView>,
     /// The cursor for the next older page: pass this as `before` to fetch it.
-    /// `null` when there is nothing older.
+    /// `null` when there is nothing older, or when this was a forward page.
     #[ts(type = "number | null")]
     pub next_before: Option<i64>,
-    /// Whether older Messages exist beyond this page.
+    /// The cursor for the next newer page: pass this as `after` to fetch it.
+    /// `null` when there is nothing newer, or when this was a backward page.
+    #[ts(type = "number | null")]
+    pub next_after: Option<i64>,
+    /// Whether another page exists beyond this one, in the requested direction.
     pub has_more: bool,
 }
 

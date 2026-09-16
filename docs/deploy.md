@@ -313,22 +313,34 @@ Caddy 文档原文：连接在配置重载时被强制关闭，因为每个请�
 
 ## 10. 备份与灾难恢复
 
-research §(f) 的策略在无容器下**依然成立**，只有脚本里的 `docker compose exec` 需替换为原生 `pg_dump`：
+> 完整设计（制品布局、加密、保留策略、告警、恢复 runbook、未验证清单）见
+> [`docs/backup.md`](./backup.md)。最近一次恢复演练的真实记录见
+> [`docs/drills/2026-09-17-restore-drill.md`](./drills/2026-09-17-restore-drill.md)。
+> 本节只留部署视角的要点。
 
-```bash
-# 原生，无容器。全连接串强制 TCP，避免 cron 下的 peer 认证问题。
-pg_dump -Fc --no-owner --no-privileges "$DATABASE_URL" \
-  | gzip -6 \
-  | gpg --batch --yes --passphrase-file /root/.backup_gpg_pass -c \
-  > "/var/backups/pg/app_$(date -u +%Y-%m-%dT%H-%M-%S).dump.gz.gpg"
-```
+research §(f) 的策略在无容器下**依然成立**，`docker compose exec pg_dump` 已替换为原生 `pg_dump`
+（ADR-0010）。落地成三个脚本 + 一个 systemd timer，不再靠人肉敲命令：
 
-- 分层：Postgres 逻辑备份（本地 7 天 / 云端 30 天）、上传文件与媒体（`tar`/`restic`）、配置（本 `deploy/` 目录、`/etc/jiuyue/*`、Caddyfile）；
-- 用 `rclone` + `rclone crypt` 上传（内容、文件名、目录名都加密），`rclone copy` 而非 `sync`，云端保留交给 bucket 生命周期；
-- 给备份任务加**心跳监控**（Uptime Kuma push），静默即告警；
-- 每季度在另一台机器演练恢复——**未演练的备份只是假设**。
-- 注意：research §(f) 里灾难恢复步骤第 1、5 步提到 `docker`/`docker compose`，**已随 ADR-0010 作废**，
-  改为原生安装 PostgreSQL 后 `pg_restore --clean --if-exists -d "$DATABASE_URL" < dump`。
+| 命令                             | 作用                                                             |
+| -------------------------------- | ---------------------------------------------------------------- |
+| `deploy/backup.sh`               | dump + 归档文件存储 + **加密** + 上传 + 本地/远端分离保留 + 心跳 |
+| `deploy/restore.sh`              | 从备份集恢复数据库与文件存储（sha256 不匹配即拒绝）              |
+| `deploy/restore-drill.sh`        | 销毁 → 从远端恢复 → 逐字节比对；CI 每次推送真跑                  |
+| `jiuyue-backup.timer`（systemd） | 每日 18:30 UTC（香港 02:30）触发 `jiuyue-backup.service`         |
+
+要点（与 research §(f) 一致，容器相关内容作废）：
+
+- **加密在上传之前**：`pg_dump -Fc | gzip -6 | gpg -c`，口令文件独立于备份；用 `rclone crypt` 时再叠一层；
+- **上传用 `rclone copy`，绝不用 `sync`**——否则本地 7 天清理会把云端 30 天历史一起删掉；
+  本地保留 7 天（`BACKUP_KEEP_LOCAL_DAYS`）与远端保留 30 天（`BACKUP_KEEP_REMOTE_DAYS`）是**两套独立策略**；
+- **心跳监控**（Uptime Kuma push）：成功发 `status=up`，任何失败发 `status=down`；**心跳缺席本身就是告警**
+  （备份没跑比备份失败更危险）；
+- **文件存储必须一起备份**，不能只导数据库（ADR-0006，`/var/lib/jiuyue`）；
+- **演练是交付物**：`.github/workflows/backup-restore.yml` 造数据 → 备份 → **销毁** → 恢复 → 比对，
+  不通过即红；另外每季度在真实机器上演练一次。
+
+密钥与口令的存放要求见 §6；`/etc/jiuyue/backup.env` 与 `/etc/jiuyue/backup_gpg_pass` 由
+`deploy/provision.sh` 生成/安装，**口令必须同时存进密码管理器**——它是唯一能读回备份的东西。
 
 ---
 
@@ -367,22 +379,29 @@ ufw enable
 
 ## 13. 验证状态（诚实清单）
 
-| 检查项                                                            | 在哪里验证                  | 状态                       |
-| ----------------------------------------------------------------- | --------------------------- | -------------------------- |
-| Caddyfile 语法 / 结构                                             | CI `caddy validate`         | CI 每次推送                |
-| systemd unit 与 drop-in 语法                                      | CI `systemd-analyze verify` | CI 每次推送                |
-| 部署脚本语法 / lint                                               | CI `bash -n` + `shellcheck` | CI 每次推送                |
-| 无 CRLF、env 模板变量齐全                                         | CI                          | CI 每次推送                |
-| 证书签发/续期、HTTP→HTTPS、真实域名路由                           | 需要真实服务器与域名        | **未验证**                 |
-| `MemoryMax`/`LimitNOFILE` 的实际生效                              | 需要真实服务器              | **未验证**                 |
-| `deploy.sh` 端到端（下载→校验→切换→重启→健康→回滚）               | 需要真实服务器与 systemd    | **未验证**                 |
-| PostgreSQL 调参、swap 的实际表现                                  | 需要真实服务器负载          | **未验证**                 |
-| Caddy 重载时的 WebSocket 保留行为                                 | 需要真实浏览器与 live 连接  | **未验证**                 |
-| 制品打包内容（`bin/` + `dist/` + `VERSION`）                      | CI `Release` 工作流冒烟任务 | CI 每次 push main / 标签   |
-| 制品 `.sha256` 侧车能被 `sha256sum -c` 验证                       | CI `Release` 工作流冒烟任务 | CI 每次 push main / 标签   |
-| 制品能在 Linux 上真跑（真 PostgreSQL，`/health` = ok 且版本一致） | CI `Release` 工作流冒烟任务 | CI 每次 push main / 标签   |
-| `deploy.sh` 端到端（假 systemd + 真二进制 + 真健康检查）          | CI `Release` 工作流冒烟任务 | CI 每次 push main / 标签   |
-| GitHub Release 发布（`v*` 标签 → tar.gz + 侧车可下载）            | 首次打 `v*` 标签时          | **未验证**（仓库尚无标签） |
+| 检查项                                                            | 在哪里验证                                     | 状态                          |
+| ----------------------------------------------------------------- | ---------------------------------------------- | ----------------------------- |
+| Caddyfile 语法 / 结构                                             | CI `caddy validate`                            | CI 每次推送                   |
+| systemd unit 与 drop-in 语法                                      | CI `systemd-analyze verify`                    | CI 每次推送                   |
+| 部署脚本语法 / lint                                               | CI `bash -n` + `shellcheck`                    | CI 每次推送                   |
+| 无 CRLF、env 模板变量齐全                                         | CI                                             | CI 每次推送                   |
+| 证书签发/续期、HTTP→HTTPS、真实域名路由                           | 需要真实服务器与域名                           | **未验证**                    |
+| `MemoryMax`/`LimitNOFILE` 的实际生效                              | 需要真实服务器                                 | **未验证**                    |
+| `deploy.sh` 端到端（下载→校验→切换→重启→健康→回滚）               | 需要真实服务器与 systemd                       | **未验证**                    |
+| PostgreSQL 调参、swap 的实际表现                                  | 需要真实服务器负载                             | **未验证**                    |
+| Caddy 重载时的 WebSocket 保留行为                                 | 需要真实浏览器与 live 连接                     | **未验证**                    |
+| 制品打包内容（`bin/` + `dist/` + `VERSION`）                      | CI `Release` 工作流冒烟任务                    | CI 每次 push main / 标签      |
+| 制品 `.sha256` 侧车能被 `sha256sum -c` 验证                       | CI `Release` 工作流冒烟任务                    | CI 每次 push main / 标签      |
+| 制品能在 Linux 上真跑（真 PostgreSQL，`/health` = ok 且版本一致） | CI `Release` 工作流冒烟任务                    | CI 每次 push main / 标签      |
+| `deploy.sh` 端到端（假 systemd + 真二进制 + 真健康检查）          | CI `Release` 工作流冒烟任务                    | CI 每次 push main / 标签      |
+| GitHub Release 发布（`v*` 标签 → tar.gz + 侧车可下载）            | 首次打 `v*` 标签时                             | **未验证**（仓库尚无标签）    |
+| 备份/恢复脚本 lint、CRLF、systemd unit、env 模板                  | CI `Backup and restore` lint                   | CI 每次推送                   |
+| **恢复演练**：备份 → 销毁 → 从远端副本恢复 → 逐表逐字节一致       | CI `Backup and restore` `restore-drill` + 本机 | **已验证**（见 drills 记录）  |
+| 文件存储纳入备份（空文件、带空格文件名）                          | CI `restore-drill` / 本机演练                  | **已验证**                    |
+| 备份失败会发出 `status=down` 心跳                                 | CI `alerting` / 本机捕获                       | **已验证**                    |
+| 制品离开机器前确为密文（OpenPGP 包头 + 可解析）                   | CI `restore-drill` / 本机演练                  | **已验证**                    |
+| `rclone` 上传真实对象存储、远端保留对真实 bucket 生效             | 需要真实 bucket 与凭据                         | **未验证**（CI 指向本地目录） |
+| Uptime Kuma 因心跳缺席而告警（「没备份」那条路径）                | 需要真实 Kuma 实例                             | **未验证**                    |
 
 > 本地开发机是 Windows，无法运行 systemd 或 Caddy，所以上述"未验证"项只能靠 CI 或真实服务器确认。
 > `deploy.sh` 现在不再只靠语法检查：`Release` 工作流在 Linux runner 上用**假 systemd + 真二进制 + 真
@@ -404,5 +423,13 @@ ufw enable
 | `deploy/provision.sh`                                                 | 一次性幂等初始化（包/用户/目录/swap/PG/Caddy/密钥/unit）       |
 | `deploy/postgresql/jiuyue-tuning.conf`                                | PostgreSQL 16 调参 drop-in                                     |
 | `deploy/env/jiuyue.env.example`                                       | 运行时变量模板（占位符，无真实密钥）                           |
+| `deploy/backup.sh`                                                    | 每日备份：dump + 文件存储 + 加密 + 上传 + 分离保留 + 心跳      |
+| `deploy/restore.sh`                                                   | 从备份集恢复数据库与文件存储（sha256 不匹配即拒绝）            |
+| `deploy/restore-drill.sh`                                             | 恢复演练：销毁 → 从远端恢复 → 逐字节比对                       |
+| `deploy/env/backup.env.example`                                       | 备份配置模板（保留天数、远端、心跳 URL；占位符）               |
+| `deploy/systemd/jiuyue-backup.service` / `.timer`                     | 每日 18:30 UTC 执行备份（systemd timer，非 cron）              |
+| `docs/backup.md`                                                      | 备份与恢复的完整设计与诚实清单                                 |
+| `docs/drills/2026-09-17-restore-drill.md`                             | 最近一次恢复演练的日期化记录                                   |
 | `.github/workflows/deploy-validate.yml`                               | 每次推送校验上述全部制品                                       |
+| `.github/workflows/backup-restore.yml`                                | 每次推送跑真恢复演练与失败告警断言                             |
 | `.github/workflows/release.yml`                                       | 构建发布制品（tar.gz + `.sha256`）、冒烟真跑、标签时发 Release |

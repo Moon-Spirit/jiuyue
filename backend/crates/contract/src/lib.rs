@@ -25,6 +25,7 @@ pub mod auth;
 pub mod chat;
 pub mod envelope;
 pub mod events;
+pub mod sync;
 
 pub use auth::{
     AuthSession, ErrorBody, ErrorCode, ErrorDetail, FieldError, FieldErrorCode, LoginRequest,
@@ -38,3 +39,4 @@ pub use chat::{
 };
 pub use envelope::{ClientEnvelope, PROTOCOL_VERSION, ServerEnvelope};
 pub use events::{ClientEvent, Ping, ServerEvent};
+pub use sync::{Resume, Resync, ResyncReason};
