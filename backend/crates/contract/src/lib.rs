@@ -25,6 +25,7 @@ pub mod auth;
 pub mod chat;
 pub mod envelope;
 pub mod events;
+pub mod read;
 pub mod sync;
 
 pub use auth::{
@@ -39,4 +40,5 @@ pub use chat::{
 };
 pub use envelope::{ClientEnvelope, PROTOCOL_VERSION, ServerEnvelope};
 pub use events::{ClientEvent, Ping, ServerEvent};
+pub use read::{MarkRead, ReadMarker, ReadReceipt};
 pub use sync::{Resume, Resync, ResyncReason, SyncCursor, SyncState};

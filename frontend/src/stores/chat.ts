@@ -7,6 +7,8 @@ import type { MessageAck } from "../generated/MessageAck";
 import type { MessageList } from "../generated/MessageList";
 import type { MessageRejected } from "../generated/MessageRejected";
 import type { NewMessage } from "../generated/NewMessage";
+import type { ReadMarker } from "../generated/ReadMarker";
+import type { ReadReceipt } from "../generated/ReadReceipt";
 import type { ServerEvent } from "../generated/ServerEvent";
 import type { SyncState } from "../generated/SyncState";
 import { useAuthStore } from "./auth";
@@ -82,6 +84,30 @@ export const useChatStore = defineStore("chat", () => {
    */
   const syncCursors = ref<Record<string, number>>({});
 
+  /**
+   * The **User's** Unread Count per Conversation (CONTEXT.md: 未读数).
+   *
+   * Scoped to the User, not the Device: reading on one Device clears it on all of
+   * them. Seeded from the Conversation list's `unread_count`, bumped locally when
+   * a peer's Message arrives, and settled authoritatively by `ReadMarker` events —
+   * which is what makes it eventually consistent across the account's Devices.
+   */
+  const unreadCounts = ref<Record<string, number>>({});
+
+  /**
+   * The other Participant's public Read Receipt per Conversation.
+   *
+   * Deliberately a *different* map from {@link unreadCounts}: this is the peer's
+   * public position, rendered as "read" on the caller's own Messages. It is fed
+   * by `ReadReceipt` events and by the `read_receipts` of a history page — never
+   * by the caller's private Read Marker, which the server does not send to peers
+   * and which this store does not read from any peer-facing shape.
+   */
+  const peerReceipts = ref<Record<string, number>>({});
+
+  /** The highest read position this client has already reported per Conversation. */
+  const reportedReadSeq = new Map<string, number>();
+
   /** Cursor reports waiting to be sent, one per Conversation. */
   const pendingCursorReports = new Map<string, number>();
   /** Whether a flush is already queued for the current batch of reports. */
@@ -155,6 +181,14 @@ export const useChatStore = defineStore("chat", () => {
         token,
       );
       conversations.value = payload.conversations;
+
+      // The list is the authoritative seed for the badges: each row carries the
+      // caller's own Unread Count, computed server-side from the private marker.
+      const counts: Record<string, number> = {};
+      for (const conversation of payload.conversations) {
+        counts[conversation.id] = conversation.unread_count;
+      }
+      unreadCounts.value = counts;
     } catch (cause) {
       applyError(cause);
     } finally {
@@ -188,6 +222,9 @@ export const useChatStore = defineStore("chat", () => {
       upsertConversation(conversation);
       activeConversationId.value = conversation.id;
       await loadMessages(conversation.id);
+      // Entering the Conversation is reading it: clear the badge on every Device
+      // of the account through the server's private Read Marker.
+      markConversationRead(conversation.id);
       return true;
     } catch (cause) {
       applyError(cause);
@@ -201,6 +238,9 @@ export const useChatStore = defineStore("chat", () => {
     if (messagesByConversation.value[conversationId] === undefined) {
       await loadMessages(conversationId);
     }
+    // Entering a Conversation is the first read of it; the scroll-to-bottom
+    // trigger in `MessageList` keeps it current as new Messages arrive.
+    markConversationRead(conversationId);
   }
 
   /**
@@ -232,6 +272,11 @@ export const useChatStore = defineStore("chat", () => {
       nextBeforeByConversation.value[conversationId] =
         payload.next_before ?? null;
       hasMoreByConversation.value[conversationId] = payload.has_more === true;
+      // The page carries the peers' public receipts, so "read" indicators render
+      // on first paint instead of waiting for a live event. Never the caller's
+      // own private marker — the contract has no such field.
+      for (const receipt of payload.read_receipts ?? [])
+        applyPeerReceipt(receipt);
       // The newest page is the position this Device now holds.
       scheduleCursorReport(conversationId);
     } catch (cause) {
@@ -277,6 +322,8 @@ export const useChatStore = defineStore("chat", () => {
       nextBeforeByConversation.value[conversationId] =
         payload.next_before ?? null;
       hasMoreByConversation.value[conversationId] = payload.has_more === true;
+      for (const receipt of payload.read_receipts ?? [])
+        applyPeerReceipt(receipt);
       // Older history does not move the high-water mark, but the report keeps the
       // persisted Device cursor honest with what is loaded.
       scheduleCursorReport(conversationId);
@@ -342,6 +389,82 @@ export const useChatStore = defineStore("chat", () => {
       });
       if (sent) pendingCursorReports.delete(conversationId);
     }
+  }
+
+  /**
+   * Report that the User has read a Conversation up to its newest held Message.
+   *
+   * The Read Marker is per **User**, so the server echoes it to every Device of
+   * the account — which is exactly what clears the badge on the account's other
+   * Devices without any of them opening the Conversation. The value sent is the
+   * highest Sequence Number actually held; the server clamps it to real Messages
+   * and only ever moves forward, and {@link reportedReadSeq} stops this client
+   * reporting the same position twice.
+   */
+  function markConversationRead(conversationId: string): boolean {
+    const newest = maxSeq(messagesByConversation.value[conversationId] ?? []);
+    if (newest === null) return false;
+
+    const already = reportedReadSeq.get(conversationId) ?? 0;
+    if (newest <= already) return false;
+
+    const sent = useRealtimeStore().send({
+      t: "MarkRead",
+      d: { conversation_id: conversationId, last_read_seq: newest },
+    });
+    if (sent) {
+      reportedReadSeq.set(conversationId, newest);
+      // Optimistic clear: the server's ReadMarker confirms the authoritative
+      // value, but the badge should not wait a round trip to disappear.
+      unreadCounts.value[conversationId] = 0;
+    }
+    return sent;
+  }
+
+  /** Mark the currently focused Conversation read, if there is one. */
+  function markActiveRead(): boolean {
+    const conversationId = activeConversationId.value;
+    if (conversationId === null) return false;
+    return markConversationRead(conversationId);
+  }
+
+  /**
+   * Record the peer's public Read Receipt.
+   *
+   * Receipts only move forward, so a re-delivered or out-of-order one cannot
+   * rewind the indicator. Kept in {@link peerReceipts}, separate from the
+   * private badge state: one is a peer's public position, the other a User's own
+   * private reading.
+   */
+  function applyPeerReceipt(receipt: ReadReceipt): void {
+    const current = peerReceipts.value[receipt.conversation_id] ?? 0;
+    peerReceipts.value[receipt.conversation_id] = Math.max(
+      current,
+      receipt.last_read_seq,
+    );
+  }
+
+  /**
+   * Adopt the account's private Read Marker, delivered to this Device because it
+   * belongs to the same User.
+   *
+   * The Unread Count in the event is authoritative and overwrites any local
+   * guess, which is how two Devices converge without either one polling. The
+   * reported position is folded in too, so this Device does not echo back a read
+   * the account has already made.
+   */
+  function applyReadMarker(marker: ReadMarker): void {
+    unreadCounts.value[marker.conversation_id] = marker.unread_count;
+    const already = reportedReadSeq.get(marker.conversation_id) ?? 0;
+    reportedReadSeq.set(
+      marker.conversation_id,
+      Math.max(already, marker.last_read_seq),
+    );
+  }
+
+  /** A peer's public Read Receipt advanced. */
+  function applyReadReceipt(receipt: ReadReceipt): void {
+    applyPeerReceipt(receipt);
   }
 
   /**
@@ -547,13 +670,24 @@ export const useChatStore = defineStore("chat", () => {
     const view = payload.message;
     const list = bucket(view.conversation_id);
     const before = maxSeq(list);
-    upsert(list, fromView(view, "sent"));
+    // `upsert` reports whether this was a new Message or a re-delivery. Delivery
+    // is at-least-once, so only a genuinely new Message may raise the badge.
+    const inserted = upsert(list, fromView(view, "sent"));
 
     // A Message more than one Sequence Number beyond the high-water mark means the
     // Conversation stream has a hole; pull the missing range forward. The
     // connection layer may have filled its own gap, but this is the exact repair.
     if (before !== null && view.seq > before + 1) {
       void repairConversations();
+    }
+
+    // The badge is the User's, not the Device's. A peer's Message raises it
+    // immediately; the server's `ReadMarker` settles it authoritatively, and a
+    // Conversation open at the bottom clears it through `markConversationRead`.
+    const fromSelf = view.sender_id === (useAuthStore().user?.id ?? "");
+    if (inserted && !fromSelf) {
+      const current = unreadCounts.value[view.conversation_id] ?? 0;
+      unreadCounts.value[view.conversation_id] = current + 1;
     }
 
     scheduleCursorReport(view.conversation_id);
@@ -608,6 +742,12 @@ export const useChatStore = defineStore("chat", () => {
       case "SyncState":
         adoptSyncState(event.d);
         break;
+      case "ReadMarker":
+        applyReadMarker(event.d);
+        break;
+      case "ReadReceipt":
+        applyReadReceipt(event.d);
+        break;
       default:
         assertExhaustive(event);
     }
@@ -634,6 +774,8 @@ export const useChatStore = defineStore("chat", () => {
     activeConversation,
     messages,
     syncCursors,
+    unreadCounts,
+    peerReceipts,
     hasMoreHistory,
     loadingConversations,
     loadingMessages,
@@ -646,6 +788,8 @@ export const useChatStore = defineStore("chat", () => {
     loadOlder,
     sendMessage,
     retry,
+    markConversationRead,
+    markActiveRead,
     repairConversations,
     clearNotice,
   };

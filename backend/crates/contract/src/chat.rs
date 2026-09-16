@@ -23,6 +23,7 @@ use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
 use crate::auth::ErrorCode;
+use crate::read::ReadReceipt;
 
 /// Hard cap on a Message body, in Unicode scalar values.
 ///
@@ -86,6 +87,14 @@ pub struct ConversationSummary {
     /// The other Participant of a Direct Conversation; absent for a Group (whose
     /// summary is a later ticket).
     pub peer: Option<PeerSummary>,
+    /// The caller's Unread Count (CONTEXT.md: 未读数) in this Conversation.
+    ///
+    /// Computed server-side from the caller's private Read Marker and maintained
+    /// incrementally, never by scanning `messages` here: the Conversation list is
+    /// the hottest read path. It is the **caller's own** count — another
+    /// Participant's is never exposed.
+    #[ts(type = "number")]
+    pub unread_count: i64,
     /// Creation time, milliseconds since the Unix epoch.
     #[ts(type = "number")]
     pub created_at_ms: i64,
@@ -200,6 +209,11 @@ pub struct MessageList {
     pub next_after: Option<i64>,
     /// Whether another page exists beyond this one, in the requested direction.
     pub has_more: bool,
+    /// The **other** Participants' public Read Receipts, so the page renders its
+    /// "read" indicators on first paint rather than only after a live event
+    /// arrives. The caller's own private Read Marker is never part of this list:
+    /// a receipt is public, a marker is not (see [`crate::read`]).
+    pub read_receipts: Vec<ReadReceipt>,
 }
 
 /// `ClientEvent::SendMessage` payload.

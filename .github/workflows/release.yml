@@ -305,9 +305,155 @@ jobs:
           # 服务是 root（经 sudo）起的，用 sudo 收尾，别留给 runner 退出时擦除。
           sudo kill "$(cat "${root}/server.pid")" 2>/dev/null || true
 
+  # deploy.sh 的失败路径：平时不用、出事时必须对的那部分（ticket #54）。
+  #
+  # 上面的 smoke 任务已经把**成功路径**真跑了一遍（下载 → 校验 → 解包 → 切换 →
+  # 重启 → 健康检查），这里一个字节都不重复它。这里只补坏情况：回滚、拒绝未验证
+  # 的制品、拒绝校验和不匹配、版本保留、幂等重跑 —— 一个没被测过的回滚，就是一个
+  # 不会工作的回滚。
+  #
+  # 为什么单开任务而不是往 smoke 里塞步骤：断言要能独立地红/绿，定位才快；它复用
+  # build 任务产出的同一个制品（不造第二套打包链路），并沿用 smoke 的假 systemctl
+  # 模式；只多花一次 PostgreSQL 安装。
+  #
+  # 断言标准："退出码 + current 指向"两条都要查：只看退出码证明不了没有激活新版本。
+  #
+  # 反静默跳过（照 backup-restore.yml 的做法）：
+  #   * 测试脚本内部用 ran_* 标志 + 证据日志，五个场景少跑一个就非零退出；
+  #   * 任务末尾的独立步骤再核对一遍日志证据串——哪怕整个断言步骤被 `if: false`
+  #     掉，那一步也会因为日志缺失而变红。
+  #
+  # 阴性对照：把 rollback_to() 的 switch_current 打断（只改临时副本，不动仓库文件），
+  # 断言测试脚本**必须**因此失败。一个不会失败的断言不是断言。
+  deploy-failures:
+    name: deploy.sh 失败路径（回滚 / 拒绝 / 保留 / 幂等）
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    services: {} # 不使用 service container（ADR-0010）
+    env:
+      VERSION: ${{ needs.build.outputs.version }}
+      ARCHIVE: ${{ needs.build.outputs.archive }}
+      # 与 CI / Release 相同的原生 PostgreSQL 约定，不另造一套。
+      DATABASE_URL: postgres://jiuyue:jiuyue_dev_password@localhost:5432/jiuyue_failpaths
+      JWT_SECRET: ci-only-release-secret-not-used-anywhere-0123456789
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: 语法检查失败路径测试脚本
+        run: |
+          set -euo pipefail
+          bash -n deploy/test-deploy-failure-paths.sh
+          bash -n deploy/deploy.sh
+          echo "shell syntax: OK"
+
+      - name: 安装 PostgreSQL 16（原生，非容器）
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y postgresql-16 postgresql-client-16
+          sudo systemctl start postgresql
+          sudo -u postgres psql -c "CREATE ROLE jiuyue LOGIN PASSWORD 'jiuyue_dev_password' SUPERUSER;"
+          sudo -u postgres psql -c "CREATE DATABASE jiuyue_failpaths OWNER jiuyue;"
+          pg_isready -h localhost -p 5432
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-archive
+          path: artifact
+
+      - name: 断言五个失败路径（回滚 / 无校验和 / 校验和不匹配 / 保留 / 幂等）
+        env:
+          EXPECTED_VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          set -Eeuo pipefail
+          # deploy.sh 要 root；沙箱、假 systemctl 和全部路径覆盖都由脚本自己准备，
+          # 真实 /opt 与真实 systemd 一概不碰。
+          sudo env \
+            "DATABASE_URL=${DATABASE_URL}" \
+            "JWT_SECRET=${JWT_SECRET}" \
+            bash deploy/test-deploy-failure-paths.sh \
+              --artifact "${PWD}/artifact/${ARCHIVE}" \
+              --work-dir "${RUNNER_TEMP}/deploy-failure-paths" \
+              --expected-version "${EXPECTED_VERSION}"
+
+      - name: 阴性对照：打断回滚，断言回滚断言确实会失败
+        run: |
+          set -Eeuo pipefail
+          # 只在临时副本上动手：把 rollback_to() 里指回上一版的那一行拿掉。
+          mutant="${RUNNER_TEMP}/mutant"
+          rm -rf "$mutant"
+          mkdir -p "$mutant"
+          cp deploy/deploy.sh "${mutant}/deploy.sh"
+          cp deploy/test-deploy-failure-paths.sh "${mutant}/test-deploy-failure-paths.sh"
+          sed -i 's|^  switch_current "\$previous"$|  log "MUTANT: rollback no longer repoints current"|' \
+            "${mutant}/deploy.sh"
+          # 变异必须真的发生，否则"阴性对照"本身就是一次静默跳过。
+          [ "$(grep -c 'MUTANT: rollback no longer repoints current' "${mutant}/deploy.sh")" -eq 1 ] \
+            || { echo "::error::the negative control did not mutate deploy.sh"; exit 1; }
+          [ "$(grep -c 'switch_current "\$previous"' "${mutant}/deploy.sh")" -eq 0 ] \
+            || { echo "::error::the rollback repoint is still present in the mutant"; exit 1; }
+          bash -n "${mutant}/deploy.sh"
+
+          log="${RUNNER_TEMP}/mutant.log"
+          set +e
+          # 换一组端口：不依赖上一轮进程是否已经彻底退出。
+          sudo env \
+            "DATABASE_URL=${DATABASE_URL}" \
+            "JWT_SECRET=${JWT_SECRET}" \
+            "BASE_PORT=8180" \
+            "BASE_PORT_RETENTION=8182" \
+            bash "${mutant}/test-deploy-failure-paths.sh" \
+              --artifact "${PWD}/artifact/${ARCHIVE}" \
+              --work-dir "${RUNNER_TEMP}/mutant-work" \
+              --expected-version "${VERSION}" > "$log" 2>&1
+          code=$?
+          set -e
+          cat "$log"
+          if [ "$code" -eq 0 ]; then
+            echo "::error::the rollback assertion passed while the rollback was broken — it is not an assertion"
+            exit 1
+          fi
+          grep -q 'ASSERTION FAILED' "$log" \
+            || { echo "::error::the mutant run failed, but not on an assertion"; exit 1; }
+          grep -qE 'did not report a healthy rollback|expected the previous release' "$log" \
+            || { echo "::error::the mutant run failed for the wrong reason (not the rollback)"; exit 1; }
+          echo "negative control: the rollback assertion fails when the rollback is broken (exit ${code})"
+
+      - name: 反静默跳过：断言五个场景都真的跑了
+        run: |
+          set -Eeuo pipefail
+          work="${RUNNER_TEMP}/deploy-failure-paths"
+          fail=0
+          check() {
+            if grep -qF "$1" "$2"; then
+              echo "  ok: $3"
+            else
+              echo "::error::missing evidence: $3"
+              fail=1
+            fi
+          }
+          # 每个场景一条只有它才会产生的证据串。
+          check "rolling back to"                       "${work}/scenario-1-rollback-bad.log" "rollback repointed current and restarted the service"
+          check "refusing to deploy an unverified artifact" "${work}/scenario-2-no-checksum.log" "a missing checksum is refused"
+          check "sha256 mismatch"                       "${work}/scenario-3-bad-checksum.log" "a wrong digest is refused"
+          check "pruning old release"                   "${work}/scenario-4-retention.log"   "old releases are pruned"
+          check "replacing existing release directory"  "${work}/scenario-5-idempotent.log"  "a re-run replaces instead of duplicating"
+          [ "$fail" -eq 0 ] || exit 1
+          echo "anti-silent-skip: 5/5 failure paths produced evidence"
+
+      - name: 上传失败路径日志
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: deploy-failure-paths-log
+          path: ${{ runner.temp }}/deploy-failure-paths/*.log
+          if-no-files-found: warn
+
   publish:
     name: 发布 GitHub Release（仅 v* 标签）
-    needs: [build, smoke]
+    needs: [build, smoke, deploy-failures]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
     permissions:

@@ -14,7 +14,7 @@
 //!   send turns out to be a replay. That is what keeps `seq` gapless *and* keeps a
 //!   retry from writing twice.
 
-use jiuyue_contract::SyncCursor;
+use jiuyue_contract::{ReadReceipt, SyncCursor};
 use sqlx::postgres::PgRow;
 use sqlx::types::time::OffsetDateTime;
 use sqlx::{Executor, PgPool, Postgres, Row};
@@ -44,7 +44,7 @@ const SELECT_USER_BY_ID: &str = "\
     FROM users WHERE id = $1";
 
 const SELECT_CONVERSATIONS_FOR_USER: &str = "\
-    SELECT c.id::text AS id, c.kind, c.created_at, \
+    SELECT c.id::text AS id, c.kind, c.created_at, me.unread_count, \
            u.id::text AS peer_id, u.username AS peer_username, \
            u.display_name AS peer_display_name, u.avatar_url AS peer_avatar_url \
     FROM conversation_members AS me \
@@ -156,6 +156,84 @@ const SELECT_SYNC_CURSORS: &str = "\
     FROM sync_cursors WHERE session_id = $1 \
     ORDER BY updated_at DESC, conversation_id DESC LIMIT $2";
 
+/// Bump every recipient's Unread Count for a freshly written Message.
+///
+/// This runs **inside the same transaction as the insert**, so the count and the
+/// stream can never disagree: a rollback (a lost idempotency race) undoes both.
+/// The `read_marker_seq < $3` guard is what makes it correct rather than merely
+/// additive — a Message the User has already read (its `seq` is at or below the
+/// marker) must not re-inflate the count, however late this statement runs.
+///
+/// Concurrent sends to the same Conversation each run this `UPDATE`, and because
+/// they touch the same participant rows they serialise on the row lock: N
+/// concurrent Messages produce exactly N increments, not a lost update. The
+/// sender's own row is excluded (`user_id <> $2`): a User's own Messages are
+/// never unread to them.
+const INCREMENT_UNREAD: &str = "\
+    UPDATE conversation_members \
+    SET unread_count = unread_count + 1 \
+    WHERE conversation_id = $1 AND user_id <> $2 AND read_marker_seq < $3";
+
+/// Advance one User's private Read Marker *and* public Read Receipt, and settle
+/// the Unread Count.
+///
+/// The two columns are written together but remain two columns with two
+/// meanings: `read_marker_seq` is the private position that drives the badge,
+/// `read_receipt_seq` is the public position a peer will be shown. Nothing here
+/// reads or returns another User's marker.
+///
+/// `LEAST($3, c.newest_seq)` clamps the reported position to the newest Message
+/// that actually exists. `conversations.next_seq` is the allocator the send path
+/// pre-increments (`UPDATE ... SET next_seq = next_seq + 1 ... RETURNING`), so at
+/// rest it equals the highest Sequence Number handed out — and 0 when the
+/// Conversation has no Messages at all. An over-reported value therefore cannot
+/// mark unread Messages as read, which would otherwise wedge the guarded
+/// increment above forever. `GREATEST` makes both positions monotonic, so a
+/// replayed or out-of-order report cannot rewind them.
+///
+/// The Unread Count is recomputed from the invariant (Messages after the new
+/// marker, excluding the User's own) in the same statement: one range read of the
+/// `(conversation_id, seq)` index at human frequency, and it self-corrects the
+/// incremental count. Returns no row when the caller is not a Participant.
+const MARK_READ: &str = "\
+    UPDATE conversation_members AS cm \
+    SET read_marker_seq = GREATEST(cm.read_marker_seq, LEAST($3, c.newest_seq)), \
+        read_receipt_seq = GREATEST(cm.read_receipt_seq, LEAST($3, c.newest_seq)), \
+        unread_count = ( \
+            SELECT count(*) FROM messages AS m \
+            WHERE m.conversation_id = cm.conversation_id \
+              AND m.sender_id <> cm.user_id \
+              AND m.seq > GREATEST(cm.read_marker_seq, LEAST($3, c.newest_seq)) \
+        ) \
+    FROM ( \
+        SELECT id, next_seq AS newest_seq \
+        FROM conversations WHERE id = $1 \
+    ) AS c \
+    WHERE cm.conversation_id = c.id AND cm.user_id = $2 \
+    RETURNING cm.read_marker_seq, cm.read_receipt_seq, cm.unread_count";
+
+/// The **other** Participants' public Read Receipts for one Conversation.
+///
+/// This query names exactly one read column, `read_receipt_seq`. It cannot return
+/// a Read Marker because it does not select that column — which is the structural
+/// half of "a private marker is never served as a public receipt". The caller is
+/// excluded (`user_id <> $2`): their own receipt is not news to them, and their
+/// own marker is not in this result at all.
+const SELECT_RECEIPTS: &str = "\
+    SELECT conversation_id::text AS conversation_id, user_id::text AS user_id, \
+           read_receipt_seq \
+    FROM conversation_members \
+    WHERE conversation_id = $1 AND user_id <> $2 \
+    ORDER BY user_id";
+
+/// One Participant's private read state, for the owning User alone.
+///
+/// Used by tests and by the server's own bookkeeping; it is never attached to a
+/// peer-facing response.
+const SELECT_READ_STATE: &str = "\
+    SELECT read_marker_seq, read_receipt_seq, unread_count \
+    FROM conversation_members WHERE conversation_id = $1 AND user_id = $2";
+
 /// A row of `conversations`, as this module needs it.
 #[derive(Debug, Clone)]
 pub struct ConversationRow {
@@ -212,6 +290,17 @@ pub struct NewMessageRow {
     pub client_msg_id: String,
     /// Message text.
     pub body: String,
+}
+
+/// One User's private read state in one Conversation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReadStateRow {
+    /// Private Read Marker: highest Sequence Number the User has read.
+    pub read_marker_seq: i64,
+    /// Public Read Receipt: highest Sequence Number acknowledged to peers.
+    pub read_receipt_seq: i64,
+    /// Unread Count after the marker advanced.
+    pub unread_count: i64,
 }
 
 /// Data access for the chat domain.
@@ -297,19 +386,29 @@ impl ChatRepository {
 
     /// Every Direct Conversation the User participates in, newest first.
     ///
+    /// Each entry also carries the **caller's** Unread Count, read from their own
+    /// participant row. The count is stored, never recomputed by scanning
+    /// `messages` here, because the Conversation list is the hottest read path.
+    ///
     /// Group Conversations are excluded until the group ticket defines what a
     /// group summary renders; the query is deliberately not written to half-guess it.
     pub async fn list_conversations(
         &self,
         user_id: &str,
-    ) -> Result<Vec<(ConversationRow, PeerRow)>, ChatError> {
+    ) -> Result<Vec<(ConversationRow, PeerRow, i64)>, ChatError> {
         sqlx::query(SELECT_CONVERSATIONS_FOR_USER)
             .bind(user_id)
             .fetch_all(&self.pool)
             .await
             .map(|rows| {
                 rows.iter()
-                    .map(|row| (conversation_from_row(row), peer_from_join_row(row)))
+                    .map(|row| {
+                        (
+                            conversation_from_row(row),
+                            peer_from_join_row(row),
+                            row.get("unread_count"),
+                        )
+                    })
                     .collect()
             })
             .map_err(ChatError::Database)
@@ -348,10 +447,11 @@ impl ChatRepository {
     ///
     /// Returns `(row, created)`: `created` is false when the send was a replay.
     ///
-    /// The Sequence Number and the row are one unit of work. A replay detected
-    /// after the allocation is resolved by *rolling the transaction back*, which
-    /// undoes the `next_seq` increment — otherwise every retried send would punch a
-    /// hole in the Conversation's ordering.
+    /// The Sequence Number, the row and the recipient Unread Count bumps are one
+    /// unit of work. A replay detected after the allocation is resolved by
+    /// *rolling the transaction back*, which undoes the `next_seq` increment and
+    /// the badge bumps together — otherwise every retried send would punch a hole
+    /// in the Conversation's ordering and inflate every badge.
     pub async fn insert_message_idempotent(
         &self,
         message: &NewMessageRow,
@@ -391,12 +491,24 @@ impl ChatRepository {
 
         match inserted {
             Some(row) => {
+                // The badge bump is part of the same transaction as the row, so a
+                // crash cannot commit one without the other, and a later rollback
+                // undoes both.
+                sqlx::query(INCREMENT_UNREAD)
+                    .bind(&message.conversation_id)
+                    .bind(&message.sender_id)
+                    .bind(seq)
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(ChatError::Database)?;
+
                 transaction.commit().await.map_err(ChatError::Database)?;
                 Ok((message_from_row(&row), true))
             }
             None => {
                 // A concurrent send with the same idempotency key won the insert.
-                // Rolling back here is what returns the allocated `seq` to the pool.
+                // Rolling back here is what returns the allocated `seq` to the pool
+                // and discards the badge bump.
                 transaction.rollback().await.map_err(ChatError::Database)?;
 
                 let existing = find_message_by_client_id(
@@ -545,6 +657,70 @@ impl ChatRepository {
             })
             .map_err(ChatError::Database)
     }
+
+    /// Advance one User's private Read Marker and public Read Receipt.
+    ///
+    /// Both are clamped to the newest Message that exists and move only forward
+    /// (`GREATEST`), and the Unread Count is recomputed from the same invariant in
+    /// the same statement. Returns `None` when the User is not a Participant —
+    /// there is no row to advance, and that must be distinguishable from success.
+    pub async fn mark_read(
+        &self,
+        conversation_id: &str,
+        user_id: &str,
+        last_read_seq: i64,
+    ) -> Result<Option<ReadStateRow>, ChatError> {
+        sqlx::query(MARK_READ)
+            .bind(conversation_id)
+            .bind(user_id)
+            .bind(last_read_seq)
+            .fetch_optional(&self.pool)
+            .await
+            .map(|row| row.map(|row| read_state_from_row(&row)))
+            .map_err(ChatError::Database)
+    }
+
+    /// The other Participants' public Read Receipts for a Conversation.
+    ///
+    /// `exclude_user_id` is the caller: their own receipt is not news to them.
+    /// Only `read_receipt_seq` is selected, so no private Read Marker can appear
+    /// in this result.
+    pub async fn list_receipts(
+        &self,
+        conversation_id: &str,
+        exclude_user_id: &str,
+    ) -> Result<Vec<ReadReceipt>, ChatError> {
+        sqlx::query(SELECT_RECEIPTS)
+            .bind(conversation_id)
+            .bind(exclude_user_id)
+            .fetch_all(&self.pool)
+            .await
+            .map(|rows| {
+                rows.iter()
+                    .map(|row| ReadReceipt {
+                        conversation_id: row.get("conversation_id"),
+                        reader_id: row.get("user_id"),
+                        last_read_seq: row.get("read_receipt_seq"),
+                    })
+                    .collect()
+            })
+            .map_err(ChatError::Database)
+    }
+
+    /// One User's private read state, or `None` when they are not a Participant.
+    pub async fn read_state(
+        &self,
+        conversation_id: &str,
+        user_id: &str,
+    ) -> Result<Option<ReadStateRow>, ChatError> {
+        sqlx::query(SELECT_READ_STATE)
+            .bind(conversation_id)
+            .bind(user_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map(|row| row.map(|row| read_state_from_row(&row)))
+            .map_err(ChatError::Database)
+    }
 }
 
 /// Find a Message by its idempotency key, inside any executor.
@@ -601,5 +777,13 @@ fn message_from_row(row: &PgRow) -> MessageRow {
         client_msg_id: row.get("client_msg_id"),
         body: row.get("body"),
         created_at: row.get("created_at"),
+    }
+}
+
+fn read_state_from_row(row: &PgRow) -> ReadStateRow {
+    ReadStateRow {
+        read_marker_seq: row.get("read_marker_seq"),
+        read_receipt_seq: row.get("read_receipt_seq"),
+        unread_count: row.get("unread_count"),
     }
 }

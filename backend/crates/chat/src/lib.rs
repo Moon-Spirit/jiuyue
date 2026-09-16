@@ -18,10 +18,19 @@
 //!
 //! It does not know about HTTP or WebSockets: it returns data and lets
 //! `jiuyue-server` and `jiuyue-realtime` deliver it. It paginates history
-//! backwards on the Sequence Number cursor (ticket #11), but does not repair
-//! reconnects (a separate ticket) or model Groups, attachments, reactions or read
-//! state (later tickets). The schema and the service are shaped so those can be
-//! added without replacing this module.
+//! backwards on the Sequence Number cursor (ticket #11), maintains read state
+//! (ticket #16) and repairs reconnects (tickets #12/#13), but does not model
+//! Groups, attachments or reactions (later tickets). The schema and the service
+//! are shaped so those can be added without replacing this module.
+//!
+//! # Read state: two positions, never one
+//!
+//! The Read Marker (a User's private position) and the Read Receipt (a
+//! Participant's public acknowledgement) are stored in two columns, carried by
+//! two event types and read by two different queries — see
+//! [`jiuyue_contract::read`]. The one place they meet is [`ReadStateUpdate`],
+//! which deliberately hands back both so the realtime layer can fan them out to
+//! their disjoint recipient sets.
 //!
 //! # Retry safety
 //!
@@ -39,5 +48,6 @@ mod service;
 pub use error::ChatError;
 pub use repository::ChatRepository;
 pub use service::{
-    ChatService, ConversationNotice, MAX_SYNC_CURSORS, OpenedConversation, SentMessage,
+    ChatService, ConversationNotice, MAX_SYNC_CURSORS, OpenedConversation, ReadState,
+    ReadStateUpdate, SentMessage,
 };

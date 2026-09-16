@@ -1,10 +1,12 @@
 <script setup lang="ts">
 import type { ConversationSummary } from "../../generated/ConversationSummary";
 
-defineProps<{
+const props = defineProps<{
   conversations: readonly ConversationSummary[];
   activeId: string | null;
   loading: boolean;
+  /** The User's Unread Count per Conversation id (CONTEXT.md: 未读数). */
+  unreadCounts: Record<string, number>;
 }>();
 
 const emit = defineEmits<{ select: [id: string] }>();
@@ -14,6 +16,11 @@ function label(conversation: ConversationSummary): string {
   const peer = conversation.peer;
   if (peer === null) return "群聊";
   return peer.display_name === "" ? peer.username : peer.display_name;
+}
+
+/** This Conversation's badge, defaulting to zero for one never counted. */
+function unreadFor(conversation: ConversationSummary): number {
+  return props.unreadCounts[conversation.id] ?? 0;
 }
 </script>
 
@@ -53,6 +60,14 @@ function label(conversation: ConversationSummary): string {
             <span class="block truncate text-xs text-zinc-500">
               @{{ conversation.peer?.username ?? "group" }}
             </span>
+          </span>
+          <span
+            v-if="unreadFor(conversation) > 0"
+            class="shrink-0 rounded-full bg-zinc-900 px-2 py-0.5 text-xs font-medium text-white dark:bg-zinc-100 dark:text-zinc-900"
+            data-test="unread-badge"
+            :aria-label="`${unreadFor(conversation)} 条未读`"
+          >
+            {{ unreadFor(conversation) > 99 ? "99+" : unreadFor(conversation) }}
           </span>
         </button>
       </li>

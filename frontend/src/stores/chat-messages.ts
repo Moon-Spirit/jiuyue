@@ -125,21 +125,27 @@ export function fromView(view: MessageView, state: DeliveryState): ChatMessage {
  * This is the single merge point, and it is what makes applying a duplicate
  * harmless: a Message is keyed by id, so re-delivering one the client already
  * holds replaces its entry rather than adding a second bubble.
+ *
+ * Returns `true` when the Message was **appended** (genuinely new) and `false`
+ * when it replaced an entry it was already known by. Callers that count things —
+ * an unread badge, say — need the distinction, because at-least-once delivery
+ * means the same Message may be applied more than once and must be counted once.
  */
-export function upsert(list: ChatMessage[], message: ChatMessage): void {
+export function upsert(list: ChatMessage[], message: ChatMessage): boolean {
   const byClientId = list.findIndex(
     (entry) => entry.clientMsgId === message.clientMsgId,
   );
   if (byClientId >= 0) {
     list.splice(byClientId, 1, message);
-    return;
+    return false;
   }
 
   const byServerId = list.findIndex((entry) => entry.id === message.id);
   if (byServerId >= 0) {
     list.splice(byServerId, 1, message);
-    return;
+    return false;
   }
 
   list.push(message);
+  return true;
 }

@@ -15,8 +15,9 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use jiuyue_contract::{
-    ClientEnvelope, ClientEvent, MessageAck, MessageRejected, NewMessage, Ping, Resume, Resync,
-    ResyncReason, SendMessage, ServerEnvelope, ServerEvent, SyncCursor, SyncState,
+    ClientEnvelope, ClientEvent, MarkRead, MessageAck, MessageRejected, NewMessage, Ping,
+    ReadMarker, ReadReceipt, Resume, Resync, ResyncReason, SendMessage, ServerEnvelope,
+    ServerEvent, SyncCursor, SyncState,
 };
 use tokio::sync::mpsc;
 
@@ -173,6 +174,9 @@ impl<'a> Session<'a> {
             ClientEvent::SyncCursor(cursor) => {
                 self.record_cursor(cursor).await;
             }
+            ClientEvent::MarkRead(mark) => {
+                self.mark_read(mark).await;
+            }
         }
 
         Ok(())
@@ -217,6 +221,68 @@ impl<'a> Session<'a> {
                     message: error.message().to_owned(),
                 })
             }
+        }
+    }
+
+    /// Record that this User has read a Conversation, then fan the two positions
+    /// out to their **disjoint** audiences.
+    ///
+    /// This is the one place the private Read Marker and the public Read Receipt
+    /// meet, and they leave it by different doors:
+    ///
+    /// - [`ServerEvent::ReadMarker`] carries the private position and the caller's
+    ///   Unread Count, and is delivered to **exactly the reader's own User** — so
+    ///   every Device of the account clears its badge, and no other Participant
+    ///   can ever receive it. The recipient list is `[update.user_id]` and nothing
+    ///   else.
+    /// - [`ServerEvent::ReadReceipt`] carries the public position and the reader's
+    ///   identity, and is delivered to **exactly `update.others`** — the
+    ///   Participants who are *not* the reader. The private marker is never placed
+    ///   in this event.
+    ///
+    /// A failure is logged and swallowed: reading is advisory state, and a database
+    /// hiccup must not cost the user their connection.
+    async fn mark_read(&self, mark: &MarkRead) {
+        let update = match self
+            .hub
+            .chat()
+            .mark_read(&self.device.user_id, mark.clone())
+            .await
+        {
+            Ok(update) => update,
+            Err(error) => {
+                tracing::debug!(%error, "rejected a read marker");
+                return;
+            }
+        };
+
+        // Private: the reader's own Devices only. Never `others`.
+        self.hub
+            .registry()
+            .deliver(
+                std::slice::from_ref(&update.user_id),
+                &ServerEvent::ReadMarker(ReadMarker {
+                    conversation_id: update.conversation_id.clone(),
+                    last_read_seq: update.read_marker_seq,
+                    unread_count: update.unread_count,
+                }),
+            )
+            .await;
+
+        // Public: the other Participants only. Never the reader's Devices, and the
+        // value is the receipt column, not the marker.
+        if !update.others.is_empty() {
+            self.hub
+                .registry()
+                .deliver(
+                    &update.others,
+                    &ServerEvent::ReadReceipt(ReadReceipt {
+                        conversation_id: update.conversation_id.clone(),
+                        reader_id: update.user_id.clone(),
+                        last_read_seq: update.read_receipt_seq,
+                    }),
+                )
+                .await;
         }
     }
 

@@ -4,6 +4,12 @@ import type { ChatMessage } from "../../stores/chat";
 defineProps<{
   message: ChatMessage;
   own: boolean;
+  /**
+   * Whether the other Participant's public Read Receipt has reached this
+   * Message's Sequence Number. Always `false` for a peer's Message: a receipt is
+   * only shown on the sender's own bubbles.
+   */
+  readByPeer: boolean;
 }>();
 
 const emit = defineEmits<{ retry: [clientMsgId: string] }>();
@@ -48,6 +54,13 @@ const emit = defineEmits<{ retry: [clientMsgId: string] }>();
             重试
           </button>
         </template>
+        <span
+          v-else-if="readByPeer"
+          class="text-emerald-600 dark:text-emerald-400"
+          data-test="delivery-state"
+        >
+          已读
+        </span>
         <span v-else class="text-zinc-400" data-test="delivery-state">
           已发送
         </span>

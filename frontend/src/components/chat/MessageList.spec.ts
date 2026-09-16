@@ -29,6 +29,7 @@ function mountList(messages: ChatMessage[], hasMore = true) {
       loading: false,
       hasMore,
       loadingOlder: false,
+      peerReceiptSeq: 0,
     },
   });
 }
@@ -114,5 +115,37 @@ describe("MessageList", () => {
     await wrapper.setProps({ messages: [message(5), message(6)] });
 
     expect(element.scrollTop).toBe(0);
+  });
+
+  it("asks the store to mark read when the user reaches the newest message", async () => {
+    const wrapper = mountList([message(1), message(2)]);
+    const scroller = wrapper.get('[data-test="message-list"]');
+    // Distance to the bottom is 0: the viewport is parked on the newest Message.
+    defineScroll(scroller.element, 400, 400);
+
+    await scroller.trigger("scroll");
+
+    expect(wrapper.emitted("read")).toHaveLength(1);
+  });
+
+  it("does not mark read while the user is reading older history", async () => {
+    const wrapper = mountList([message(1), message(2)]);
+    const scroller = wrapper.get('[data-test="message-list"]');
+    // Far from the bottom: the newest Messages are not on screen.
+    defineScroll(scroller.element, 100, 800);
+
+    await scroller.trigger("scroll");
+
+    expect(wrapper.emitted("read")).toBeUndefined();
+  });
+
+  it("marks read when a new Message arrives while parked on the newest one", async () => {
+    const wrapper = mountList([message(1)]);
+    const scroller = wrapper.get('[data-test="message-list"]');
+    defineScroll(scroller.element, 400, 400);
+
+    await wrapper.setProps({ messages: [message(1), message(2)] });
+
+    expect(wrapper.emitted("read")).toHaveLength(1);
   });
 });

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { storeToRefs } from "pinia";
-import { computed, onMounted, onUnmounted, ref } from "vue";
+import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { RouterLink, useRouter } from "vue-router";
 import type { SocketStatus } from "../api/ws";
 import ConversationList from "../components/chat/ConversationList.vue";
@@ -25,6 +25,8 @@ const {
   loadingConversations,
   loadingMessages,
   loadingOlder,
+  unreadCounts,
+  peerReceipts,
   errorMessage,
   notice,
 } = storeToRefs(chat);
@@ -37,6 +39,18 @@ const currentUserId = computed(() => user.value?.id ?? "");
 const connected = computed(() => status.value === "open");
 const socketLabel = computed(() => SOCKET_LABELS[status.value]);
 
+/**
+ * The focused Conversation's peer receipt, or `0`.
+ *
+ * A public Read Receipt drives the "read" indicator on the user's own Messages;
+ * it is not the caller's private Read Marker, which never reaches this view.
+ */
+const activePeerReceiptSeq = computed(() => {
+  const id = activeConversationId.value;
+  if (id === null) return 0;
+  return peerReceipts.value[id] ?? 0;
+});
+
 const SOCKET_LABELS: Record<SocketStatus, string> = {
   idle: "未连接",
   connecting: "连接中…",
@@ -48,6 +62,13 @@ const SOCKET_LABELS: Record<SocketStatus, string> = {
 onMounted(async () => {
   realtime.connect();
   await chat.loadConversations();
+});
+
+// A socket that opens (or reopens) after the Conversation was entered must still
+// report the read: its socket was not there to carry the `MarkRead` at entry
+// time. Idempotent, because the store only reports a position once.
+watch(connected, (isConnected) => {
+  if (isConnected) chat.markActiveRead();
 });
 
 onUnmounted(() => {
@@ -124,6 +145,7 @@ async function signOut(): Promise<void> {
         :conversations="conversations"
         :active-id="activeConversationId"
         :loading="loadingConversations"
+        :unread-counts="unreadCounts"
         @select="chat.openConversation($event)"
       />
 
@@ -185,8 +207,10 @@ async function signOut(): Promise<void> {
             :loading="loadingMessages"
             :has-more="hasMoreHistory"
             :loading-older="loadingOlder"
+            :peer-receipt-seq="activePeerReceiptSeq"
             @retry="chat.retry($event)"
             @load-older="chat.loadOlder()"
+            @read="chat.markActiveRead()"
           />
         </div>
 

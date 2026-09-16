@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
 use crate::chat::{ConversationCreated, MessageAck, MessageRejected, NewMessage, SendMessage};
+use crate::read::{MarkRead, ReadMarker, ReadReceipt};
 use crate::sync::{Resume, Resync, SyncCursor, SyncState};
 
 /// Events the server pushes to a client.
@@ -41,6 +42,19 @@ pub enum ServerEvent {
     /// is what lets a Device that was away — a closed laptop, a new process — learn
     /// exactly what it missed instead of re-reading whole Conversations.
     SyncState(SyncState),
+    /// The owning User's **private** Read Marker advanced (CONTEXT.md: 已读标记).
+    ///
+    /// Sent **only** to the reader's own Devices — never to another Participant.
+    /// It is what clears the Unread Count on the account's other Devices when one
+    /// Device reads. See [`crate::read`] for why this is not the same event as
+    /// [`ServerEvent::ReadReceipt`].
+    ReadMarker(ReadMarker),
+    /// A Participant's **public** Read Receipt advanced (CONTEXT.md: 已读回执).
+    ///
+    /// Sent **only** to the *other* Participants, and only from the public
+    /// [`ReadReceipt`] position — the reader's private Read Marker has no path to
+    /// this event.
+    ReadReceipt(ReadReceipt),
 }
 
 /// Events a client sends to the server.
@@ -61,6 +75,13 @@ pub enum ClientEvent {
     /// batches. A report the server never receives costs the Device a re-fetch of
     /// the tail on its next connect — harmless under at-least-once delivery.
     SyncCursor(SyncCursor),
+    /// Declare how far the User has read in a Conversation (CONTEXT.md: 已读标记).
+    ///
+    /// One action with two separate effects: the private Read Marker advances
+    /// (clearing the Unread Count and echoing to the caller's other Devices) and
+    /// the public Read Receipt advances (broadcast to the other Participants).
+    /// Monotonic — a replayed or out-of-order report can never rewind either.
+    MarkRead(MarkRead),
 }
 
 /// Heartbeat payload shared by both directions.

@@ -17,12 +17,14 @@ use sqlx::types::time::OffsetDateTime;
 
 use jiuyue_contract::{
     ConversationKind, ConversationSummary, DEFAULT_MESSAGE_PAGE_SIZE, FieldError, FieldErrorCode,
-    MAX_CLIENT_MSG_ID_BYTES, MAX_MESSAGE_BODY_CHARS, MAX_MESSAGE_PAGE_SIZE, MessageList,
-    MessagePageQuery, MessageView, PeerSummary, SendMessage, SyncCursor,
+    MAX_CLIENT_MSG_ID_BYTES, MAX_MESSAGE_BODY_CHARS, MAX_MESSAGE_PAGE_SIZE, MarkRead, MessageList,
+    MessagePageQuery, MessageView, PeerSummary, ReadReceipt, SendMessage, SyncCursor,
 };
 
 use crate::error::ChatError;
-use crate::repository::{ChatRepository, ConversationRow, MessageRow, NewMessageRow, PeerRow};
+use crate::repository::{
+    ChatRepository, ConversationRow, MessageRow, NewMessageRow, PeerRow, ReadStateRow,
+};
 
 /// Upper bound on the cursors one connection is handed at once.
 ///
@@ -73,6 +75,44 @@ pub struct SentMessage {
     /// again: a retry is a no-op, and a second [`jiuyue_contract::NewMessage`]
     /// would force every peer to de-duplicate by Message id.
     pub created: bool,
+}
+
+/// The outcome of a User marking a Conversation read.
+///
+/// It carries **both** positions, and the caller must keep them apart: the
+/// [`Self::read_marker_seq`] is private (fan out to the reader's own Devices
+/// only) and [`Self::read_receipt_seq`] is public (fan out to the other
+/// Participants including the reader's identity). See [`crate::service`]'s
+/// `mark_read` and `jiuyue_contract::read`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadStateUpdate {
+    /// The Conversation that was read.
+    pub conversation_id: String,
+    /// The reader (the private marker's owner).
+    pub user_id: String,
+    /// The reader's private Read Marker after the advance.
+    pub read_marker_seq: i64,
+    /// The reader's public Read Receipt after the advance.
+    pub read_receipt_seq: i64,
+    /// The reader's Unread Count after the advance.
+    pub unread_count: i64,
+    /// Every **other** Participant, for the public receipt fan-out. Never
+    /// contains the reader, so the private marker's owner is not in this set.
+    pub others: Vec<String>,
+}
+
+/// One User's private read state in one Conversation.
+///
+/// This is the owner's own view of both positions; it is never a peer-facing
+/// shape. The Read Marker drives the Unread Count and is not shared.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReadState {
+    /// The User's private Read Marker.
+    pub read_marker_seq: i64,
+    /// The User's public Read Receipt.
+    pub read_receipt_seq: i64,
+    /// The User's Unread Count.
+    pub unread_count: i64,
 }
 
 /// The chat domain's public API.
@@ -159,8 +199,8 @@ impl ChatService {
             );
         }
 
-        let caller_view = summary_from(&conversation, &peer);
-        let peer_view = summary_from(&conversation, &caller);
+        let caller_view = summary_from(&conversation, &peer, 0);
+        let peer_view = summary_from(&conversation, &caller, 0);
         let notices = vec![
             ConversationNotice {
                 user_id: caller_id.to_owned(),
@@ -189,7 +229,9 @@ impl ChatService {
             .list_conversations(caller_id)
             .await?
             .into_iter()
-            .map(|(conversation, peer)| summary_from(&conversation, &peer))
+            .map(|(conversation, peer, unread_count)| {
+                summary_from(&conversation, &peer, unread_count)
+            })
             .collect())
     }
 
@@ -236,6 +278,16 @@ impl ChatService {
 
         let limit = page_size(page.limit);
 
+        // The page also carries the other Participants' public Read Receipts, so a
+        // client can render its "read" indicators on first paint rather than only
+        // after a live event arrives. The query selects only `read_receipt_seq`:
+        // the caller's own private marker is not in this result, and neither is
+        // anyone else's.
+        let read_receipts = self
+            .repository
+            .list_receipts(conversation_id, caller_id)
+            .await?;
+
         match page.after {
             Some(after) => {
                 let (rows, has_more) = self
@@ -256,6 +308,7 @@ impl ChatService {
                     next_before: None,
                     next_after,
                     has_more,
+                    read_receipts,
                 })
             }
             None => {
@@ -278,6 +331,7 @@ impl ChatService {
                     next_before,
                     next_after: None,
                     has_more,
+                    read_receipts,
                 })
             }
         }
@@ -322,6 +376,101 @@ impl ChatService {
             participants,
             created,
         })
+    }
+
+    /// Mark a Conversation read up to a Sequence Number.
+    ///
+    /// The caller must be a Participant. `mark.last_read_seq` is clamped to the
+    /// newest Message that exists and both positions only move forward, so a
+    /// replayed or over-eager report is harmless.
+    ///
+    /// The two positions are returned together but must be fanned out
+    /// **separately**: [`ReadStateUpdate::read_marker_seq`] is private and goes to
+    /// the reader's own Devices; [`ReadStateUpdate::read_receipt_seq`] is public
+    /// and goes to [`ReadStateUpdate::others`]. Keeping both on one step result is
+    /// what lets the caller do that without a second read — and keeping them in
+    /// two fields is what stops one being sent where the other belongs.
+    pub async fn mark_read(
+        &self,
+        user_id: &str,
+        mark: MarkRead,
+    ) -> Result<ReadStateUpdate, ChatError> {
+        if !is_ulid(&mark.conversation_id) {
+            return Err(ChatError::ConversationNotFound);
+        }
+        if mark.last_read_seq < 0 {
+            return Err(validation(
+                "last_read_seq",
+                FieldErrorCode::InvalidFormat,
+                "已读位置不合法",
+            ));
+        }
+
+        require_participant(&self.repository, &mark.conversation_id, user_id).await?;
+
+        let state = self
+            .repository
+            .mark_read(&mark.conversation_id, user_id, mark.last_read_seq)
+            .await?
+            .ok_or(ChatError::Internal)?;
+
+        let others = self
+            .repository
+            .participants(&mark.conversation_id)
+            .await?
+            .into_iter()
+            .filter(|participant| participant != user_id)
+            .collect();
+
+        Ok(ReadStateUpdate {
+            conversation_id: mark.conversation_id,
+            user_id: user_id.to_owned(),
+            read_marker_seq: state.read_marker_seq,
+            read_receipt_seq: state.read_receipt_seq,
+            unread_count: state.unread_count,
+            others,
+        })
+    }
+
+    /// One User's private read state in a Conversation, for that User alone.
+    ///
+    /// Not a peer-facing read model — it returns the caller's **own** Read Marker
+    /// and Unread Count. A peer's private state is never read here.
+    pub async fn read_state(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+    ) -> Result<Option<ReadState>, ChatError> {
+        if !is_ulid(conversation_id) {
+            return Ok(None);
+        }
+
+        Ok(self
+            .repository
+            .read_state(conversation_id, user_id)
+            .await?
+            .map(read_state))
+    }
+
+    /// The other Participants' public Read Receipts for a Conversation.
+    ///
+    /// Requires the caller to be a Participant; the caller's own receipt is
+    /// excluded, and a private Read Marker can never appear here (the query reads
+    /// only `read_receipt_seq`).
+    pub async fn list_receipts(
+        &self,
+        caller_id: &str,
+        conversation_id: &str,
+    ) -> Result<Vec<ReadReceipt>, ChatError> {
+        if !is_ulid(conversation_id) {
+            return Err(ChatError::ConversationNotFound);
+        }
+
+        require_participant(&self.repository, conversation_id, caller_id).await?;
+
+        self.repository
+            .list_receipts(conversation_id, caller_id)
+            .await
     }
 
     /// The Device's stored Sync Cursors, most recently advanced first.
@@ -490,7 +639,11 @@ fn new_id() -> String {
 }
 
 /// Project a stored Conversation and the viewer's peer onto the list shape.
-fn summary_from(conversation: &ConversationRow, peer: &PeerRow) -> ConversationSummary {
+fn summary_from(
+    conversation: &ConversationRow,
+    peer: &PeerRow,
+    unread_count: i64,
+) -> ConversationSummary {
     ConversationSummary {
         id: conversation.id.clone(),
         kind: kind_from(&conversation.kind),
@@ -500,7 +653,17 @@ fn summary_from(conversation: &ConversationRow, peer: &PeerRow) -> ConversationS
             display_name: peer.display_name.clone(),
             avatar_url: peer.avatar_url.clone(),
         }),
+        unread_count,
         created_at_ms: unix_millis(conversation.created_at),
+    }
+}
+
+/// Project a repository read-state row onto the service shape.
+fn read_state(row: ReadStateRow) -> ReadState {
+    ReadState {
+        read_marker_seq: row.read_marker_seq,
+        read_receipt_seq: row.read_receipt_seq,
+        unread_count: row.unread_count,
     }
 }
 

@@ -24,16 +24,16 @@ use futures_util::{SinkExt, StreamExt};
 use jiuyue_auth::{AuthConfig, AuthService};
 use jiuyue_chat::ChatService;
 use jiuyue_contract::{
-    AuthSession, ClientEnvelope, ClientEvent, ConversationSummary, MessageAck, MessageList,
-    MessageRejected, MessageView, NewMessage, Resume, Resync, SendMessage, ServerEnvelope,
-    ServerEvent, SyncCursor, SyncState,
+    AuthSession, ClientEnvelope, ClientEvent, ConversationSummary, MarkRead, MessageAck,
+    MessageList, MessageRejected, MessageView, NewMessage, ReadMarker, ReadReceipt, Resume, Resync,
+    SendMessage, ServerEnvelope, ServerEvent, SyncCursor, SyncState,
 };
 use jiuyue_realtime::{HEARTBEAT_INTERVAL, RealtimeHub};
 use jiuyue_server::{AppState, Config, Services, app};
 use jiuyue_store::Store;
 use serde_json::{Value, json};
 use sqlx::postgres::PgPoolOptions;
-use sqlx::{Executor as _, PgPool};
+use sqlx::{Executor as _, PgPool, Row};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::Message;
@@ -260,6 +260,19 @@ pub fn sync_cursor(conversation_id: &str, last_seq: i64) -> ClientEvent {
     })
 }
 
+/// A `MarkRead` client event: "this User has read up to `last_seq` here".
+///
+/// This is the one client action behind both read concepts: it advances the
+/// User's private Read Marker (which clears the Unread Count and echoes to the
+/// account's other Devices) and their public Read Receipt (which is broadcast to
+/// the other Participants).
+pub fn mark_read(conversation_id: &str, last_seq: i64) -> ClientEvent {
+    ClientEvent::MarkRead(MarkRead {
+        conversation_id: conversation_id.to_owned(),
+        last_read_seq: last_seq,
+    })
+}
+
 /// Read the REST repair loop: every Message strictly after `cursor`, oldest first.
 ///
 /// This is what the client does after a reconnect: pull forward pages until the
@@ -405,6 +418,45 @@ pub async fn expect_sync_state(socket: &mut TestSocket) -> SyncState {
     loop {
         if let ServerEvent::SyncState(state) = next_event(socket).await {
             return state;
+        }
+    }
+}
+
+/// Read until the next private Read Marker arrives, ignoring everything else.
+pub async fn expect_read_marker(socket: &mut TestSocket) -> ReadMarker {
+    loop {
+        if let ServerEvent::ReadMarker(marker) = next_event(socket).await {
+            return marker;
+        }
+    }
+}
+
+/// Read until the next public Read Receipt arrives, ignoring everything else.
+pub async fn expect_read_receipt(socket: &mut TestSocket) -> ReadReceipt {
+    loop {
+        if let ServerEvent::ReadReceipt(receipt) = next_event(socket).await {
+            return receipt;
+        }
+    }
+}
+
+/// Every non-heartbeat event a socket receives within `timeout`.
+///
+/// Used to assert an **absence**: the privacy test drains a peer's socket for a
+/// window and then asserts no `ReadMarker` was among the events.
+pub async fn collect_events_within(socket: &mut TestSocket, timeout: Duration) -> Vec<ServerEvent> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut events = Vec::new();
+
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return events;
+        }
+
+        match next_event_within(socket, remaining).await {
+            Some(event) => events.push(event),
+            None => return events,
         }
     }
 }
@@ -563,6 +615,63 @@ pub fn assert_exact_sequence_set(messages: Vec<MessageView>, count: i64) -> BTre
     );
 
     ids
+}
+
+/// One User's stored read state, read straight from the schema.
+///
+/// Returns `(read_marker_seq, read_receipt_seq, unread_count)`. Asserting from
+/// PostgreSQL and not from a hub's memory is the point: the persistence *is* the
+/// behaviour under test.
+pub async fn member_read_state(
+    pool: &PgPool,
+    conversation_id: &str,
+    user_id: &str,
+) -> (i64, i64, i64) {
+    let row = sqlx::query(
+        "SELECT read_marker_seq, read_receipt_seq, unread_count \
+         FROM conversation_members WHERE conversation_id = $1 AND user_id = $2",
+    )
+    .bind(conversation_id)
+    .bind(user_id)
+    .fetch_one(pool)
+    .await
+    .unwrap_or_else(|error| panic!("reading conversation_members must succeed: {error}"));
+
+    (
+        row.get("read_marker_seq"),
+        row.get("read_receipt_seq"),
+        row.get("unread_count"),
+    )
+}
+
+/// Just the stored Unread Count for one User in one Conversation.
+pub async fn member_unread_count(pool: &PgPool, conversation_id: &str, user_id: &str) -> i64 {
+    member_read_state(pool, conversation_id, user_id).await.2
+}
+
+/// Wait until a User's stored Unread Count is `expected`.
+///
+/// The count is committed with the Message insert and with the read update, so
+/// this usually answers on the first poll; it exists so a test never races the
+/// last write of a concurrent burst.
+pub async fn wait_for_unread(pool: &PgPool, conversation_id: &str, user_id: &str, expected: i64) {
+    let deadline = tokio::time::Instant::now() + EVENT_TIMEOUT;
+
+    loop {
+        if member_unread_count(pool, conversation_id, user_id).await == expected {
+            return;
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            panic!(
+                "unread for {user_id} never reached {expected} within {EVENT_TIMEOUT:?}; \
+                 stored: {:?}",
+                member_read_state(pool, conversation_id, user_id).await
+            );
+        }
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 /// Wait until some Device of `user_id` has exactly `expected` as its cursor.

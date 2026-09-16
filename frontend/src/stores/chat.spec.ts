@@ -1,6 +1,7 @@
 import { createPinia, setActivePinia } from "pinia";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { FakeWebSocket } from "../testing/fake-websocket";
+import { useAuthStore } from "./auth";
 import { useChatStore } from "./chat";
 import { useRealtimeStore } from "./realtime";
 
@@ -20,6 +21,7 @@ function conversationPayload(): Record<string, unknown> {
       display_name: "Bob",
       avatar_url: null,
     },
+    unread_count: 0,
     created_at_ms: 1_700_000_000_000,
   };
 }
@@ -84,7 +86,21 @@ interface ClientFrame {
       client_msg_id?: string;
       conversation_id?: string;
       last_seq?: number;
+      last_read_seq?: number;
     };
+  };
+}
+
+/** The signed-in profile, so the store can tell the user's own Messages apart. */
+function signIn(): void {
+  useAuthStore().user = {
+    id: SELF_ID,
+    username: "alice",
+    email: "alice@example.com",
+    display_name: "Alice",
+    avatar_url: null,
+    email_verified: false,
+    created_at_ms: 1_700_000_000_000,
   };
 }
 
@@ -761,5 +777,183 @@ describe("useChatStore", () => {
       expect(reports.every((frame) => frame.e.d.last_seq === 1)).toBe(true);
     });
     expect(store.messages.map((message) => message.seq)).toEqual([1, 4]);
+  });
+
+  it("raises the unread badge for a peer's Message and clears it when read", async () => {
+    const store = await openedStore();
+    signIn();
+    const socket = openSocket();
+
+    socket.emitMessage(
+      newMessageEnvelope(
+        messagePayload({
+          id: "PEER-1",
+          sender_id: PEER_ID,
+          client_msg_id: "peer-1",
+          seq: 1,
+          body: "未读",
+        }),
+      ),
+    );
+
+    expect(store.unreadCounts[CONVERSATION_ID]).toBe(1);
+
+    // Reading the focused Conversation reports the marker and clears the badge.
+    expect(store.markActiveRead()).toBe(true);
+    expect(store.unreadCounts[CONVERSATION_ID]).toBe(0);
+
+    const marker = socket.sent
+      .map((text) => parseFrame(text))
+      .find((frame) => frame.e.t === "MarkRead");
+    expect(marker?.e.d.conversation_id).toBe(CONVERSATION_ID);
+    expect(marker?.e.d.last_read_seq).toBe(1);
+  });
+
+  it("counts a re-delivered peer Message once and never the user's own", async () => {
+    const store = await openedStore();
+    signIn();
+    const socket = openSocket();
+
+    const peer = messagePayload({
+      id: "PEER-1",
+      sender_id: PEER_ID,
+      client_msg_id: "peer-1",
+      seq: 1,
+    });
+    // At-least-once delivery: the same Message may arrive twice, but the badge
+    // must count it once.
+    socket.emitMessage(newMessageEnvelope(peer));
+    socket.emitMessage(newMessageEnvelope(peer));
+    expect(store.unreadCounts[CONVERSATION_ID]).toBe(1);
+
+    // The user's own Message from another Device (so not a local optimistic
+    // bubble) is never unread.
+    socket.emitMessage(
+      envelope(4, {
+        t: "NewMessage",
+        d: {
+          message: messagePayload({
+            id: "MINE",
+            sender_id: SELF_ID,
+            client_msg_id: "mine-1",
+            seq: 2,
+          }),
+        },
+      }),
+    );
+    expect(store.unreadCounts[CONVERSATION_ID]).toBe(1);
+  });
+
+  it("clears the badge when a ReadMarker arrives for the account's other Device", async () => {
+    const store = await openedStore();
+    signIn();
+    const socket = openSocket();
+
+    socket.emitMessage(
+      newMessageEnvelope(
+        messagePayload({
+          id: "PEER-1",
+          sender_id: PEER_ID,
+          client_msg_id: "peer-1",
+          seq: 1,
+        }),
+      ),
+    );
+    expect(store.unreadCounts[CONVERSATION_ID]).toBe(1);
+
+    // The account's other Device read the Conversation, so the server echoed the
+    // private Read Marker to this Device; the shared badge clears here too.
+    socket.emitMessage(
+      envelope(4, {
+        t: "ReadMarker",
+        d: {
+          conversation_id: CONVERSATION_ID,
+          last_read_seq: 1,
+          unread_count: 0,
+        },
+      }),
+    );
+    expect(store.unreadCounts[CONVERSATION_ID]).toBe(0);
+  });
+
+  it("reports a read when a Conversation with history is opened", async () => {
+    stubFetch({
+      "/api/conversations": [
+        () => jsonResponse({ conversations: [conversationPayload()] }),
+      ],
+      [messagesRoute()]: [
+        () =>
+          jsonResponse({
+            messages: [
+              messagePayload({ id: "M1", client_msg_id: "k1", seq: 1 }),
+            ],
+            next_before: null,
+            next_after: null,
+            has_more: false,
+          }),
+      ],
+    });
+
+    const store = useChatStore();
+    signIn();
+    await store.loadConversations();
+    const socket = openSocket();
+    await store.openConversation(CONVERSATION_ID);
+
+    const marker = socket.sent
+      .map((text) => parseFrame(text))
+      .find((frame) => frame.e.t === "MarkRead");
+    expect(marker?.e.d.conversation_id).toBe(CONVERSATION_ID);
+    expect(marker?.e.d.last_read_seq).toBe(1);
+  });
+
+  it("tracks the peer's public receipt separately from the unread badge", async () => {
+    stubFetch({
+      "/api/conversations": [
+        () => jsonResponse({ conversations: [conversationPayload()] }),
+      ],
+      [messagesRoute()]: [
+        () =>
+          jsonResponse({
+            messages: [
+              messagePayload({ id: "M1", client_msg_id: "k1", seq: 1 }),
+            ],
+            next_before: null,
+            next_after: null,
+            has_more: false,
+            read_receipts: [
+              {
+                conversation_id: CONVERSATION_ID,
+                reader_id: PEER_ID,
+                last_read_seq: 1,
+              },
+            ],
+          }),
+      ],
+    });
+
+    const store = useChatStore();
+    signIn();
+    await store.loadConversations();
+    const socket = openSocket();
+    await store.openConversation(CONVERSATION_ID);
+
+    // The history page carries the peer's public receipt, and it is kept apart
+    // from the user's own private Unread Count.
+    expect(store.peerReceipts[CONVERSATION_ID]).toBe(1);
+    expect(store.unreadCounts[CONVERSATION_ID] ?? 0).toBe(0);
+
+    // A live receipt advances it.
+    socket.emitMessage(
+      envelope(4, {
+        t: "ReadReceipt",
+        d: {
+          conversation_id: CONVERSATION_ID,
+          reader_id: PEER_ID,
+          last_read_seq: 5,
+        },
+      }),
+    );
+    expect(store.peerReceipts[CONVERSATION_ID]).toBe(5);
   });
 });
