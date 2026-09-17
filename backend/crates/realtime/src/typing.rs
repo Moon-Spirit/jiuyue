@@ -167,9 +167,19 @@ impl TypingDirectory {
                 !entry.is_active(now, self.limits.ttl)
                     || now.saturating_duration_since(entry.last_change_at) >= self.limits.throttle
             }
-            // A stop is only meaningful while the indicator is still showing. A
-            // stop for an expired or already-cleared entry is dropped, which is
-            // exactly what keeps a stale stop from cancelling a newer start.
+            // A stop is only meaningful while the indicator is still showing; a
+            // stop for an expired or already-cleared entry is dropped rather than
+            // broadcast as a no-op.
+            //
+            // What this does NOT protect against: a stop generated *before* a
+            // newer start but arriving after it. Two Devices of one account mean
+            // two connections, and arrival order at the lock is the only order
+            // there is, so that stop clears the newer indicator. The cost is a
+            // flicker rather than a lost message - the sender is still composing,
+            // so the next start that clears the throttle re-asserts the
+            // indicator - but it is a real gap, and closing it needs a monotonic
+            // per-(Conversation, User) sequence carried on the signal, which is a
+            // protocol change this ticket does not make.
             TypingState::Stopped => entry.is_active(now, self.limits.ttl),
         }
     }
@@ -459,18 +469,33 @@ mod tests {
     }
 
     #[test]
-    fn a_stop_cannot_cancel_a_start_that_came_first_in_the_total_order() {
+    fn a_stop_clears_a_live_indicator_and_an_alternating_sequence_ends_cleared() {
         let mut directory = TypingDirectory::new(limits());
         let base = Instant::now();
 
-        // The server-ordered sequence: start, then stop, then start. Each is
-        // recorded in order, which is what the lock in `TypingTracker` guarantees.
+        // The sequence a single Device produces: start, stop, start, stop. Each is
+        // recorded in order, which is what the lock in `TypingTracker` guarantees
+        // for signals arriving on one connection.
         directory.record(&key(), TypingState::Started, base);
+
+        // A stop while the indicator is live is broadcast: that is what clears it
+        // on every other Device.
+        assert!(
+            directory.decide(
+                &key(),
+                TypingState::Stopped,
+                base + Duration::from_millis(1)
+            ),
+            "a stop clears an indicator that is currently showing"
+        );
         directory.record(
             &key(),
             TypingState::Stopped,
             base + Duration::from_millis(1),
         );
+
+        // A start after a cleared indicator is a fresh broadcast, not a throttled
+        // refresh of something that is no longer showing.
         assert!(
             directory.decide(
                 &key(),
@@ -485,33 +510,36 @@ mod tests {
             base + Duration::from_millis(2),
         );
 
-        // The old stop, arriving late, must not cancel the newer start. It is
-        // stale because the start it would cancel is the *newest* transition, and
-        // the directory only lets a stop clear the state it last recorded.
+        // And it clears again. Alternating transitions never get stuck: the entry
+        // carries the state each transition left behind, so "showing" and
+        // "cleared" stay distinguishable across the whole sequence.
         assert!(
-            !directory.decide(
+            directory.decide(
                 &key(),
                 TypingState::Stopped,
                 base + Duration::from_millis(3)
             ),
-            "a stale stop must not overtake the start that follows it in the lock's order"
+            "the second stop clears the second indicator"
         );
-
-        // The same rule seen from the other side: a stop that *is* the newest
-        // transition clears the indicator, and the next start is a fresh broadcast
-        // rather than a throttled refresh.
         directory.record(
             &key(),
             TypingState::Stopped,
-            base + Duration::from_millis(4),
+            base + Duration::from_millis(3),
         );
+
+        // A stop with nothing showing is dropped rather than broadcast as a no-op.
+        //
+        // This is the boundary of what the rule buys. It drops a stop for an entry
+        // that is *already* cleared or expired; it cannot drop a stop that arrives
+        // after a newer start, because that entry *is* showing and arrival order is
+        // the only order a two-connection stop has (see `decide`).
         assert!(
-            directory.decide(
+            !directory.decide(
                 &key(),
-                TypingState::Started,
-                base + Duration::from_millis(5)
+                TypingState::Stopped,
+                base + Duration::from_millis(4)
             ),
-            "a start after a real stop is a new indicator"
+            "a stop for an already-cleared entry cancels nothing and is not broadcast"
         );
     }
 
