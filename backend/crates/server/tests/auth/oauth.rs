@@ -759,7 +759,7 @@ async fn a_limited_session_is_single_use() {
 }
 
 #[tokio::test]
-async fn the_convertible_verifier_is_sent_to_the_token_endpoint() {
+async fn the_pkce_verifier_sent_to_the_token_endpoint_commits_to_the_challenge() {
     let app = TestApp::start().await;
     app.oauth()
         .script_github("2020", "pkce", Some("pkce@example.com"), true);
