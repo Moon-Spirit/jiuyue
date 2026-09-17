@@ -35,6 +35,19 @@ const router = createRouter({
       component: () => import("../views/VerifyEmailView.vue"),
     },
     {
+      // The two pages of a third-party sign-in. Both are reachable without a
+      // session: the callback arrives from the provider, and the username step
+      // runs on the limited session rather than on an access token.
+      path: "/oauth/callback",
+      name: "oauth-callback",
+      component: () => import("../views/OAuthCallbackView.vue"),
+    },
+    {
+      path: "/oauth/username",
+      name: "oauth-username",
+      component: () => import("../views/OAuthUsernameView.vue"),
+    },
+    {
       path: "/forgot-password",
       name: "forgot-password",
       component: () => import("../views/ForgotPasswordView.vue"),
@@ -62,6 +75,13 @@ router.beforeEach((to) => {
   // Someone already signed in has no use for the login or register form.
   if ((to.name === "login" || to.name === "register") && auth.isAuthenticated) {
     return { name: "chat" };
+  }
+
+  // The username step belongs to a limited session, not to a signed-in one. A
+  // browser that holds neither has no business there, and is sent to the
+  // provider button rather than shown a form that cannot succeed.
+  if (to.name === "oauth-username" && auth.limitedToken === null) {
+    return { name: "login" };
   }
 
   return true;

@@ -97,6 +97,20 @@ pub struct Config {
     /// carries no provider implementation, so setting this makes startup fail
     /// rather than let the process pretend to deliver password-reset mail.
     pub smtp_url: Option<String>,
+    /// GitHub OAuth application client id, from `GITHUB_CLIENT_ID`.
+    pub github_client_id: Option<String>,
+    /// GitHub OAuth application client secret, from `GITHUB_CLIENT_SECRET`. Never
+    /// leaves the server; the login page is built from the client id alone.
+    pub github_client_secret: Option<String>,
+    /// Google OAuth application client id, from `GOOGLE_CLIENT_ID`.
+    pub google_client_id: Option<String>,
+    /// Google OAuth application client secret, from `GOOGLE_CLIENT_SECRET`.
+    pub google_client_secret: Option<String>,
+    /// The origin a provider will send the browser back to, from
+    /// `OAUTH_CALLBACK_BASE_URL`. Defaults to [`Config::public_base_url`], which
+    /// is correct whenever the app and the callback share an origin — including
+    /// the Vite dev server, whose proxy forwards `/auth` to this process.
+    pub oauth_callback_base_url: Option<String>,
 }
 
 impl Default for Config {
@@ -112,6 +126,11 @@ impl Default for Config {
             verification_token_ttl: DEFAULT_VERIFICATION_TOKEN_TTL,
             reset_token_ttl: DEFAULT_RESET_TOKEN_TTL,
             smtp_url: None,
+            github_client_id: None,
+            github_client_secret: None,
+            google_client_id: None,
+            google_client_secret: None,
+            oauth_callback_base_url: None,
         }
     }
 }
@@ -146,6 +165,11 @@ struct RawConfig {
     verification_token_ttl_secs: Option<String>,
     password_reset_ttl_secs: Option<String>,
     smtp_url: Option<String>,
+    github_client_id: Option<String>,
+    github_client_secret: Option<String>,
+    google_client_id: Option<String>,
+    google_client_secret: Option<String>,
+    oauth_callback_base_url: Option<String>,
 }
 
 impl Config {
@@ -169,6 +193,11 @@ impl Config {
             verification_token_ttl_secs: read_var("EMAIL_VERIFICATION_TTL_SECS")?,
             password_reset_ttl_secs: read_var("PASSWORD_RESET_TTL_SECS")?,
             smtp_url: read_var("SMTP_URL")?,
+            github_client_id: read_var("GITHUB_CLIENT_ID")?,
+            github_client_secret: read_var("GITHUB_CLIENT_SECRET")?,
+            google_client_id: read_var("GOOGLE_CLIENT_ID")?,
+            google_client_secret: read_var("GOOGLE_CLIENT_SECRET")?,
+            oauth_callback_base_url: read_var("OAUTH_CALLBACK_BASE_URL")?,
         })
     }
 
@@ -227,7 +256,60 @@ impl Config {
                 "PASSWORD_RESET_TTL_SECS",
             )?,
             smtp_url: non_empty(raw.smtp_url).map(|value| value.trim().to_owned()),
+            github_client_id: non_empty(raw.github_client_id).map(trimmed),
+            github_client_secret: non_empty(raw.github_client_secret).map(trimmed),
+            google_client_id: non_empty(raw.google_client_id).map(trimmed),
+            google_client_secret: non_empty(raw.google_client_secret).map(trimmed),
+            oauth_callback_base_url: optional_base_url(
+                raw.oauth_callback_base_url,
+                "OAUTH_CALLBACK_BASE_URL",
+            )?,
         })
+    }
+
+    /// Where a provider sends the browser back to.
+    ///
+    /// Defaults to the public origin, which is what a single-origin deployment
+    /// (and the Vite dev proxy) needs; a deployment that terminates the callback
+    /// on a different host sets it explicitly.
+    pub fn oauth_callback_base_url(&self) -> &str {
+        self.oauth_callback_base_url
+            .as_deref()
+            .unwrap_or(&self.public_base_url)
+    }
+
+    /// The credentials for one third-party provider, as the identity module wants
+    /// them: `(client id, client secret)`, either of which may be absent.
+    pub fn oauth_credentials(
+        &self,
+        provider: jiuyue_contract::OAuthProvider,
+    ) -> (Option<String>, Option<String>) {
+        match provider {
+            jiuyue_contract::OAuthProvider::GitHub => (
+                self.github_client_id.clone(),
+                self.github_client_secret.clone(),
+            ),
+            jiuyue_contract::OAuthProvider::Google => (
+                self.google_client_id.clone(),
+                self.google_client_secret.clone(),
+            ),
+        }
+    }
+}
+
+/// A trimmed owned copy, for the `Option<String>` fields.
+fn trimmed(value: String) -> String {
+    value.trim().to_owned()
+}
+
+/// Parse an optional absolute http(s) origin, keeping `None` for an absent value.
+fn optional_base_url(
+    value: Option<String>,
+    name: &'static str,
+) -> Result<Option<String>, ConfigError> {
+    match non_empty(value) {
+        Some(raw) => absolute_origin(&raw, name).map(Some),
+        None => Ok(None),
     }
 }
 
@@ -238,20 +320,27 @@ impl Config {
 /// both build the same link prefix.
 fn base_url(value: Option<String>, default: String) -> Result<String, ConfigError> {
     match non_empty(value) {
-        Some(raw) => {
-            let trimmed = raw.trim().trim_end_matches('/').to_owned();
-
-            if !(trimmed.starts_with("http://") || trimmed.starts_with("https://")) {
-                return Err(ConfigError::InvalidUrl {
-                    name: "APP_BASE_URL",
-                    value: raw,
-                });
-            }
-
-            Ok(trimmed)
-        }
+        Some(raw) => absolute_origin(&raw, "APP_BASE_URL"),
         None => Ok(default),
     }
+}
+
+/// Trim a trailing slash and insist on an `http(s)` scheme.
+///
+/// A trailing slash is trimmed so `https://a.example/` and `https://a.example`
+/// build the same link prefix, and a value that could never be an origin is
+/// refused rather than accepted and used to build a broken link.
+fn absolute_origin(raw: &str, name: &'static str) -> Result<String, ConfigError> {
+    let trimmed = raw.trim().trim_end_matches('/').to_owned();
+
+    if !(trimmed.starts_with("http://") || trimmed.starts_with("https://")) {
+        return Err(ConfigError::InvalidUrl {
+            name,
+            value: raw.to_owned(),
+        });
+    }
+
+    Ok(trimmed)
 }
 
 /// Read an environment variable, distinguishing "absent" from "not unicode".

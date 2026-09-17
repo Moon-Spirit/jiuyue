@@ -1,8 +1,9 @@
 <script setup lang="ts">
 import { storeToRefs } from "pinia";
-import { reactive } from "vue";
+import { onMounted, reactive, ref } from "vue";
 import { RouterLink, useRoute, useRouter } from "vue-router";
 import { useAuthStore } from "../stores/auth";
+import type { OAuthProviderInfo } from "../generated/OAuthProviderInfo";
 
 const auth = useAuthStore();
 const { loading, errorMessage, fieldErrors, retryAfterSeconds } =
@@ -12,12 +13,40 @@ const route = useRoute();
 
 const form = reactive({ email: "", password: "" });
 
+/**
+ * The providers this instance can drive.
+ *
+ * Empty when none is configured, in which case the third-party section does not
+ * render at all — a provider with no credentials is absent from the server's
+ * answer rather than present and failing on click.
+ */
+const providers = ref<OAuthProviderInfo[]>([]);
+
+onMounted(async () => {
+  providers.value = await auth.fetchOAuthProviders();
+});
+
 async function submit(): Promise<void> {
   const ok = await auth.login({ email: form.email, password: form.password });
   if (!ok) return;
 
   const redirect = route.query.redirect;
   await router.replace(typeof redirect === "string" ? redirect : "/");
+}
+
+/**
+ * Hand the browser to the provider.
+ *
+ * The URL is the server's answer, because it carries the `state` and the PKCE
+ * challenge; the client never assembles an authorization URL. A refusal (an
+ * unconfigured provider, a throttled instance) leaves the error on the page
+ * rather than navigating anywhere.
+ */
+async function signInWith(provider: OAuthProviderInfo): Promise<void> {
+  const authorizeUrl = await auth.startOAuth(provider.provider);
+  if (authorizeUrl === null) return;
+
+  window.location.assign(authorizeUrl);
 }
 </script>
 
@@ -99,6 +128,29 @@ async function submit(): Promise<void> {
           {{ loading ? "登录中…" : "登录" }}
         </button>
       </form>
+
+      <div
+        v-if="providers.length > 0"
+        class="mt-6 border-t border-zinc-200 pt-6 dark:border-zinc-800"
+        data-test="oauth-providers"
+      >
+        <p class="mb-3 text-center text-xs text-zinc-500 dark:text-zinc-400">
+          或使用第三方账号登录
+        </p>
+        <div class="space-y-2">
+          <button
+            v-for="provider in providers"
+            :key="provider.provider"
+            type="button"
+            class="w-full rounded-lg border border-zinc-300 px-4 py-2 text-sm font-medium transition-colors hover:bg-zinc-50 disabled:cursor-not-allowed disabled:opacity-50 dark:border-zinc-700 dark:hover:bg-zinc-800"
+            :data-test="`oauth-${provider.provider}`"
+            :disabled="loading"
+            @click="signInWith(provider)"
+          >
+            使用 {{ provider.display_name }} 登录
+          </button>
+        </div>
+      </div>
 
       <p class="mt-6 text-center text-sm text-zinc-500 dark:text-zinc-400">
         还没有账号？

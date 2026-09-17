@@ -2,14 +2,19 @@ import { defineStore } from "pinia";
 import { computed, ref } from "vue";
 import {
   ApiError,
+  apiGet,
   apiGetAuthed,
   apiPost,
+  apiPostAuthed,
   apiPostAuthedNoContent,
   apiPostNoContent,
 } from "../api/client";
 import type { AuthSession } from "../generated/AuthSession";
 import type { ErrorCode } from "../generated/ErrorCode";
 import type { FieldError } from "../generated/FieldError";
+import type { OAuthCallbackResponse } from "../generated/OAuthCallbackResponse";
+import type { OAuthProvider } from "../generated/OAuthProvider";
+import type { OAuthProviderInfo } from "../generated/OAuthProviderInfo";
 import type { TokenPair } from "../generated/TokenPair";
 import type { UserProfile } from "../generated/UserProfile";
 import type { WhoAmI } from "../generated/WhoAmI";
@@ -21,6 +26,7 @@ import {
   validateLogin,
   validatePasswordReset,
   validateRegistration,
+  validateUsername,
   type ForgotPasswordForm,
   type LoginForm,
   type RegisterForm,
@@ -29,6 +35,17 @@ import {
 
 const ACCESS_TOKEN_KEY = "jiuyue.auth.access_token";
 const REFRESH_TOKEN_KEY = "jiuyue.auth.refresh_token";
+
+/**
+ * Where the limited session from a first-time third-party sign-in lives.
+ *
+ * `sessionStorage` rather than `localStorage`, because the limited session is a
+ * step in a flow rather than a credential to keep: it dies with the tab, and the
+ * user can always begin again from the provider button. Access and refresh tokens
+ * are the opposite — they belong in `localStorage` so a reload does not sign the
+ * user out.
+ */
+const LIMITED_TOKEN_KEY = "jiuyue.auth.oauth_limited_token";
 
 /**
  * The outcome of one silent re-authentication attempt.
@@ -77,6 +94,33 @@ function writeToken(key: string, value: string | null): void {
 }
 
 /**
+ * The limited session from a third-party sign-in, held for one tab.
+ *
+ * Deliberately a separate pair of readers from the access/refresh tokens: a
+ * limited token is not a credential for the API, and mixing the two would make
+ * "am I signed in?" answer yes for an account that has no username yet.
+ */
+function readLimitedToken(): string | null {
+  try {
+    return window.sessionStorage.getItem(LIMITED_TOKEN_KEY);
+  } catch (cause) {
+    // A browser that refuses session storage still gets the flow for this page
+    // load; only the reload path is lost, and the user can redo it.
+    console.warn("第三方登录的临时凭据无法持久化", cause);
+    return null;
+  }
+}
+
+function persistLimitedToken(value: string | null): void {
+  try {
+    if (value === null) window.sessionStorage.removeItem(LIMITED_TOKEN_KEY);
+    else window.sessionStorage.setItem(LIMITED_TOKEN_KEY, value);
+  } catch (cause) {
+    console.warn("第三方登录的临时凭据无法持久化", cause);
+  }
+}
+
+/**
  * The signed-in session, the credentials that back it, and the state of the
  * last auth request.
  *
@@ -88,6 +132,12 @@ export const useAuthStore = defineStore("auth", () => {
   const user = ref<UserProfile | null>(null);
   const accessToken = ref<string | null>(readToken(ACCESS_TOKEN_KEY));
   const refreshToken = ref<string | null>(readToken(REFRESH_TOKEN_KEY));
+  /**
+   * The limited session a first-time third-party user holds until they choose a
+   * username. It is not an access token, so {@link isAuthenticated} stays false
+   * while it is the only thing held.
+   */
+  const limitedToken = ref<string | null>(readLimitedToken());
   const whoami = ref<WhoAmI | null>(null);
 
   const loading = ref(false);
@@ -120,6 +170,19 @@ export const useAuthStore = defineStore("auth", () => {
     retryAfterSeconds.value = null;
   }
 
+  /**
+   * Set the limited session in the store and in this tab's storage together.
+   *
+   * Both halves matter: the ref is what the router guard and the username view
+   * read, and storage is what survives the page reload a provider redirect
+   * sometimes causes. Setting one without the other is how "sent to the username
+   * step but told the state was lost" happens.
+   */
+  function rememberLimitedToken(value: string | null): void {
+    limitedToken.value = value;
+    persistLimitedToken(value);
+  }
+
   function applySession(session: AuthSession): void {
     user.value = session.user;
     applyTokens(session.tokens);
@@ -140,6 +203,7 @@ export const useAuthStore = defineStore("auth", () => {
     refreshToken.value = null;
     writeToken(ACCESS_TOKEN_KEY, null);
     writeToken(REFRESH_TOKEN_KEY, null);
+    rememberLimitedToken(null);
     resetMessages();
   }
 
@@ -419,6 +483,153 @@ export const useAuthStore = defineStore("auth", () => {
     }
   }
 
+  // --- Third-party sign-in -------------------------------------------------
+
+  /**
+   * The providers this instance can actually drive.
+   *
+   * Answered by the server, so a provider with no credentials is simply absent —
+   * the page never renders a button that would fail on click. An instance with
+   * none returns an empty list, and the login page shows no third-party section
+   * at all.
+   */
+  async function fetchOAuthProviders(): Promise<OAuthProviderInfo[]> {
+    try {
+      const response = await apiGet<{ providers: OAuthProviderInfo[] }>(
+        "/auth/oauth/providers",
+      );
+      return response.providers;
+    } catch (cause) {
+      // A missing provider list must not break email sign-in, so this is
+      // reported softly and the section simply does not render.
+      console.warn("第三方登录列表获取失败", cause);
+      return [];
+    }
+  }
+
+  /**
+   * Ask the server where to send the browser for a third-party sign-in.
+   *
+   * The URL is the server's answer — it carries the `state` and the PKCE
+   * challenge, and the client must never assemble it. The *navigation* is the
+   * caller's: a store that redirected would be untestable without faking
+   * `window.location`, and the view already owns where the user goes.
+   */
+  async function startOAuth(provider: OAuthProvider): Promise<string | null> {
+    loading.value = true;
+    resetMessages();
+    try {
+      const response = await apiPost<{ authorize_url: string }>(
+        "/auth/oauth/start",
+        { provider },
+      );
+      return response.authorize_url;
+    } catch (cause) {
+      applyError(cause);
+      return null;
+    } finally {
+      loading.value = false;
+    }
+  }
+
+  /**
+   * Redeem the provider's redirect.
+   *
+   * Two outcomes, and the caller must handle both: a finished sign-in, or a
+   * first-time user who must choose a username. The second is not an error — it
+   * is a step, and the limited token that goes with it is kept for it.
+   */
+  async function completeOAuthCallback(
+    provider: OAuthProvider,
+    code: string,
+    state: string,
+  ): Promise<OAuthCallbackResponse | null> {
+    loading.value = true;
+    resetMessages();
+    try {
+      const response = await apiPost<OAuthCallbackResponse>(
+        "/auth/oauth/callback",
+        { provider, code, state },
+      );
+
+      if (response.session !== undefined) {
+        applySession({
+          user: response.session.user,
+          tokens: response.session.tokens,
+        });
+        rememberLimitedToken(null);
+        return response;
+      }
+
+      const limited = response.onboarding?.limited_token ?? null;
+      rememberLimitedToken(limited);
+      return response;
+    } catch (cause) {
+      rememberLimitedToken(null);
+      applyError(cause);
+      return null;
+    } finally {
+      loading.value = false;
+    }
+  }
+
+  /**
+   * Finish a first-time third-party sign-in by choosing a username.
+   *
+   * The limited token is the bearer credential, and the server spends it as it
+   * claims the handle — so a username that lost a race comes back as a field
+   * problem on the same token and the user simply picks another.
+   */
+  async function completeOAuthSignIn(
+    username: string,
+    displayName = "",
+  ): Promise<boolean> {
+    const limited = limitedToken.value;
+    if (limited === null) {
+      errorCode.value = "USERNAME_REQUIRED";
+      errorMessage.value = "用户名设置已过期，请重新使用第三方登录";
+      return false;
+    }
+
+    const problem = validateUsername(username);
+    if (problem !== null) {
+      rejectLocally([problem]);
+      return false;
+    }
+
+    const trimmedDisplayName = displayName.trim();
+
+    loading.value = true;
+    resetMessages();
+    try {
+      const response = await apiPostAuthed<OAuthCallbackResponse>(
+        "/auth/oauth/complete",
+        {
+          username: normalizeUsername(username),
+          display_name: trimmedDisplayName === "" ? null : trimmedDisplayName,
+        },
+        limited,
+      );
+
+      const session = response.session;
+      if (session === undefined) {
+        // The server never answers an onboarding half from this endpoint; a
+        // response without a session means the contract changed under us.
+        errorMessage.value = "登录状态异常，请重新使用第三方登录";
+        return false;
+      }
+
+      applySession({ user: session.user, tokens: session.tokens });
+      rememberLimitedToken(null);
+      return true;
+    } catch (cause) {
+      applyError(cause);
+      return false;
+    } finally {
+      loading.value = false;
+    }
+  }
+
   /**
    * Re-establish the session after a reload.
    *
@@ -434,6 +645,7 @@ export const useAuthStore = defineStore("auth", () => {
     user,
     accessToken,
     refreshToken,
+    limitedToken,
     whoami,
     loading,
     errorCode,
@@ -451,6 +663,10 @@ export const useAuthStore = defineStore("auth", () => {
     logout,
     fetchCurrentUser,
     fetchWhoAmI,
+    fetchOAuthProviders,
+    startOAuth,
+    completeOAuthCallback,
+    completeOAuthSignIn,
     restore,
     clear,
   };

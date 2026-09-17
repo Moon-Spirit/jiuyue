@@ -6,6 +6,7 @@ import type { Presence } from "../generated/Presence";
 import type { ResyncReason } from "../generated/ResyncReason";
 import type { ServerEnvelope } from "../generated/ServerEnvelope";
 import type { ServerEvent } from "../generated/ServerEvent";
+import type { Typing } from "../generated/Typing";
 import { useAuthStore } from "./auth";
 
 /**
@@ -64,6 +65,7 @@ export const useRealtimeStore = defineStore("realtime", () => {
   const listeners = new Set<(event: ServerEvent) => void>();
   const resyncListeners = new Set<(reason: ResyncReason) => void>();
   const presenceListeners = new Set<(presence: Presence) => void>();
+  const typingListeners = new Set<(typing: Typing) => void>();
 
   /** Highest `s` applied on the current connection; reset when a new one opens. */
   let lastSequence: number | null = null;
@@ -159,6 +161,13 @@ export const useRealtimeStore = defineStore("realtime", () => {
         // than to the chat store, which stays about Conversations and Messages.
         for (const listener of presenceListeners) listener(event.d);
         break;
+      case "Typing":
+        // A Typing Indicator is ephemeral state *about* a Participant, not
+        // Message history, so it too has its own subscribers rather than riding
+        // the chat store's message reducers. The server never sends the sender's
+        // own echo here, so a subscriber never sees its own Devices.
+        for (const listener of typingListeners) listener(event.d);
+        break;
       default:
         assertExhaustive(event);
     }
@@ -205,6 +214,19 @@ export const useRealtimeStore = defineStore("realtime", () => {
   function onPresenceEvent(listener: (presence: Presence) => void): () => void {
     presenceListeners.add(listener);
     return () => presenceListeners.delete(listener);
+  }
+
+  /**
+   * Subscribe to Typing Indicators. Returns an unsubscribe.
+   *
+   * The server delivers a Typing Indicator only to the *other* Participants of the
+   * Conversation it names, and never back to the sender's own Devices, so a
+   * subscriber here never sees its own echo. The socket is the pipe; the typing
+   * store owns what the deadline means and how it is rendered.
+   */
+  function onTypingEvent(listener: (typing: Typing) => void): () => void {
+    typingListeners.add(listener);
+    return () => typingListeners.delete(listener);
   }
 
   /** Open the realtime channel, reusing the socket if it already exists. */
@@ -262,5 +284,6 @@ export const useRealtimeStore = defineStore("realtime", () => {
     onChatEvent,
     onResync,
     onPresenceEvent,
+    onTypingEvent,
   };
 });

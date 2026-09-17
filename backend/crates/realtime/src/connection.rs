@@ -113,6 +113,10 @@ async fn run_connection(
                 // lock stamps every reachable User in one statement, so a node with
                 // many connections still writes once per interval.
                 hub.checkpoint_presence().await;
+                // Expired Typing Indicators are the other thing that has to age out
+                // on a clock: a client that closes mid-sentence never says it
+                // stopped, so the map is swept here rather than trusted to a stop.
+                hub.sweep_typing().await;
                 // A peer that has stopped answering its heartbeat is gone even
                 // though the socket still looks open — the half-open connection
                 // ADR-0013 describes, seen from the server. Ending the loop drives

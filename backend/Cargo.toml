@@ -25,6 +25,17 @@ tower = "0.5"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+# The outbound HTTP client the OAuth adapters use to reach a provider's token
+# and profile endpoints. Rustls with the bundled webpki roots, not the platform
+# verifier: the server already uses rustls+ring (see `jiuyue-auth`'s JWT note),
+# and a trust store compiled into the binary behaves the same on the 2C2G Hong
+# Kong box as it does in CI, with no system CA store to be missing.
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls-webpki-roots",
+    "json",
+    "http2",
+] }
+
 # Sized for a 2 vCPU / 2 GB single-node box: single codegen unit and thin LTO
 # trade a little build time for a smaller, faster release binary.
 [profile.release]

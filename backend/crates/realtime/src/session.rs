@@ -192,6 +192,12 @@ impl<'a> Session<'a> {
             ClientEvent::MarkRead(mark) => {
                 self.mark_read(mark).await;
             }
+            ClientEvent::Typing(signal) => {
+                // Ephemeral and best-effort: the hub coalesces it, authorises it
+                // and fans it out. Nothing here persists, sequences or replays it,
+                // which is what makes the indicator impossible to find in history.
+                self.hub.handle_typing(&self.device.user_id, signal).await;
+            }
         }
 
         Ok(())
@@ -222,6 +228,14 @@ impl<'a> Session<'a> {
                         )
                         .await;
                 }
+
+                // A Message is the strongest possible "I stopped typing", and the
+                // sender's client may have hit Enter without sending a stop. Clear
+                // the indicator here so it disappears with the Message rather than
+                // lingering for the TTL. A no-op when the sender was not typing.
+                self.hub
+                    .clear_typing(&self.device.user_id, &send.conversation_id)
+                    .await;
 
                 ServerEvent::MessageAck(MessageAck {
                     client_msg_id: send.client_msg_id.clone(),

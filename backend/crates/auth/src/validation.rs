@@ -111,6 +111,27 @@ pub fn validate_resend_verification(request: &ResendVerificationRequest) -> Vec<
     errors
 }
 
+/// Validate the username a first-time provider user chose.
+///
+/// The rules are the registration rules, unchanged: a handle claimed here is the
+/// same kind of value as one claimed at registration, and it has to satisfy the
+/// same `users_username_format` check, the same length bounds, and the same
+/// unique index. Re-deriving them would be how the two paths drift apart.
+pub fn validate_username_choice(
+    request: &jiuyue_contract::CompleteOAuthSignInRequest,
+) -> Vec<FieldError> {
+    let mut errors = Vec::new();
+
+    let username = normalize_username(&request.username);
+    push(&mut errors, check_username(&username));
+
+    if let Some(requested) = request.display_name.as_deref() {
+        push(&mut errors, check_display_name(requested));
+    }
+
+    errors
+}
+
 /// Validate a password-reset request.
 ///
 /// The new password must satisfy the same strength policy as registration. A

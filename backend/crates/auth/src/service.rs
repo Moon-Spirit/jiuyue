@@ -40,6 +40,8 @@ use crate::limiter::{
 };
 use crate::links;
 use crate::mailer::{InMemoryMailer, Mailer, OutgoingMessage};
+use crate::oauth::provider::OAuthClient;
+use crate::oauth::service::{OAuthConfig, OAuthService};
 use crate::password::PasswordHasher;
 use crate::repository::{NewAccount, NewSession, SessionRepository, UserRow};
 use crate::token::{IssuedAccess, TokenIssuer};
@@ -57,6 +59,14 @@ pub struct AuthConfig {
     /// Public base URL the frontend is served from, used to build the links inside
     /// verification and reset emails (for example `https://jiuyue.example`).
     pub public_base_url: String,
+    /// Origin a third-party provider sends the browser back to.
+    ///
+    /// Usually the same as [`Self::public_base_url`], and it defaults to it. It is
+    /// separate because a deployment that terminates the OAuth callback on a
+    /// different host (a dedicated callback domain) is a real configuration, and
+    /// because the redirect URI the provider is told about must never be derived
+    /// from a request header.
+    pub oauth_redirect_base_url: Option<String>,
     /// How long an email-verification link stays valid.
     pub verification_token_ttl: Duration,
     /// How long a password-reset link stays valid.
@@ -90,9 +100,17 @@ impl AuthConfig {
             access_token_ttl: Self::DEFAULT_ACCESS_TOKEN_TTL,
             refresh_token_ttl: Self::DEFAULT_REFRESH_TOKEN_TTL,
             public_base_url: Self::DEFAULT_PUBLIC_BASE_URL.to_owned(),
+            oauth_redirect_base_url: None,
             verification_token_ttl: Self::DEFAULT_VERIFICATION_TOKEN_TTL,
             reset_token_ttl: Self::DEFAULT_RESET_TOKEN_TTL,
         }
+    }
+
+    /// The origin a provider's redirect comes back to.
+    pub fn oauth_redirect_base_url(&self) -> &str {
+        self.oauth_redirect_base_url
+            .as_deref()
+            .unwrap_or(&self.public_base_url)
     }
 }
 
@@ -149,6 +167,7 @@ pub struct AuthServiceBuilder {
     login_attempts: Option<Arc<dyn LoginAttemptStore>>,
     email_attempts: Option<Arc<dyn LoginAttemptStore>>,
     mailer: Option<Arc<dyn Mailer>>,
+    oauth: Option<(Arc<dyn OAuthClient>, OAuthConfig)>,
 }
 
 impl AuthServiceBuilder {
@@ -174,6 +193,16 @@ impl AuthServiceBuilder {
         self
     }
 
+    /// Enable third-party sign-in through the given transport and configuration.
+    ///
+    /// Left off, OAuth is simply not offered: no provider appears on the login
+    /// page and every OAuth endpoint answers `OAUTH_NOT_CONFIGURED`. A deployment
+    /// that has not registered OAuth applications is the normal case.
+    pub fn oauth(mut self, client: Arc<dyn OAuthClient>, config: OAuthConfig) -> Self {
+        self.oauth = Some((client, config));
+        self
+    }
+
     /// Build the service, hashing one throwaway password as the timing equaliser.
     pub async fn build(self) -> Result<AuthService, AuthError> {
         let hasher = PasswordHasher::new();
@@ -190,6 +219,15 @@ impl AuthServiceBuilder {
             .mailer
             .unwrap_or_else(|| Arc::new(InMemoryMailer::new()));
 
+        let oauth = self.oauth.map(|(client, config)| {
+            OAuthService::new(
+                self.pool.clone(),
+                client,
+                config,
+                self.config.oauth_redirect_base_url().to_owned(),
+            )
+        });
+
         Ok(AuthService {
             repository: SessionRepository::new(self.pool.clone()),
             account_tokens: AccountTokenRepository::new(self.pool),
@@ -198,6 +236,7 @@ impl AuthServiceBuilder {
             login_attempts,
             email_attempts,
             mailer,
+            oauth,
             public_base_url: self.config.public_base_url,
             verification_token_ttl: self.config.verification_token_ttl,
             reset_token_ttl: self.config.reset_token_ttl,
@@ -227,6 +266,8 @@ pub struct AuthService {
     email_attempts: Arc<dyn LoginAttemptStore>,
     /// Where mail is handed off. Sending is spawned, never awaited here.
     mailer: Arc<dyn Mailer>,
+    /// Third-party sign-in, when this instance has any provider configured.
+    oauth: Option<OAuthService>,
     /// Base URL for the links inside emails.
     public_base_url: String,
     /// Verification-link lifetime.
@@ -252,7 +293,14 @@ impl AuthService {
             login_attempts: None,
             email_attempts: None,
             mailer: None,
+            oauth: None,
         }
+    }
+
+    /// Third-party sign-in, or [`AuthError::OAuthNotConfigured`] on an instance
+    /// that has no provider credentials.
+    pub fn oauth(&self) -> Result<&OAuthService, AuthError> {
+        self.oauth.as_ref().ok_or(AuthError::OAuthNotConfigured)
     }
 
     /// Build the service with a chosen login-attempt store.
@@ -766,7 +814,18 @@ impl AuthService {
         })
     }
 
-    fn token_pair(&self, issued: IssuedAccess, refresh_token: String) -> TokenPair {
+    /// Sign an access token for a session, for the paths that open sessions
+    /// outside this module (third-party sign-in).
+    pub(crate) fn issue_access_token(
+        &self,
+        user_id: &str,
+        session_id: &str,
+    ) -> Result<IssuedAccess, AuthError> {
+        self.tokens.issue_access(user_id, session_id)
+    }
+
+    /// Assemble the credential pair the client stores.
+    pub(crate) fn token_pair(&self, issued: IssuedAccess, refresh_token: String) -> TokenPair {
         TokenPair {
             access_token: issued.token,
             refresh_token,
@@ -825,12 +884,12 @@ async fn refuse_while_limited(
 }
 
 /// A fresh ULID primary key, matching the `users` / `sessions` conventions.
-fn new_id() -> String {
+pub(crate) fn new_id() -> String {
     ulid::Ulid::new().to_string()
 }
 
 /// Project a stored account onto its public shape.
-fn profile_from(user: UserRow) -> UserProfile {
+pub(crate) fn profile_from(user: UserRow) -> UserProfile {
     UserProfile {
         id: user.id,
         username: user.username,

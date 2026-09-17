@@ -9,16 +9,19 @@ import GroupInfoPanel from "../components/chat/GroupInfoPanel.vue";
 import MessageComposer from "../components/chat/MessageComposer.vue";
 import MessageList from "../components/chat/MessageList.vue";
 import PresenceBadge from "../components/chat/PresenceBadge.vue";
+import TypingIndicator from "../components/chat/TypingIndicator.vue";
 import type { PresenceStatus } from "../generated/PresenceStatus";
 import { useAuthStore } from "../stores/auth";
 import { useChatStore } from "../stores/chat";
 import { usePresenceStore } from "../stores/presence";
 import { useRealtimeStore } from "../stores/realtime";
+import { useTypingStore } from "../stores/typing";
 
 const auth = useAuthStore();
 const chat = useChatStore();
 const presence = usePresenceStore();
 const realtime = useRealtimeStore();
+const typing = useTypingStore();
 const router = useRouter();
 
 const { user } = storeToRefs(auth);
@@ -94,6 +97,43 @@ const activePeerReceiptSeq = computed(() => {
 
 /** The focused Conversation's peer id, or `null` for a Group (which has none). */
 const activePeerId = computed(() => activeConversation.value?.peer?.id ?? null);
+
+/**
+ * Resolve a Participant id to a name the indicator can show.
+ *
+ * A Group's member list is the only place a member's name lives, and the chat
+ * store loads it when the Conversation is opened, so a Group indicator can name
+ * people rather than print ULIDs. A Direct Conversation's peer is on the summary.
+ */
+function displayNameFor(userId: string): string {
+  const conversation = activeConversation.value;
+
+  if (conversation?.group !== undefined) {
+    const member = activeGroupMembers.value.find(
+      (entry) => entry.user_id === userId,
+    );
+    return member?.display_name || member?.username || userId;
+  }
+
+  const peer = conversation?.peer;
+  if (peer !== null && peer !== undefined && peer.id === userId) {
+    return peer.display_name || peer.username;
+  }
+
+  return userId;
+}
+
+/** The names of the Participants typing in the focused Conversation. */
+const typingNames = computed<string[]>(() => {
+  const id = activeConversationId.value;
+  if (id === null) return [];
+  return typing.typersFor(id).map(displayNameFor);
+});
+
+/** A draft change from the composer, published through the typing store's throttle. */
+function onComposerTyping(hasText: boolean): void {
+  typing.noteInput(activeConversationId.value ?? "", hasText);
+}
 
 /** The focused peer's reachability, or `null` while nothing is known yet. */
 const activePeerStatus = computed<PresenceStatus | null>(() => {
@@ -179,9 +219,12 @@ onUnmounted(() => {
 });
 
 // Switching Conversations leaves the info panel behind: it belongs to the chat
-// that was open, not to the one now focused.
-watch(activeConversationId, () => {
+// that was open, not to the one now focused. It also stops the outgoing typing
+// signal for the Conversation being left, so the previous chat does not keep
+// showing "typing" while the user reads another one.
+watch(activeConversationId, (_id, previous) => {
   showGroupInfo.value = false;
+  if (typeof previous === "string") typing.stopTyping(previous);
 });
 
 async function startChat(): Promise<void> {
@@ -252,6 +295,9 @@ async function signOut(): Promise<void> {
   // Presence belongs to the signed-in User: leaving it behind would show the next
   // account the previous one's peers as online.
   presence.clear();
+  // A Typing Indicator is just as account-scoped, and must not leak across a
+  // sign-out either.
+  typing.clear();
   await auth.logout();
   await router.replace({ name: "login" });
 }
@@ -433,10 +479,16 @@ async function signOut(): Promise<void> {
           {{ errorMessage }}
         </p>
 
+        <TypingIndicator
+          v-if="!(isGroup && showGroupInfo)"
+          :names="typingNames"
+        />
+
         <MessageComposer
           v-if="!(isGroup && showGroupInfo)"
           :disabled="!connected"
           @send="chat.sendMessage($event)"
+          @typing="onComposerTyping"
         />
       </template>
 

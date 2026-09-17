@@ -23,13 +23,14 @@ use axum::http::{Method, Request, StatusCode};
 use futures_util::{SinkExt, StreamExt};
 use jiuyue_auth::{AuthConfig, AuthService, InMemoryMailer, Mailer};
 use jiuyue_chat::ChatService;
+use jiuyue_contract::events::{Typing, TypingSignal, TypingState};
 use jiuyue_contract::{
     AuthSession, ClientEnvelope, ClientEvent, ConversationList, ConversationSummary, GroupInfo,
     MarkRead, MembershipChanged, MessageAck, MessageList, MessageRejected, MessageView, NewMessage,
     Ping, Presence, PresenceList, ReadMarker, ReadReceipt, Resume, Resync, Role, SendMessage,
     ServerEnvelope, ServerEvent, SyncCursor, SyncState,
 };
-use jiuyue_realtime::{HEARTBEAT_INTERVAL, RealtimeHub};
+use jiuyue_realtime::{HEARTBEAT_INTERVAL, RealtimeHub, TypingLimits};
 use jiuyue_server::{AppState, Config, Services, app};
 use jiuyue_store::Store;
 use serde_json::{Value, json};
@@ -74,6 +75,16 @@ impl TestApp {
     /// the same app with a millisecond period. Nothing else differs: the real
     /// registry, the real replay buffer and the real database are all still used.
     pub async fn start_with_heartbeat(heartbeat: Duration) -> Self {
+        Self::start_with_typing(heartbeat, TypingLimits::production()).await
+    }
+
+    /// Same, with explicit heartbeat and Typing Indicator clocks.
+    ///
+    /// The typing tests cannot wait the production 10 s TTL or 5 s throttle, so
+    /// they build the same app with millisecond limits. Nothing else differs: the
+    /// coalescing, the audience resolution and the fan-out are all the production
+    /// code paths.
+    pub async fn start_with_typing(heartbeat: Duration, typing: TypingLimits) -> Self {
         // Surface the server's own error logs when a test fails; the first
         // initialisation wins and a second is a no-op.
         let _ = tracing_subscriber::fmt()
@@ -108,12 +119,15 @@ impl TestApp {
             .await
             .expect("the identity service must build with a valid secret");
         let chat = Arc::new(ChatService::new(pool.clone()));
-        let realtime = Arc::new(RealtimeHub::with_settings(
-            Arc::clone(&chat),
-            pool,
-            heartbeat,
-            jiuyue_realtime::DEFAULT_REPLAY_CAPACITY,
-        ));
+        let realtime = Arc::new(
+            RealtimeHub::with_settings(
+                Arc::clone(&chat),
+                pool,
+                heartbeat,
+                jiuyue_realtime::DEFAULT_REPLAY_CAPACITY,
+            )
+            .with_typing_limits(typing),
+        );
 
         let state = AppState::with_services(
             Config::default(),
@@ -461,6 +475,17 @@ pub fn send_message(conversation_id: &str, client_msg_id: &str, body: &str) -> C
     })
 }
 
+/// A `Typing` client event: "I started / stopped composing in this Conversation".
+///
+/// The *who* is never in the signal — it is the authenticated User the socket
+/// belongs to — and there is deliberately no text field to fill in.
+pub fn typing(conversation_id: &str, state: TypingState) -> ClientEvent {
+    ClientEvent::Typing(TypingSignal {
+        conversation_id: conversation_id.to_owned(),
+        state,
+    })
+}
+
 /// A `Resume` wake-up handshake naming the highest connection sequence consumed.
 ///
 /// `0` means "this is a first connection, I consumed nothing"; `connection_id` is
@@ -704,6 +729,15 @@ pub async fn expect_presence(socket: &mut TestSocket) -> Presence {
     }
 }
 
+/// Read until the next Typing Indicator arrives, ignoring everything else.
+pub async fn expect_typing(socket: &mut TestSocket) -> Typing {
+    loop {
+        if let ServerEvent::Typing(typing) = next_event(socket).await {
+            return typing;
+        }
+    }
+}
+
 /// Every non-heartbeat event a socket receives within `timeout`.
 ///
 /// Used to assert an **absence**: the privacy test drains a peer's socket for a
@@ -862,6 +896,24 @@ pub async fn count_rows(pool: &PgPool, table: &str) -> i64 {
         .fetch_one(pool)
         .await
         .unwrap_or_else(|error| panic!("counting `{table}` must succeed: {error}"))
+}
+
+/// Every table in this test's schema whose name looks like typing storage.
+///
+/// The structural half of "a typing signal is never persisted": it is not enough
+/// that this ticket added no column — a Typing Indicator must have no table at all,
+/// anywhere, that a future change could quietly start writing to. `current_schema()`
+/// resolves through the connection's `search_path`, so this only ever sees the
+/// throwaway schema the test runs in.
+pub async fn typing_tables(pool: &PgPool) -> Vec<String> {
+    sqlx::query_scalar(
+        "SELECT table_name FROM information_schema.tables \
+         WHERE table_schema = current_schema() AND table_name ILIKE '%typ%' \
+         ORDER BY table_name",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap_or_else(|error| panic!("reading information_schema must succeed: {error}"))
 }
 
 /// Every Device's stored cursor for one Conversation, ordered by Device id.

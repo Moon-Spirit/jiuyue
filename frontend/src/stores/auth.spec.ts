@@ -4,6 +4,10 @@ import { useAuthStore } from "./auth";
 
 const ACCESS_KEY = "jiuyue.auth.access_token";
 const REFRESH_KEY = "jiuyue.auth.refresh_token";
+const LIMITED_KEY = "jiuyue.auth.oauth_limited_token";
+
+/** An untyped JSON object, which every payload builder here returns. */
+type Json = Record<string, unknown>;
 
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
@@ -13,7 +17,7 @@ function jsonResponse(body: unknown, status = 200): Response {
 }
 
 /** A session as the backend returns it. */
-function sessionPayload(): unknown {
+function sessionPayload(): Json {
   return {
     user: {
       id: "01JABC1234567890ABCDEFGHJ1",
@@ -93,6 +97,7 @@ describe("useAuthStore", () => {
   beforeEach(() => {
     setActivePinia(createPinia());
     window.localStorage.clear();
+    window.sessionStorage.clear();
   });
 
   afterEach(() => {
@@ -548,5 +553,227 @@ describe("useAuthStore", () => {
 
     expect(who?.session_id).toBe("01JABC1234567890ABCDEFGHJ2");
     expect(store.whoami?.user_id).toBe("01JABC1234567890ABCDEFGHJ1");
+  });
+
+  // --- Third-party sign-in ------------------------------------------------
+
+  it("offers only the providers the server answered with", async () => {
+    stubFetch({
+      "/api/auth/oauth/providers": [
+        () =>
+          jsonResponse({
+            providers: [
+              {
+                provider: "github",
+                display_name: "GitHub",
+                authorize_url:
+                  "https://github.com/login/oauth/authorize?state=s&code_challenge=c",
+              },
+            ],
+          }),
+      ],
+    });
+
+    const store = useAuthStore();
+    const providers = await store.fetchOAuthProviders();
+
+    expect(providers).toHaveLength(1);
+    expect(providers[0]?.provider).toBe("github");
+    expect(providers[0]?.display_name).toBe("GitHub");
+  });
+
+  it("offers nothing, rather than failing, when the provider list is unavailable", async () => {
+    stubFetch({
+      "/api/auth/oauth/providers": [
+        () => jsonResponse(errorPayload("INTERNAL", "服务器内部错误"), 500),
+      ],
+    });
+    vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+    const store = useAuthStore();
+    const providers = await store.fetchOAuthProviders();
+
+    expect(providers).toEqual([]);
+    expect(store.errorCode).toBeNull();
+  });
+
+  it("asks the server for the authorize URL and hands it back to the caller", async () => {
+    const authorize =
+      "https://github.com/login/oauth/authorize?state=state-1&code_challenge=challenge-1";
+    const fetchMock = stubFetch({
+      "/api/auth/oauth/start": [
+        () => jsonResponse({ authorize_url: authorize }),
+      ],
+    });
+
+    const store = useAuthStore();
+    const url = await store.startOAuth("github");
+
+    expect(url).toBe(authorize);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    const { url: path, init } = callAt(fetchMock, 0);
+    expect(path).toBe("/api/auth/oauth/start");
+    expect(JSON.parse(String(init?.body))).toEqual({ provider: "github" });
+  });
+
+  it("adopts the session a callback produces", async () => {
+    stubFetch({
+      "/api/auth/oauth/callback": [
+        () =>
+          jsonResponse({
+            session: { ...sessionPayload(), redirect_path: "/chat" },
+          }),
+      ],
+    });
+
+    const store = useAuthStore();
+    const response = await store.completeOAuthCallback(
+      "github",
+      "the-code",
+      "the-state",
+    );
+
+    expect(response?.session?.redirect_path).toBe("/chat");
+    expect(store.isAuthenticated).toBe(true);
+    expect(store.user?.username).toBe("alice");
+    // A finished sign-in must not leave a limited token behind.
+    expect(window.sessionStorage.getItem(LIMITED_KEY)).toBeNull();
+  });
+
+  it("holds a first-time callback at the username step and keeps the limited token", async () => {
+    const fetchMock = stubFetch({
+      "/api/auth/oauth/callback": [
+        () =>
+          jsonResponse({
+            onboarding: {
+              limited_token: "limited-1",
+              suggested_username: "octocat",
+              email: "octocat@example.com",
+              redirect_path: null,
+            },
+          }),
+      ],
+    });
+
+    const store = useAuthStore();
+    const response = await store.completeOAuthCallback(
+      "github",
+      "the-code",
+      "the-state",
+    );
+
+    expect(response?.session).toBeUndefined();
+    expect(response?.onboarding?.limited_token).toBe("limited-1");
+    expect(store.isAuthenticated).toBe(false);
+    expect(store.limitedToken).toBe("limited-1");
+    expect(window.sessionStorage.getItem(LIMITED_KEY)).toBe("limited-1");
+
+    const { init } = callAt(fetchMock, 0);
+    expect(JSON.parse(String(init?.body))).toEqual({
+      provider: "github",
+      code: "the-code",
+      state: "the-state",
+    });
+  });
+
+  it("finishes a first-time sign-in by sending the limited token as the bearer", async () => {
+    const fetchMock = stubFetch({
+      "/api/auth/oauth/callback": [
+        () =>
+          jsonResponse({
+            onboarding: {
+              limited_token: "limited-1",
+              suggested_username: "octocat",
+              email: null,
+              redirect_path: null,
+            },
+          }),
+      ],
+      "/api/auth/oauth/complete": [
+        () => jsonResponse({ session: sessionPayload() }),
+      ],
+    });
+
+    const store = useAuthStore();
+    await store.completeOAuthCallback("github", "c", "s");
+
+    const ok = await store.completeOAuthSignIn("chosen_name", "Chosen");
+
+    expect(ok).toBe(true);
+    expect(store.isAuthenticated).toBe(true);
+    expect(store.limitedToken).toBeNull();
+    expect(window.sessionStorage.getItem(LIMITED_KEY)).toBeNull();
+
+    const { url, init } = callAt(fetchMock, 1);
+    expect(url).toBe("/api/auth/oauth/complete");
+    expect(init?.headers).toEqual({
+      Accept: "application/json",
+      "Content-Type": "application/json",
+      Authorization: "Bearer limited-1",
+    });
+    expect(JSON.parse(String(init?.body))).toEqual({
+      username: "chosen_name",
+      display_name: "Chosen",
+    });
+  });
+
+  it("rejects an invalid username before spending the limited token", async () => {
+    const fetchMock = stubFetch({});
+    window.sessionStorage.setItem(LIMITED_KEY, "limited-1");
+
+    const store = useAuthStore();
+    const ok = await store.completeOAuthSignIn("ab");
+
+    expect(ok).toBe(false);
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(store.fieldErrors["username"]).toBe("用户名至少 3 个字符");
+    expect(store.limitedToken).toBe("limited-1");
+  });
+
+  it("surfaces a taken username and keeps the limited token for a retry", async () => {
+    window.sessionStorage.setItem(LIMITED_KEY, "limited-1");
+    stubFetch({
+      "/api/auth/oauth/complete": [
+        () =>
+          jsonResponse(
+            errorPayload("USERNAME_TAKEN", "该用户名已被占用", [
+              { field: "username", code: "TAKEN", message: "该用户名已被占用" },
+            ]),
+            409,
+          ),
+      ],
+    });
+
+    const store = useAuthStore();
+    const ok = await store.completeOAuthSignIn("taken_name");
+
+    expect(ok).toBe(false);
+    expect(store.errorCode).toBe("USERNAME_TAKEN");
+    expect(store.fieldErrors["username"]).toBe("该用户名已被占用");
+    expect(store.limitedToken).toBe("limited-1");
+  });
+
+  it("maps the account-take-over refusal to its own code", async () => {
+    stubFetch({
+      "/api/auth/oauth/callback": [
+        () =>
+          jsonResponse(
+            errorPayload(
+              "OAUTH_ACCOUNT_EXISTS",
+              "该邮箱已注册，请用原来的方式登录后在设置中绑定第三方账号",
+            ),
+            409,
+          ),
+      ],
+    });
+
+    const store = useAuthStore();
+    const response = await store.completeOAuthCallback("github", "c", "s");
+
+    expect(response).toBeNull();
+    expect(store.errorCode).toBe("OAUTH_ACCOUNT_EXISTS");
+    expect(store.isAuthenticated).toBe(false);
+    expect(store.limitedToken).toBeNull();
   });
 });

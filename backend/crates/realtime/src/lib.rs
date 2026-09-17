@@ -91,6 +91,18 @@
 //! is the durable half, checkpointed into `user_presence` by
 //! [`LastSeenStore`] under the same batched discipline as the cursors above.
 //!
+//! # Typing Indicator
+//!
+//! A Typing Indicator is the protocol's cheapest event and therefore its easiest
+//! amplifier, so the **throttle is the feature**: the hub coalesces every signal
+//! for one (Conversation, Participant) into at most one fan-out per
+//! [`TypingLimits::throttle`], and every indicator expires after
+//! [`TypingLimits::ttl`] whether or not a stop arrives. See [`typing`] for the
+//! arithmetic and why the state is ephemeral by construction rather than by
+//! convention. The fan-out audience is the *other* Participants of the one
+//! Conversation — never the sender's whole social graph, never the sender's own
+//! Devices — resolved through the chat domain like every other recipient set.
+//!
 //! A connection that goes silent without closing — a severed network, a killed
 //! client with no FIN — is swept once its client heartbeat is overdue: see
 //! `ConnectionLiveness` and [`RealtimeHub::dead_connection_timeout`]. A client
@@ -106,6 +118,7 @@ mod presence;
 mod registry;
 mod replay;
 mod session;
+mod typing;
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -118,6 +131,7 @@ pub use connection::serve_connection;
 pub use presence::LastSeenStore;
 pub use registry::{ConnectionId, ConnectionRegistry, PresenceChange};
 pub use replay::{DEFAULT_REPLAY_CAPACITY, ReplayBuffer};
+pub use typing::TypingLimits;
 
 /// Hard cap on a single WebSocket frame (64 KiB).
 ///
@@ -242,6 +256,7 @@ pub struct RealtimeHub {
     registry: ConnectionRegistry,
     chat: Arc<ChatService>,
     presence: presence::PresenceState,
+    typing: typing::TypingTracker,
     heartbeat_interval: Duration,
     replay_capacity: usize,
     dead_connection_timeout: Duration,
@@ -271,10 +286,23 @@ impl RealtimeHub {
             registry: ConnectionRegistry::new(),
             chat,
             presence: presence::PresenceState::new(pool),
+            typing: typing::TypingTracker::new(TypingLimits::production()),
             heartbeat_interval,
             replay_capacity,
             dead_connection_timeout: heartbeat_interval * DEAD_CONNECTION_BEATS,
         }
+    }
+
+    /// Override the Typing Indicator clocks.
+    ///
+    /// Exists so a test can watch the throttle and the expiry in milliseconds
+    /// instead of tens of seconds, without weakening the production values.
+    /// Consuming rather than mutating so a hub is fully configured before it is
+    /// shared — the same reason the heartbeat and replay capacity are constructor
+    /// arguments.
+    pub fn with_typing_limits(mut self, limits: TypingLimits) -> Self {
+        self.typing = typing::TypingTracker::new(limits);
+        self
     }
 
     /// The live-connection registry, for fan-out from outside the socket path.

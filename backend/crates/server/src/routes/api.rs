@@ -201,6 +201,66 @@ impl From<AuthError> for ApiError {
                 "找不到该账号",
                 Vec::new(),
             ),
+            // The account-take-over refusal, and the most important answer this
+            // API gives. A provider asserted an address that already belongs to an
+            // account, so nothing was linked and nothing was created. `409` is the
+            // honest code: the request conflicts with the state of the world, and
+            // the client's instruction is to sign in the usual way and link the
+            // provider from settings.
+            AuthError::AccountExists => Self::new(
+                StatusCode::CONFLICT,
+                ErrorCode::OAuthAccountExists,
+                "该邮箱已注册，请用原来的方式登录后在设置中绑定第三方账号",
+                Vec::new(),
+            ),
+            // This provider identity already belongs to another account. One
+            // provider identity, one account — linking it elsewhere is not a
+            // request that can be granted.
+            AuthError::OAuthIdentityTaken => Self::new(
+                StatusCode::CONFLICT,
+                ErrorCode::OAuthAccountExists,
+                "该第三方账号已绑定到其他账号",
+                Vec::new(),
+            ),
+            // The state did not come from here, is already spent, or has expired.
+            // Answering 400 with a code the client can branch on is deliberate:
+            // "start over" is actionable, and the alternative — proceeding — is the
+            // login-CSRF hole this refusal exists to close.
+            AuthError::OAuthStateInvalid => Self::new(
+                StatusCode::BAD_REQUEST,
+                ErrorCode::OAuthStateInvalid,
+                "登录请求已失效，请重新发起第三方登录",
+                Vec::new(),
+            ),
+            // The provider refused or was unreachable. `502 Bad Gateway` says
+            // "an upstream failed", which is true, and the provider's own text is
+            // never echoed: it is their vocabulary and may carry a secret.
+            AuthError::OAuthProviderError(detail) => {
+                tracing::warn!(detail = %detail, "third-party sign-in failed at the provider");
+                Self::new(
+                    StatusCode::BAD_GATEWAY,
+                    ErrorCode::OAuthProviderError,
+                    "第三方登录暂时不可用，请稍后再试或用邮箱登录",
+                    Vec::new(),
+                )
+            }
+            // No credentials for this provider on this instance. Normally
+            // unreachable, because it is not offered — refused explicitly so a
+            // hand-made request cannot drive a half-configured provider.
+            AuthError::OAuthNotConfigured => Self::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                ErrorCode::OAuthNotConfigured,
+                "本实例未配置该第三方登录",
+                Vec::new(),
+            ),
+            // A limited session used where a finished account is required. The
+            // client's move is to send the user back to the username step.
+            AuthError::UsernameRequired => Self::new(
+                StatusCode::FORBIDDEN,
+                ErrorCode::UsernameRequired,
+                "请先设置用户名，再使用该账号",
+                Vec::new(),
+            ),
             AuthError::Unauthenticated => Self::unauthenticated(),
             // A token that does not verify is a credential problem, not a server
             // fault: malformed, expired, tampered with, or foreign-signed. Log

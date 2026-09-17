@@ -97,6 +97,159 @@ pub struct ResendVerificationRequest {
     pub email: String,
 }
 
+/// A third-party identity provider.
+///
+/// A closed set, not free text: the value is both the `oauth_identities.provider`
+/// key and what the client sends, and an unknown one is a validation failure
+/// rather than a lookup that quietly finds nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
+#[serde(rename_all = "lowercase")]
+#[ts(export)]
+pub enum OAuthProvider {
+    /// `github.com` — one `user` endpoint, emails via a second call.
+    GitHub,
+    /// Google — OpenID Connect with an ID token carrying `email` and
+    /// `email_verified`.
+    Google,
+}
+
+impl OAuthProvider {
+    /// The stored spelling (matches the `oauth_identities.provider` check).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::GitHub => "github",
+            Self::Google => "google",
+        }
+    }
+
+    /// Parse the stored spelling; `None` for anything else.
+    pub fn from_str_opt(value: &str) -> Option<Self> {
+        match value {
+            "github" => Some(Self::GitHub),
+            "google" => Some(Self::Google),
+            _ => None,
+        }
+    }
+
+    /// The name shown on the sign-in button.
+    pub fn display_name(self) -> &'static str {
+        match self {
+            Self::GitHub => "GitHub",
+            Self::Google => "Google",
+        }
+    }
+}
+
+/// `GET /auth/oauth/providers` response.
+///
+/// Only providers the instance actually has credentials for appear here, which is
+/// what lets the login page render a button per entry instead of guessing: a
+/// provider with no client id/secret is *absent*, never present and failing on
+/// click. The `authorize_url` needs no secret, so it is safe to hand to the
+/// browser; the client secret never leaves the server.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct OAuthProviderInfo {
+    /// Which provider.
+    pub provider: OAuthProvider,
+    /// Display name for the button.
+    pub display_name: String,
+    /// Absolute URL the browser should be sent to, with `state` and the PKCE
+    /// `code_challenge` already attached.
+    pub authorize_url: String,
+}
+
+/// `GET /auth/oauth/providers` body.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct OAuthProviders {
+    /// Configured providers, in a stable order. May be empty.
+    pub providers: Vec<OAuthProviderInfo>,
+}
+
+/// `POST /auth/oauth/callback` body.
+///
+/// No `redirect_uri` is accepted: it is fixed by configuration, because a
+/// redirect target the caller could choose is the open-redirect half of the
+/// OAuth code-intercept problem.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct OAuthCallbackRequest {
+    /// Which provider is answering.
+    pub provider: OAuthProvider,
+    /// The authorization code from the provider's redirect.
+    pub code: String,
+    /// The `state` the round trip was started with; single-use and expiring.
+    pub state: String,
+}
+
+/// The username a first-time provider user chose.
+///
+/// The limited session travels in the `Authorization` header, so it is not a
+/// field here — this body is only the choice itself.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct CompleteOAuthSignInRequest {
+    /// The `@handle` to claim; validated exactly as a registration username is.
+    pub username: String,
+    /// Optional display name; the server falls back to the username.
+    #[serde(default)]
+    pub display_name: Option<String>,
+}
+
+/// What must happen before a first-time provider user has an account they can use.
+///
+/// Its presence is the machine-readable statement "this caller holds a *limited*
+/// session". The limited token is opaque, so every protected endpoint — which
+/// accepts an access token and only an access token — refuses it without needing
+/// to know this type exists.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct OAuthOnboarding {
+    /// Bearer token for `POST /auth/oauth/complete` and nothing else.
+    pub limited_token: String,
+    /// What the provider called the account, so the step can suggest a handle.
+    /// Not a username and not necessarily valid as one.
+    pub suggested_username: String,
+    /// The address the provider reported, when it reported one.
+    pub email: Option<String>,
+    /// Where the client wanted to land, when it asked and the flow was not deep
+    /// enough to honour it yet. Passed through so the intent is not lost at the
+    /// username step.
+    pub redirect_path: Option<String>,
+}
+
+/// `POST /auth/oauth/callback` response.
+///
+/// Exactly one half is present. `tokens`/`user` mean the caller is signed in;
+/// `onboarding` means the caller must first choose a username. Modelling it as
+/// one optional *pair* rather than two independent optionals is what makes "a
+/// session without a user" unrepresentable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct OAuthCallbackResponse {
+    /// Present when the sign-in completed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub session: Option<OAuthSession>,
+    /// Present when the account exists but has no username yet.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub onboarding: Option<OAuthOnboarding>,
+}
+
+/// The signed-in half of [`OAuthCallbackResponse`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct OAuthSession {
+    /// The authenticated user.
+    pub user: UserProfile,
+    /// Credentials for subsequent requests.
+    pub tokens: TokenPair,
+    /// Where the client asked to be returned to, when it asked. A relative path.
+    pub redirect_path: Option<String>,
+}
+
 /// Generic "we accepted your request" body.
 ///
 /// Used only by the two endpoints that must answer identically whether or not an
@@ -271,6 +424,40 @@ pub enum ErrorCode {
     /// The action conflicts with the current state (already a member, already the
     /// owner, the last owner trying to leave, and so on).
     Conflict,
+    /// A third-party sign-in was attempted with an email that already belongs to
+    /// another account.
+    ///
+    /// This is deliberately **not** an automatic link. Attaching the provider to
+    /// the existing account would let anyone who can make a provider assert an
+    /// address walk into it; creating a second account with the same address is
+    /// impossible and wrong anyway. The client's instruction is: sign in the way
+    /// you normally do, then link the provider from settings.
+    ///
+    /// The wire spelling is pinned because serde's `SCREAMING_SNAKE_CASE` splits
+    /// `OAuthAccountExists` at the capital `A` of `Auth`, which would produce
+    /// `O_AUTH_ACCOUNT_EXISTS` — a name no client should have to know.
+    #[serde(rename = "OAUTH_ACCOUNT_EXISTS")]
+    OAuthAccountExists,
+    /// The `state` is unknown, already spent, or past its short lifetime, or the
+    /// round trip otherwise did not originate here. Never proceed: this is the
+    /// login-CSRF refusal.
+    #[serde(rename = "OAUTH_STATE_INVALID")]
+    OAuthStateInvalid,
+    /// The provider itself refused: a bad `code`, a failed token exchange, an
+    /// unusable profile, or a network failure. The provider's own error text is
+    /// logged, never returned — it is their vocabulary, and it may echo a secret.
+    #[serde(rename = "OAUTH_PROVIDER_ERROR")]
+    OAuthProviderError,
+    /// The requested provider has no credentials configured on this instance.
+    /// Normally unreachable, because an unconfigured provider is absent from
+    /// `GET /auth/oauth/providers`; it is refused explicitly rather than trusting
+    /// the client to only ask for what it was offered.
+    #[serde(rename = "OAUTH_NOT_CONFIGURED")]
+    OAuthNotConfigured,
+    /// The caller holds a limited session and tried to use it somewhere other
+    /// than the username step. Distinct so the client can route them back rather
+    /// than showing a generic "session expired".
+    UsernameRequired,
 }
 
 /// Stable per-field validation codes.
@@ -337,6 +524,123 @@ mod tests {
             let wire = serde_json::to_value(code).expect("a code must serialise");
             assert_eq!(wire, serde_json::json!(expected));
         }
+    }
+
+    #[test]
+    fn the_oauth_failure_codes_are_stable_on_the_wire() {
+        for (code, expected) in [
+            (ErrorCode::OAuthAccountExists, "OAUTH_ACCOUNT_EXISTS"),
+            (ErrorCode::OAuthStateInvalid, "OAUTH_STATE_INVALID"),
+            (ErrorCode::OAuthProviderError, "OAUTH_PROVIDER_ERROR"),
+            (ErrorCode::OAuthNotConfigured, "OAUTH_NOT_CONFIGURED"),
+            (ErrorCode::UsernameRequired, "USERNAME_REQUIRED"),
+        ] {
+            let wire = serde_json::to_value(code).expect("a code must serialise");
+            assert_eq!(wire, serde_json::json!(expected));
+        }
+    }
+
+    #[test]
+    fn a_provider_round_trips_between_its_wire_and_stored_spellings() {
+        use super::OAuthProvider;
+
+        for (provider, wire) in [
+            (OAuthProvider::GitHub, "github"),
+            (OAuthProvider::Google, "google"),
+        ] {
+            assert_eq!(
+                serde_json::to_value(provider).expect("a provider must serialise"),
+                serde_json::json!(wire)
+            );
+            assert_eq!(provider.as_str(), wire, "the stored spelling");
+            assert_eq!(OAuthProvider::from_str_opt(wire), Some(provider));
+        }
+
+        assert_eq!(
+            OAuthProvider::from_str_opt("facebook"),
+            None,
+            "an unknown provider must not resolve to one we support"
+        );
+    }
+
+    #[test]
+    fn a_callback_answers_with_exactly_one_half() {
+        use super::{OAuthCallbackResponse, OAuthOnboarding, TokenPair, UserProfile};
+
+        let signed_in = OAuthCallbackResponse {
+            session: Some(super::OAuthSession {
+                user: UserProfile {
+                    id: "01JABC1234567890ABCDEFGHJ1".to_owned(),
+                    username: "alice".to_owned(),
+                    email: "alice@example.com".to_owned(),
+                    display_name: "alice".to_owned(),
+                    avatar_url: None,
+                    email_verified: false,
+                    created_at_ms: 1_700_000_000_000,
+                },
+                tokens: TokenPair {
+                    access_token: "access".to_owned(),
+                    refresh_token: "refresh".to_owned(),
+                    token_type: "Bearer".to_owned(),
+                    expires_in: 900,
+                },
+                redirect_path: Some("/chat".to_owned()),
+            }),
+            onboarding: None,
+        };
+
+        let wire = serde_json::to_value(&signed_in).expect("a callback response must serialise");
+        assert!(wire.get("session").is_some(), "the session half is present");
+        assert!(
+            wire.get("onboarding").is_none(),
+            "the absent half is omitted rather than null, so a client can branch on presence"
+        );
+
+        let first_time = OAuthCallbackResponse {
+            session: None,
+            onboarding: Some(OAuthOnboarding {
+                limited_token: "limited".to_owned(),
+                suggested_username: "octocat".to_owned(),
+                email: None,
+                redirect_path: Some("/chat".to_owned()),
+            }),
+        };
+
+        let wire = serde_json::to_value(&first_time).expect("a callback response must serialise");
+        assert!(wire.get("onboarding").is_some());
+        assert!(wire.get("session").is_none());
+
+        // The onboarding half must decode, including a provider that reported no
+        // address at all.
+        let decoded: OAuthCallbackResponse = serde_json::from_value(serde_json::json!({
+            "onboarding": {
+                "limited_token": "t",
+                "suggested_username": "u",
+                "email": null,
+                "redirect_path": null,
+            }
+        }))
+        .expect("the onboarding half must decode");
+        assert!(decoded.session.is_none());
+        assert_eq!(decoded.onboarding.expect("the onboarding half").email, None);
+    }
+
+    #[test]
+    fn a_callback_request_requires_the_state() {
+        use super::OAuthCallbackRequest;
+
+        let decoded: OAuthCallbackRequest =
+            serde_json::from_str(r#"{"provider":"github","code":"c","state":"s"}"#)
+                .expect("a callback body must decode");
+        assert_eq!(decoded.provider, super::OAuthProvider::GitHub);
+        assert_eq!(decoded.code, "c");
+        assert_eq!(decoded.state, "s");
+
+        assert!(
+            serde_json::from_str::<OAuthCallbackRequest>(r#"{"provider":"github","code":"c"}"#)
+                .is_err(),
+            "a body without a state must not decode: the CSRF check cannot be optional"
+        );
     }
 
     #[test]

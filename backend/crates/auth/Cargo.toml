@@ -15,6 +15,7 @@ path = "src/lib.rs"
 [dependencies]
 jiuyue-contract = { path = "../contract" }
 serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
@@ -46,6 +47,13 @@ sha2 = "0.10"
 base64 = "0.22"
 # ULID primary keys, matching the `users` table convention (ADR-0003).
 ulid = "1"
+
+# Third-party sign-in: the adapters call a provider's token and profile
+# endpoints over HTTPS, and the authorization URL is assembled with
+# `form_urlencoded` so parameters are percent-encoded rather than concatenated.
+reqwest.workspace = true
+form_urlencoded = "1"
+percent-encoding = "2"
 
 # `sessions` is this crate's table (ADR-0011), so this crate owns the SQL that
 # reads and writes it. The feature set mirrors `jiuyue-store` minus `migrate`:

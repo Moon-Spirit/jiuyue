@@ -1149,6 +1149,39 @@ impl ChatService {
         self.repository.presence_audience(user_id, candidates).await
     }
 
+    /// The **other** Participants of one Conversation — the audience for a
+    /// per-Conversation ephemeral hint such as a Typing Indicator.
+    ///
+    /// This is the same relationship answer as [`Self::presence_audience`], scoped
+    /// to a single Conversation and with the caller already removed: it is
+    /// deliberately *not* the caller's whole social graph, so typing in one
+    /// Conversation can never reach a peer the sender shares a different
+    /// Conversation with. The caller must be a Participant; a stranger's signal is
+    /// refused with [`ChatError::NotAParticipant`] (or
+    /// [`ChatError::ConversationNotFound`]) and therefore reaches nobody.
+    ///
+    /// Like the other recipient-set reads, it carries no payload and knows nothing
+    /// about the transport: `jiuyue-realtime` decides what to send and how.
+    pub async fn conversation_audience(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+    ) -> Result<Vec<String>, ChatError> {
+        if !is_ulid(conversation_id) {
+            return Err(ChatError::ConversationNotFound);
+        }
+
+        require_participant(&self.repository, conversation_id, user_id).await?;
+
+        Ok(self
+            .repository
+            .participants(conversation_id)
+            .await?
+            .into_iter()
+            .filter(|participant| participant != user_id)
+            .collect())
+    }
+
     /// The Device's stored Sync Cursors, most recently advanced first.
     ///
     /// `device_id` is a `sessions` row id — the Device identity CONTEXT.md draws —

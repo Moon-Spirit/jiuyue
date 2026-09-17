@@ -14,12 +14,15 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use jiuyue_auth::SessionContext;
+use jiuyue_auth::oauth::service::OAuthCallbackContext;
 use jiuyue_contract::auth::{
-    ForgotPasswordRequest, RequestAccepted, ResendVerificationRequest, ResetPasswordRequest,
-    VerifyEmailRequest,
+    CompleteOAuthSignInRequest, ForgotPasswordRequest, OAuthCallbackRequest, OAuthProvider,
+    OAuthProviderInfo, OAuthProviders, RequestAccepted, ResendVerificationRequest,
+    ResetPasswordRequest, VerifyEmailRequest,
 };
 use jiuyue_contract::{
-    AuthSession, LoginRequest, RefreshRequest, RegisterRequest, TokenPair, UserProfile, WhoAmI,
+    AuthSession, LoginRequest, OAuthCallbackResponse, RefreshRequest, RegisterRequest, TokenPair,
+    UserProfile, WhoAmI,
 };
 
 use super::api::{ApiError, bearer_token};
@@ -45,6 +48,165 @@ pub fn router() -> Router<AppState> {
         .route("/auth/resend-verification", post(resend_verification))
         .route("/auth/forgot-password", post(forgot_password))
         .route("/auth/reset-password", post(reset_password))
+        // Third-party sign-in. `providers` is what the login page renders from,
+        // so a provider with no credentials is absent rather than broken; `start`
+        // and `callback` are the two halves of the redirect; `link` is the same
+        // round trip, but bound to the signed-in account.
+        .route("/auth/oauth/providers", get(oauth_providers))
+        .route("/auth/oauth/start", post(oauth_start))
+        .route("/auth/oauth/callback", post(oauth_callback))
+        .route("/auth/oauth/complete", post(oauth_complete))
+        .route("/auth/oauth/link", post(oauth_link))
+}
+
+/// `POST /auth/oauth/start` body.
+///
+/// `return_to`, when present, must be a relative path: the client is asking to be
+/// sent somewhere in *this* application after signing in, and a value that could
+/// become an absolute URL would turn this endpoint into an open redirect.
+#[derive(Debug, Clone, serde::Deserialize)]
+struct OAuthStartBody {
+    provider: OAuthProvider,
+    #[serde(default)]
+    return_to: Option<String>,
+}
+
+/// `POST /auth/oauth/start` response.
+#[derive(Debug, Clone, serde::Serialize)]
+struct OAuthStartResponse {
+    authorize_url: String,
+}
+
+/// `GET /auth/oauth/providers` — the providers this instance can actually drive.
+///
+/// No credentials are needed to *start* a sign-in beyond the client id, which is
+/// public by definition, so the authorize URLs are safe to hand to the browser.
+/// The client secret never appears here or anywhere else on the wire.
+///
+/// An instance with no provider configured answers `{"providers": []}`, which is
+/// the honest answer and lets the login page render nothing rather than a
+/// broken button.
+async fn oauth_providers(State(state): State<AppState>) -> Result<Json<OAuthProviders>, ApiError> {
+    let auth = state.auth()?;
+
+    // `auth.oauth()` is `Ok` only when the instance was built with an OAuth
+    // client; without one there is nothing to offer, which is `[]` and not an
+    // error — the login page should just have no third-party buttons.
+    let Ok(oauth) = auth.oauth() else {
+        return Ok(Json(OAuthProviders {
+            providers: Vec::new(),
+        }));
+    };
+
+    let mut providers = Vec::new();
+    for provider in oauth.configured_providers() {
+        providers.push(OAuthProviderInfo {
+            provider,
+            display_name: provider.display_name().to_owned(),
+            authorize_url: oauth.start(provider, None, None).await?,
+        });
+    }
+
+    Ok(Json(OAuthProviders { providers }))
+}
+
+/// `POST /auth/oauth/start` — begin a round trip and return where to send the browser.
+///
+/// The URL is returned as JSON rather than as a `302` so the client controls the
+/// navigation (and so a test can read it). Everything secret stays server-side:
+/// the client id is public, the state and the PKCE verifier are not.
+async fn oauth_start(
+    State(state): State<AppState>,
+    Json(body): Json<OAuthStartBody>,
+) -> Result<Json<OAuthStartResponse>, ApiError> {
+    let auth = state.auth()?;
+
+    let authorize_url = auth
+        .oauth()?
+        .start(body.provider, body.return_to.as_deref(), None)
+        .await?;
+
+    Ok(Json(OAuthStartResponse { authorize_url }))
+}
+
+/// `POST /auth/oauth/callback` — redeem the provider's redirect.
+///
+/// The `state` is spent before the provider is called, so a replayed callback is
+/// refused without a second exchange. On success either a full session comes
+/// back, or — for a first-time user — a limited one and the username step; see
+/// [`OAuthCallbackResponse`].
+async fn oauth_callback(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<OAuthCallbackRequest>,
+) -> Result<Json<OAuthCallbackResponse>, ApiError> {
+    let auth = state.auth()?;
+
+    let outcome = auth
+        .oauth()?
+        .callback(body, oauth_context(&headers))
+        .await?;
+
+    Ok(Json(jiuyue_auth::session_outcome(&auth, outcome)?))
+}
+
+/// `POST /auth/oauth/complete` — choose a username and finish a first-time sign-in.
+///
+/// The limited token is the bearer credential: it is the *only* thing that names
+/// the account, and it is spent in the same statement that claims the handle.
+/// `USERNAME_TAKEN` is retryable with the same token, because a lost race wrote
+/// nothing.
+async fn oauth_complete(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<CompleteOAuthSignInRequest>,
+) -> Result<Json<OAuthCallbackResponse>, ApiError> {
+    let auth = state.auth()?;
+    let token = bearer_token(&headers)?;
+
+    let outcome = auth
+        .oauth()?
+        .complete_sign_in(&token, body, oauth_context(&headers))
+        .await?;
+
+    Ok(Json(jiuyue_auth::session_outcome(&auth, outcome)?))
+}
+
+/// `POST /auth/oauth/link` — start a linking round trip for the signed-in account.
+///
+/// Authenticated on purpose: the whole point of the linking rule is that a
+/// provider is only ever attached by someone already holding the account. The
+/// account id comes from the access token, never from the request body.
+async fn oauth_link(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<OAuthStartBody>,
+) -> Result<Json<OAuthStartResponse>, ApiError> {
+    let auth = state.auth()?;
+    let token = bearer_token(&headers)?;
+
+    let session = auth.authenticate(&token).await?;
+
+    let authorize_url = auth
+        .oauth()?
+        .start(
+            body.provider,
+            body.return_to.as_deref(),
+            Some(&session.user_id),
+        )
+        .await?;
+
+    Ok(Json(OAuthStartResponse { authorize_url }))
+}
+
+/// The callback's view of the caller, from the same headers login records.
+///
+/// Deliberately the same extraction as [`session_context`], so an OAuth session
+/// and a password session record the same device metadata.
+fn oauth_context(headers: &HeaderMap) -> OAuthCallbackContext {
+    OAuthCallbackContext {
+        session: session_context(headers),
+    }
 }
 
 /// `POST /auth/register` — create an account and sign it in immediately.

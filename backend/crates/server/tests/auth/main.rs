@@ -13,6 +13,8 @@
 mod email;
 mod flow;
 mod limiting;
+mod oauth;
+mod oauth_support;
 mod support;
 mod tokens;
 mod validation;

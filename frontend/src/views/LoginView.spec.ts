@@ -71,10 +71,103 @@ async function submitLogin(wrapper: LoginWrapper): Promise<void> {
   await flushPromises();
 }
 
+/**
+ * The provider list the login page fetches on mount.
+ *
+ * The existing tests below stub one responder for every request, so this serves
+ * the mount-time call as well as any other; the OAuth tests install their own
+ * fetch that answers both paths deliberately.
+ */
+function providersPayload(): unknown {
+  return {
+    providers: [
+      {
+        provider: "github",
+        display_name: "GitHub",
+        authorize_url: "https://github.com/login/oauth/authorize?state=s",
+      },
+    ],
+  };
+}
+
 describe("LoginView", () => {
   afterEach(() => {
     vi.unstubAllGlobals();
     window.localStorage.clear();
+    window.sessionStorage.clear();
+  });
+
+  it("renders a button for each provider the server offers", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi
+        .fn<typeof fetch>()
+        .mockImplementation(async () => jsonResponse(providersPayload())),
+    );
+
+    const wrapper = await mountLogin();
+    await flushPromises();
+
+    const section = wrapper.find('[data-test="oauth-providers"]');
+    expect(section.exists()).toBe(true);
+    expect(section.text()).toContain("GitHub");
+    expect(wrapper.find('[data-test="oauth-github"]').exists()).toBe(true);
+  });
+
+  it("renders no third-party section when the instance offers no provider", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi
+        .fn<typeof fetch>()
+        .mockImplementation(async () => jsonResponse({ providers: [] })),
+    );
+
+    const wrapper = await mountLogin();
+    await flushPromises();
+
+    expect(wrapper.find('[data-test="oauth-providers"]').exists()).toBe(false);
+  });
+
+  it("asks the server to start a sign-in when a provider button is clicked", async () => {
+    const assign = vi.fn();
+    const originalLocation = window.location;
+    Object.defineProperty(window, "location", {
+      configurable: true,
+      value: { assign, href: originalLocation.href },
+    });
+
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockImplementation(async (input) => {
+        const url = String(input);
+        if (url === "/api/auth/oauth/providers") {
+          return jsonResponse(providersPayload());
+        }
+        if (url === "/api/auth/oauth/start") {
+          return jsonResponse({
+            authorize_url: "https://github.com/login/oauth/authorize?state=s2",
+          });
+        }
+        throw new Error(`unexpected request: ${url}`);
+      });
+    vi.stubGlobal("fetch", fetchMock);
+
+    try {
+      const wrapper = await mountLogin();
+      await flushPromises();
+
+      await wrapper.find('[data-test="oauth-github"]').trigger("click");
+      await flushPromises();
+
+      expect(assign).toHaveBeenCalledWith(
+        "https://github.com/login/oauth/authorize?state=s2",
+      );
+    } finally {
+      Object.defineProperty(window, "location", {
+        configurable: true,
+        value: originalLocation,
+      });
+    }
   });
 
   it("shows the retry hint when the backend throttles the login", async () => {
@@ -82,7 +175,7 @@ describe("LoginView", () => {
       "fetch",
       vi
         .fn<typeof fetch>()
-        .mockResolvedValue(
+        .mockImplementation(async () =>
           jsonResponse(
             errorPayload(
               "TOO_MANY_ATTEMPTS",
@@ -110,7 +203,7 @@ describe("LoginView", () => {
       "fetch",
       vi
         .fn<typeof fetch>()
-        .mockResolvedValue(
+        .mockImplementation(async () =>
           jsonResponse(
             errorPayload("LOCKED_OUT", "登录失败次数过多，请稍后再试", 900),
             423,
@@ -131,7 +224,7 @@ describe("LoginView", () => {
       "fetch",
       vi
         .fn<typeof fetch>()
-        .mockResolvedValue(
+        .mockImplementation(async () =>
           jsonResponse(
             errorPayload("INVALID_CREDENTIALS", "邮箱或密码不正确"),
             401,

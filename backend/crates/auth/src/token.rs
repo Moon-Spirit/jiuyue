@@ -29,6 +29,29 @@ pub const MIN_SECRET_BYTES: usize = 32;
 /// Entropy in a refresh token, in bytes.
 const REFRESH_TOKEN_BYTES: usize = 32;
 
+/// Mint 256 bits of OS randomness as a base64url (unpadded) string.
+///
+/// Every opaque secret in this crate is the same shape — a refresh token, a
+/// one-shot link, an OAuth `state`, a PKCE verifier, a limited-session token —
+/// so they are all minted here rather than each growing its own copy of the same
+/// four lines. The caller decides what to do with it (usually: put it in a URL or
+/// an email, and store only [`hash_token`]).
+pub fn issue_opaque_token() -> Result<String, AuthError> {
+    let mut bytes = [0_u8; REFRESH_TOKEN_BYTES];
+    getrandom::fill(&mut bytes).map_err(AuthError::Random)?;
+
+    Ok(URL_SAFE_NO_PAD.encode(bytes))
+}
+
+/// Digest an opaque token for storage: lowercase hex SHA-256.
+///
+/// Matches the `^[0-9a-f]{64}$` checks on every secret column in the schema, so a
+/// raw token can never be written where a digest belongs.
+pub fn hash_token(token: &str) -> String {
+    let digest = Sha256::digest(token.as_bytes());
+    format!("{digest:x}")
+}
+
 /// Claims carried by an access token.
 ///
 /// Only identity and expiry — never anything secret, because a JWT is readable
@@ -125,10 +148,7 @@ impl TokenIssuer {
 
     /// Mint a fresh opaque refresh token (256 bits, base64url without padding).
     pub fn issue_refresh_token(&self) -> Result<String, AuthError> {
-        let mut bytes = [0_u8; REFRESH_TOKEN_BYTES];
-        getrandom::fill(&mut bytes).map_err(AuthError::Random)?;
-
-        Ok(URL_SAFE_NO_PAD.encode(bytes))
+        issue_opaque_token()
     }
 
     /// Digest a refresh token for storage: lowercase hex SHA-256.
@@ -136,8 +156,7 @@ impl TokenIssuer {
     /// The digest is what the `sessions.refresh_token_hash` check accepts, so a
     /// raw token can never be written to that column by accident.
     pub fn hash_refresh_token(token: &str) -> String {
-        let digest = Sha256::digest(token.as_bytes());
-        format!("{digest:x}")
+        hash_token(token)
     }
 
     /// Mint a fresh opaque one-shot link token (256 bits, base64url without padding).
@@ -147,18 +166,14 @@ impl TokenIssuer {
     /// minted the same way. Only the digest is ever stored, so the link in the
     /// email is the only copy of the value.
     pub fn issue_link_token(&self) -> Result<String, AuthError> {
-        let mut bytes = [0_u8; REFRESH_TOKEN_BYTES];
-        getrandom::fill(&mut bytes).map_err(AuthError::Random)?;
-
-        Ok(URL_SAFE_NO_PAD.encode(bytes))
+        issue_opaque_token()
     }
 
     /// Digest a one-shot link token for storage: lowercase hex SHA-256.
     ///
     /// Matches `account_tokens.token_hash`'s `^[0-9a-f]{64}$` CHECK.
     pub fn hash_link_token(token: &str) -> String {
-        let digest = Sha256::digest(token.as_bytes());
-        format!("{digest:x}")
+        hash_token(token)
     }
 }
 

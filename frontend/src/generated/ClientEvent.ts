@@ -4,8 +4,9 @@ import type { Ping } from "./Ping";
 import type { Resume } from "./Resume";
 import type { SendMessage } from "./SendMessage";
 import type { SyncCursor } from "./SyncCursor";
+import type { TypingSignal } from "./TypingSignal";
 
 /**
  * Events a client sends to the server.
  */
-export type ClientEvent = { "t": "Ping", "d": Ping } | { "t": "SendMessage", "d": SendMessage } | { "t": "Resume", "d": Resume } | { "t": "SyncCursor", "d": SyncCursor } | { "t": "MarkRead", "d": MarkRead };
+export type ClientEvent = { "t": "Ping", "d": Ping } | { "t": "SendMessage", "d": SendMessage } | { "t": "Resume", "d": Resume } | { "t": "SyncCursor", "d": SyncCursor } | { "t": "MarkRead", "d": MarkRead } | { "t": "Typing", "d": TypingSignal };

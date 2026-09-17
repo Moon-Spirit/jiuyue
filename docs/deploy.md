@@ -215,6 +215,11 @@ curl -fsS http://127.0.0.1:8080/health
 | `EMAIL_VERIFICATION_TTL_SECS` | 否   | `86400`                 | 邮箱验证链接有效期（24 小时）                                                                                                             |
 | `PASSWORD_RESET_TTL_SECS`     | 否   | `3600`                  | 密码重置链接有效期（1 小时）                                                                                                              |
 | `SMTP_URL`                    | 否   | —                       | 事务邮件传输；**当前构建不内置任何服务商，设置它会使服务拒绝启动**（见 [ADR-0015](./adr/0015-email-verification-and-the-mailer-seam.md)） |
+| `GITHUB_CLIENT_ID`            | 否   | —                       | GitHub OAuth 应用 client id；**与 secret 必须成对**，缺一则该 provider 不出现在登录页                                                     |
+| `GITHUB_CLIENT_SECRET`        | 否   | —                       | GitHub OAuth 应用 client secret；**只在服务端使用**，绝不下发前端                                                                         |
+| `GOOGLE_CLIENT_ID`            | 否   | —                       | Google OAuth 2.0 client id（应用类型必须是 Web application）                                                                              |
+| `GOOGLE_CLIENT_SECRET`        | 否   | —                       | Google OAuth 2.0 client secret                                                                                                            |
+| `OAUTH_CALLBACK_BASE_URL`     | 否   | `APP_BASE_URL`          | 第三方回调的公开 origin；**只从配置读取，绝不从请求头取**（见 [ADR-0016](./adr/0016-third-party-sign-in.md)）                             |
 
 **密钥处理**：
 

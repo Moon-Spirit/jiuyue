@@ -14,6 +14,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use axum::Router;
 use axum::body::{Body, to_bytes};
 use axum::http::{HeaderMap, Method, Request, StatusCode};
+use jiuyue_auth::oauth::{OAuthClient, OAuthConfig};
 use jiuyue_auth::{
     AuthConfig, AuthService, InMemoryMailer, InProcessLoginAttemptStore, LoginAttemptPolicy,
     LoginAttemptPolicyBuilder, LoginAttemptStore, Mailer, OutgoingMessage,
@@ -27,6 +28,8 @@ use sqlx::postgres::PgPoolOptions;
 use sqlx::{Executor as _, PgPool};
 use tower::ServiceExt;
 
+use super::oauth_support::{FakeOAuthClient, credentialed_providers};
+
 /// Signing secret used by the test router. Long enough for the 32-byte minimum.
 pub const TEST_SECRET: &str = "test-signing-secret-0123456789abcdef";
 
@@ -37,6 +40,9 @@ pub struct TestApp {
     admin_url: String,
     schema: String,
     mailer: Arc<InMemoryMailer>,
+    /// The fake provider transport. Every test app has one; the OAuth tests are
+    /// the only ones that script it.
+    oauth: Arc<FakeOAuthClient>,
 }
 
 impl TestApp {
@@ -93,11 +99,16 @@ impl TestApp {
         let login_store = Arc::new(InProcessLoginAttemptStore::new(login_policy));
         let email_store = Arc::new(InProcessLoginAttemptStore::new(email_policy));
         let mailer = Arc::new(InMemoryMailer::new());
+        let oauth = Arc::new(FakeOAuthClient::new());
 
         let auth = AuthService::builder(store.pool().clone(), AuthConfig::new(TEST_SECRET))
             .login_store(Arc::clone(&login_store) as Arc<dyn LoginAttemptStore>)
             .email_store(Arc::clone(&email_store) as Arc<dyn LoginAttemptStore>)
             .mailer(Arc::clone(&mailer) as Arc<dyn Mailer>)
+            .oauth(
+                Arc::clone(&oauth) as Arc<dyn OAuthClient>,
+                OAuthConfig::new(credentialed_providers()),
+            )
             .build()
             .await
             .expect("the identity service must build with a valid secret");
@@ -111,6 +122,7 @@ impl TestApp {
                 admin_url,
                 schema,
                 mailer,
+                oauth,
             },
             login_store,
             email_store,
@@ -125,6 +137,11 @@ impl TestApp {
     /// The captured-mail transport, for asserting on what was "sent".
     pub fn mailer(&self) -> &InMemoryMailer {
         &self.mailer
+    }
+
+    /// The fake provider transport, for scripting what a provider answers.
+    pub fn oauth(&self) -> &FakeOAuthClient {
+        &self.oauth
     }
 
     /// The pool writing into this test's schema, for direct assertions.
@@ -294,6 +311,18 @@ pub async fn send_full(app: &TestApp, request: Request<Body>) -> (StatusCode, He
     };
 
     (status, headers, body)
+}
+
+/// Drive a hand-built request and return its status and parsed body.
+///
+/// The OAuth journeys send bearer credentials on endpoints whose bodies are not
+/// plain JSON, so they build the request themselves; this is the shared way to
+/// send one and read the answer under test.
+pub async fn send_full_body(
+    app: &TestApp,
+    request: Request<Body>,
+) -> (StatusCode, HeaderMap, Value) {
+    send_full(app, request).await
 }
 
 /// `POST` a JSON body from a source, keeping the response headers.

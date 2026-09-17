@@ -81,6 +81,22 @@ pub enum ServerEvent {
     /// the first is already live produces no event at all, and [`Presence::status`]
     /// only turns `offline` when the User's *last* Device goes.
     Presence(Presence),
+    /// A Participant started or stopped composing in a Conversation
+    /// (CONTEXT.md: Typing Indicator).
+    ///
+    /// **Ephemeral by construction.** The event carries no Message id and no
+    /// Sequence Number, it is never written to a table, and it cannot arrive after
+    /// a reconnect: it rides the per-connection `s` (ADR-0003), and a reconnect is
+    /// a new connection whose replay buffer starts empty, so a position from the
+    /// old connection is answered `unavailable` rather than replayed.
+    ///
+    /// Sent **only** to the *other* Participants of [`Typing::conversation_id`].
+    /// The sender's own Devices are deliberately excluded — seeing your own typing
+    /// echoed on your phone is a bug — and the payload carries no Message text, so
+    /// message content can never travel on this unpersisted, unmoderated channel.
+    /// The receiver must clear the indicator on its own after a bounded interval,
+    /// because a client that closes mid-sentence never sends a stop.
+    Typing(Typing),
 }
 
 /// Events a client sends to the server.
@@ -108,6 +124,13 @@ pub enum ClientEvent {
     /// the public Read Receipt advances (broadcast to the other Participants).
     /// Monotonic — a replayed or out-of-order report can never rewind either.
     MarkRead(MarkRead),
+    /// "I am composing in this Conversation" (CONTEXT.md: Typing Indicator).
+    ///
+    /// Best-effort and deliberately cheap: the server coalesces repeats in memory,
+    /// so a client may emit one signal per keystroke and still cost at most one
+    /// fan-out per throttle window. A signal naming a Conversation the caller does
+    /// not participate in is dropped, and the server never stores anything for it.
+    Typing(TypingSignal),
 }
 
 /// Heartbeat payload shared by both directions.
@@ -138,4 +161,117 @@ pub struct Ping {
     #[serde(default)]
     #[ts(type = "number | null")]
     pub connection_id: Option<u64>,
+}
+
+/// The state a Typing Indicator signal carries (CONTEXT.md: 正在输入).
+///
+/// Two states, not a boolean, for the same reason [`crate::PresenceStatus`] is an
+/// enum: an `idle` refinement can be added later as a new variant without touching
+/// the shape of every existing payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum TypingState {
+    /// The Participant is composing; the other Participants show the indicator.
+    Started,
+    /// The Participant stopped composing (or sent); the indicator clears now.
+    Stopped,
+}
+
+/// `ClientEvent::Typing` payload: "I am / am not composing in this Conversation".
+///
+/// The **who** is not in the payload: it is the authenticated User the connection
+/// belongs to, so a client cannot claim another Participant is typing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct TypingSignal {
+    /// ULID of the Conversation the signal applies to. The caller must be a
+    /// Participant; anything else is dropped without a fan-out.
+    pub conversation_id: String,
+    /// Whether the caller started or stopped composing.
+    pub state: TypingState,
+}
+
+/// `ServerEvent::Typing` payload: **who** is composing, and **where**.
+///
+/// That is the whole payload — two ids and a state. There is deliberately no
+/// Message text field: this event is neither persisted nor moderated, so a
+/// content preview here would route around the Cloud Conversation moderation
+/// boundary (CONTEXT.md). The receiver orders these by arrival on its single
+/// ordered connection; the server emits them in a total per-Conversation order,
+/// so a stop can never overtake a later start for the same Participant.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct Typing {
+    /// ULID of the Conversation the indicator belongs to.
+    pub conversation_id: String,
+    /// ULID of the Participant who is (or is no longer) composing.
+    pub user_id: String,
+    /// Whether that Participant started or stopped composing.
+    pub state: TypingState,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ClientEvent, ServerEvent, Typing, TypingSignal, TypingState};
+    use crate::envelope::{ClientEnvelope, ServerEnvelope};
+
+    #[test]
+    fn a_typing_signal_uses_the_additive_adjacent_tag_and_stays_minimal() {
+        let envelope = ClientEnvelope::new(ClientEvent::Typing(TypingSignal {
+            conversation_id: "01JABC1234567890ABCDEFGHJ1".to_owned(),
+            state: TypingState::Started,
+        }));
+
+        let wire = serde_json::to_value(&envelope).expect("a client envelope must serialise");
+
+        assert_eq!(wire["e"]["t"], "Typing");
+        assert_eq!(wire["e"]["d"]["state"], "started");
+        assert_eq!(
+            wire["e"]["d"]["conversation_id"],
+            "01JABC1234567890ABCDEFGHJ1"
+        );
+        assert!(
+            wire["e"]["d"].get("body").is_none(),
+            "a typing signal must never carry Message text"
+        );
+    }
+
+    #[test]
+    fn a_server_typing_event_names_who_and_where_and_nothing_else() {
+        let envelope = ServerEnvelope::new(
+            4,
+            1_750_000_000_000,
+            ServerEvent::Typing(Typing {
+                conversation_id: "01JABC1234567890ABCDEFGHJ1".to_owned(),
+                user_id: "01JABC1234567890ABCDEFGHJ2".to_owned(),
+                state: TypingState::Stopped,
+            }),
+        );
+
+        let wire = serde_json::to_value(&envelope).expect("a server envelope must serialise");
+
+        assert_eq!(wire["e"]["t"], "Typing");
+        assert_eq!(wire["e"]["d"]["user_id"], "01JABC1234567890ABCDEFGHJ2");
+        assert_eq!(
+            wire["e"]["d"]["conversation_id"],
+            "01JABC1234567890ABCDEFGHJ1"
+        );
+        assert_eq!(wire["e"]["d"]["state"], "stopped");
+        assert_eq!(
+            wire["e"]["d"].as_object().map(serde_json::Map::len),
+            Some(3),
+            "the payload is who, where and the state — nothing else"
+        );
+    }
+
+    #[test]
+    fn a_typing_state_round_trips_through_json() {
+        for state in [TypingState::Started, TypingState::Stopped] {
+            let text = serde_json::to_string(&state).expect("a state must serialise");
+            let decoded: TypingState =
+                serde_json::from_str(&text).expect("a state must deserialise");
+            assert_eq!(decoded, state);
+        }
+    }
 }

@@ -4,8 +4,10 @@ use std::net::SocketAddr;
 use std::process::ExitCode;
 use std::sync::Arc;
 
+use jiuyue_auth::oauth::{HttpOAuthClient, OAuthConfig, OAuthProviders};
 use jiuyue_auth::{AuthConfig, AuthService, InMemoryMailer};
 use jiuyue_chat::ChatService;
+use jiuyue_contract::OAuthProvider;
 use jiuyue_realtime::RealtimeHub;
 use jiuyue_server::{AppState, Config, Error, Services, app};
 use jiuyue_store::Store;
@@ -51,6 +53,9 @@ async fn run() -> Result<(), Error> {
     auth_config.access_token_ttl = config.access_token_ttl;
     auth_config.refresh_token_ttl = config.refresh_token_ttl;
     auth_config.public_base_url = config.public_base_url.clone();
+    // Usually the same origin as the app; separate so a deployment whose OAuth
+    // callback terminates elsewhere can say so. It is never taken from a request.
+    auth_config.oauth_redirect_base_url = config.oauth_callback_base_url.clone();
     auth_config.verification_token_ttl = config.verification_token_ttl;
     auth_config.reset_token_ttl = config.reset_token_ttl;
 
@@ -58,10 +63,34 @@ async fn run() -> Result<(), Error> {
     // how a local run "receives" mail. Production supplies a provider-backed
     // `Mailer` here instead — see
     // `docs/adr/0015-email-verification-and-the-mailer-seam.md`.
-    let auth = AuthService::builder(store.pool().clone(), auth_config)
-        .mailer(Arc::new(InMemoryMailer::new()))
-        .build()
-        .await?;
+    let mut builder = AuthService::builder(store.pool().clone(), auth_config)
+        .mailer(Arc::new(InMemoryMailer::new()));
+
+    // Third-party sign-in is offered only when this instance has credentials for
+    // at least one provider. A provider without a client id and secret is absent
+    // from the login page rather than present and failing on click, and an
+    // instance with none gets no OAuth routes at all beyond a truthful `[]`.
+    let providers = OAuthProviders::from_credentials(
+        config.oauth_credentials(OAuthProvider::GitHub),
+        config.oauth_credentials(OAuthProvider::Google),
+    );
+
+    if providers.any_configured() {
+        builder = builder.oauth(
+            Arc::new(HttpOAuthClient::new()?),
+            OAuthConfig::new(providers),
+        );
+        tracing::info!(
+            callback = %format!("{}/auth/oauth/callback", config.oauth_callback_base_url()),
+            "third-party sign-in enabled"
+        );
+    } else {
+        tracing::info!(
+            "no third-party sign-in credentials configured; the login page will offer none"
+        );
+    }
+
+    let auth = builder.build().await?;
 
     tracing::warn!(
         "no mail provider configured: verification and password-reset emails are captured in the process log only"

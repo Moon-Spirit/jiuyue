@@ -4,15 +4,35 @@ import { MESSAGE_MAX_CHARS } from "../../stores/chat";
 import { charCount } from "../../validation";
 
 const props = defineProps<{ disabled: boolean }>();
-const emit = defineEmits<{ send: [body: string] }>();
+const emit = defineEmits<{ send: [body: string]; typing: [active: boolean] }>();
 
 const draft = ref("");
 const remaining = computed(() => MESSAGE_MAX_CHARS - charCount(draft.value));
+
+/**
+ * Report a draft change so the view can publish a Typing Indicator.
+ *
+ * The composer deliberately knows nothing about throttling or the wire: it emits
+ * the raw fact ("there is text" / "there is none") and the typing store owns the
+ * policy. On an empty draft the event is what makes the indicator disappear the
+ * moment the box is cleared.
+ */
+function onInput(): void {
+  emit("typing", draft.value.trim() !== "");
+}
+
+/** A blurred composer is not being typed in, whatever the draft still holds. */
+function onBlur(): void {
+  emit("typing", false);
+}
 
 function submit(): void {
   const body = draft.value.trim();
   if (body === "" || props.disabled) return;
 
+  // Sending is the strongest "stopped": say so before the Message leaves, so the
+  // indicator clears immediately rather than waiting for the server's echo.
+  emit("typing", false);
   emit("send", body);
   draft.value = "";
 }
@@ -43,6 +63,8 @@ function onKeydown(event: KeyboardEvent): void {
         :disabled="disabled"
         class="max-h-40 min-h-10 flex-1 resize-y rounded-xl border border-zinc-300 bg-white px-3 py-2 text-sm outline-none transition-colors focus:border-zinc-500 disabled:opacity-50 dark:border-zinc-700 dark:bg-zinc-950"
         data-test="composer"
+        @input="onInput"
+        @blur="onBlur"
         @keydown="onKeydown"
       ></textarea>
       <button

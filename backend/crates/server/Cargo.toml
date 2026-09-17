@@ -41,6 +41,10 @@ tracing-subscriber.workspace = true
 futures-util = { version = "0.3", features = ["sink"] }
 # Used to forge expired / foreign-signed tokens for the rejection tests.
 jsonwebtoken = { version = "11", default-features = false, features = ["rust_crypto"] }
+# The OAuth integration tests decode the form bodies the service sent, so the
+# assertion is against the wire encoding rather than against the string that
+# happened to be built. `serde_json` is already a dependency.
+form_urlencoded = "1"
 sqlx = { version = "0.8", default-features = false, features = [
     "postgres",
     "runtime-tokio",

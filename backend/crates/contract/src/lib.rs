@@ -31,8 +31,10 @@ pub mod read;
 pub mod sync;
 
 pub use auth::{
-    AuthSession, ErrorBody, ErrorCode, ErrorDetail, FieldError, FieldErrorCode, LoginRequest,
-    RefreshRequest, RegisterRequest, TokenPair, UserProfile, WhoAmI,
+    AuthSession, CompleteOAuthSignInRequest, ErrorBody, ErrorCode, ErrorDetail, FieldError,
+    FieldErrorCode, LoginRequest, OAuthCallbackRequest, OAuthCallbackResponse, OAuthOnboarding,
+    OAuthProvider, OAuthProviderInfo, OAuthProviders, OAuthSession, RefreshRequest,
+    RegisterRequest, TokenPair, UserProfile, WhoAmI,
 };
 pub use chat::{
     ConversationCreated, ConversationKind, ConversationList, ConversationSummary,

@@ -1132,6 +1132,12 @@ export const useChatStore = defineStore("chat", () => {
         // exists because the tagged union is exhaustive — the compiler refuses to
         // let a new event type go unconsidered.
         break;
+      case "Typing":
+        // A Typing Indicator is ephemeral state about a Participant, not Message
+        // history, so the realtime store routes it to the typing store's own
+        // subscription. It is deliberately not reduced here: nothing about it may
+        // touch the Conversation or Message state that is persisted and repaired.
+        break;
       default:
         assertExhaustive(event);
     }

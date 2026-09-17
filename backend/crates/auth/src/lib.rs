@@ -27,6 +27,14 @@
 //! supply, and `docs/adr/0015-email-verification-and-the-mailer-seam.md` for the
 //! full decision.
 //!
+//! # Third-party sign-in
+//!
+//! GitHub and Google sign-in live in [`oauth`]. What must be understood about
+//! them before touching either is one sentence: **a provider identity is a
+//! credential for an account, never a way to claim one by email.** A provider
+//! address that matches an existing account is refused, not linked; the full
+//! reasoning is in that module's documentation and in ADR-0016.
+//!
 //! # Cost control on a 2 vCPU / 2 GB box
 //!
 //! Argon2id at OWASP parameters allocates ~19 MiB per in-flight hash, so an
@@ -42,6 +50,7 @@ mod error;
 pub mod limiter;
 mod links;
 pub mod mailer;
+pub mod oauth;
 mod password;
 mod repository;
 mod service;
@@ -55,9 +64,15 @@ pub use limiter::{
     LoginAttemptStore, MAX_LOCKOUT_SECS,
 };
 pub use mailer::{InMemoryMailer, MailError, Mailer, OutgoingMessage};
+pub use oauth::{
+    CallbackOutcome, GitHubAdapter, GoogleAdapter, HttpOAuthClient, OAuthClient, OAuthConfig,
+    OAuthEndpoint, OAuthFuture, OAuthIdentity, OAuthProviderAdapter, OAuthProviderConfig,
+    OAuthProviders, OAuthRepository, OAuthRequest, OAuthResponse, OAuthService, PkcePair,
+    adapter_for, session_outcome,
+};
 pub use password::PasswordHasher;
 pub use service::{
     AuthConfig, AuthService, AuthServiceBuilder, AuthenticatedSession, SessionContext,
     UNKNOWN_SOURCE,
 };
-pub use token::{AccessClaims, TokenIssuer};
+pub use token::{AccessClaims, TokenIssuer, hash_token, issue_opaque_token};
